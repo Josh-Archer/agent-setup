@@ -1,0 +1,45 @@
+name: Setup GitHub CLI
+description: Ensure gh is available and authenticated for subsequent steps.
+inputs:
+  token:
+    description: GitHub token to expose to later gh steps.
+    required: true
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.token }}
+      run: |
+        set -euo pipefail
+
+        echo "GH_TOKEN=${GH_TOKEN}" >> "$GITHUB_ENV"
+        echo "GH_REPO=${GITHUB_REPOSITORY}" >> "$GITHUB_ENV"
+
+        if command -v gh >/dev/null 2>&1; then
+          echo "Using preinstalled gh at $(command -v gh)"
+          exit 0
+        fi
+
+        bin_dir="$RUNNER_TEMP/gh-bin"
+        mkdir -p "$bin_dir"
+
+        arch="$(uname -m)"
+        case "$arch" in
+          x86_64|amd64) gh_arch="amd64" ;;
+          aarch64|arm64) gh_arch="arm64" ;;
+          *)
+            echo "::error::Unsupported architecture for GitHub CLI bootstrap: $arch"
+            exit 1
+            ;;
+        esac
+
+        latest_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/cli/cli/releases/latest)"
+        version="${latest_url##*/v}"
+        tmpdir="$(mktemp -d)"
+        tarball="gh_${version}_linux_${gh_arch}.tar.gz"
+        curl -fsSL "https://github.com/cli/cli/releases/download/v${version}/${tarball}" -o "${tmpdir}/${tarball}"
+        tar -xzf "${tmpdir}/${tarball}" -C "$tmpdir"
+        install -m 0755 "${tmpdir}/gh_${version}_linux_${gh_arch}/bin/gh" "${bin_dir}/gh"
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "Installed gh ${version} to ${bin_dir}."

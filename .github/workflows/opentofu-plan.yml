@@ -1,0 +1,2046 @@
+name: OpenTofu Plan Validation
+
+on:
+  pull_request:
+    paths:
+      - 'terraform/ci-runners/**'
+      - 'terraform/cloudflare-access/**'
+      - 'terraform/homelab/**'
+      - 'terraform/identity/**'
+      - 'terraform/gcp-worker/**'
+      - 'terraform/uptime-kuma-app-engine/**'
+      - 'apps/uptime-kuma/**'
+      - 'terraform/arr-config/**'
+      - 'terraform/unifi/**'
+      - 'terraform/aws-backup/**'
+      - 'terraform/vaultwarden/**'
+      - 'infrastructure/terraform/aws-cleanarr/**'
+      - 'infrastructure/terraform/aws-lambda-cleanup/**'
+      - 'infrastructure/terraform/azure-lidarr/**'
+      - 'terraform/velero-backup/**'
+      - 'terraform/velero-rescue-lambda/**'
+      - 'scripts/tofu-init-with-retry.sh'
+      - 'scripts/tofu-recover-stale-lock.sh'
+      - 'scripts/import-cloudflare-state.py'
+      - 'scripts/import-gcp-spot-state.sh'
+      - 'scripts/cleanup-gcp-orphans.sh'
+      - 'scripts/tofu-apply-with-zone-fallback.sh'
+      - '.opentofu-version'
+      - 'scripts/unifi/**'
+      - '.github/workflows/deploy.yml'
+      - '.github/workflows/gcp-control.yml'
+      - '.github/workflows/gcp-reconcile.yml'
+      - '.github/workflows/opentofu-plan.yml'
+  workflow_dispatch:
+    inputs:
+      tofu_replace:
+        description: 'Optional OpenTofu -replace address (advanced)'
+        type: string
+        required: false
+        default: ''
+permissions:
+  contents: read
+  pull-requests: read
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+  TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT }}
+  TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+  TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT }}
+  AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+  AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+
+concurrency:
+  group: opentofu-plan-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  detect-changes:
+    name: Detect OpenTofu changes
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    outputs:
+      ci_runners: ${{ steps.detect.outputs.ci_runners }}
+      homelab: ${{ steps.detect.outputs.homelab }}
+      vaultwarden: ${{ steps.detect.outputs.vaultwarden }}
+      gcp_worker: ${{ steps.detect.outputs.gcp_worker }}
+      unifi: ${{ steps.detect.outputs.unifi }}
+      arr_config: ${{ steps.detect.outputs.arr_config }}
+      aws_cleanarr: ${{ steps.detect.outputs.aws_cleanarr }}
+      aws_lambda_cleanup: ${{ steps.detect.outputs.aws_lambda_cleanup }}
+      azure_lidarr: ${{ steps.detect.outputs.azure_lidarr }}
+      velero: ${{ steps.detect.outputs.velero }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Detect changed files
+        id: detect
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            changed_files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            changed_files="$(git diff --name-only HEAD~1 HEAD)"
+          else
+            changed_files="$(git ls-files)"
+          fi
+
+          has_match() {
+            local pattern="$1"
+            if printf '%s\n' "${changed_files}" | grep -Eq "${pattern}"; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          echo "ci_runners=$(has_match '^terraform/ci-runners/|^scripts/tofu-init-with-retry\.sh$|^scripts/tofu-recover-stale-lock\.sh$|^\.opentofu-version$|^\.github/workflows/deploy\.yml$|^\.github/workflows/opentofu-plan\.yml$')" >> "$GITHUB_OUTPUT"
+          echo "homelab=$(has_match '^terraform/homelab/|^terraform/cloudflare-access/')" >> "$GITHUB_OUTPUT"
+          echo "vaultwarden=$(has_match '^terraform/vaultwarden/')" >> "$GITHUB_OUTPUT"
+          echo "gcp_worker=$(has_match '^terraform/gcp-worker/')" >> "$GITHUB_OUTPUT"
+          echo "unifi=$(has_match '^terraform/unifi/')" >> "$GITHUB_OUTPUT"
+          echo "arr_config=$(has_match '^terraform/arr-config/')" >> "$GITHUB_OUTPUT"
+          echo "aws_cleanarr=$(has_match '^infrastructure/terraform/aws-cleanarr/')" >> "$GITHUB_OUTPUT"
+          echo "aws_lambda_cleanup=$(has_match '^infrastructure/terraform/aws-lambda-cleanup/')" >> "$GITHUB_OUTPUT"
+          echo "azure_lidarr=$(has_match '^infrastructure/terraform/azure-lidarr/')" >> "$GITHUB_OUTPUT"
+          echo "velero=$(has_match '^terraform/velero-backup/|^terraform/velero-rescue-lambda/')" >> "$GITHUB_OUTPUT"
+
+  ci-runners-plan:
+    name: OpenTofu Plan (CI Runners)
+    needs: detect-changes
+    if: vars.ENABLE_CI_RUNNERS_ROOT == 'true' && vars.CI_RUNNERS_STATE_MIGRATED == 'true' && (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.ci_runners == 'true')
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    concurrency:
+      group: tofu-ci-runners-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: terraform/ci-runners
+    env:
+      TF_VAR_azure_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID != '' && vars.AZURE_SUBSCRIPTION_ID || '' }}
+      TF_VAR_azure_tenant_id: ${{ secrets.AZURE_TENANT_ID != '' && secrets.AZURE_TENANT_ID || '' }}
+      TF_VAR_azure_client_id: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_ID || '' }}
+      TF_VAR_azure_client_secret: ${{ secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_SECRET || '' }}
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_enable_codebuild_runner_project: ${{ vars.ENABLE_CODEBUILD_RUNNER_PROJECT != '' && vars.ENABLE_CODEBUILD_RUNNER_PROJECT || 'false' }}
+      TF_VAR_enable_codebuild_runner_repo_variables: 'false'
+      TF_VAR_enable_codebuild_runner_toggle_variable: 'false'
+      TF_VAR_enable_runner_provider_mode_variable: 'false'
+      TF_VAR_enable_self_hosted_runner_toggle_variable: 'false'
+      TF_VAR_codebuild_runner_project_name: ${{ vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && vars.AWS_CODEBUILD_RUNNER_PROJECT || 'home-pr-runner' }}
+      TF_VAR_codebuild_runner_github_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_runner_provider_mode: ${{ vars.RUNNER_PROVIDER_MODE != '' && vars.RUNNER_PROVIDER_MODE || 'github-hosted' }}
+      TF_VAR_enable_azure_student_vm: ${{ github.event_name == 'pull_request' && 'false' || vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_bootstrap_enabled: ${{ github.event_name == 'pull_request' && 'false' || vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_registration_pat: ${{ github.event_name == 'pull_request' && '' || secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_azure_student_vm_github_runner_count: '2'
+      TF_VAR_azure_student_vm_github_runner_labels: '["self-hosted","linux","x64","az-vm-gha"]'
+      TF_VAR_azure_vm_runner_label: ${{ vars.AZURE_VM_RUNNER_LABEL != '' && vars.AZURE_VM_RUNNER_LABEL || 'az-vm-gha' }}
+      TF_VAR_azure_vm_offload_enabled: ${{ github.event_name == 'pull_request' && 'false' || vars.USE_AZURE_VM != '' && vars.USE_AZURE_VM || 'false' }}
+      TF_VAR_azure_student_vm_github_runner_version: '2.333.1'
+      TF_VAR_azure_pipelines_mode_enabled: ${{ github.event_name == 'pull_request' && 'false' || vars.USE_AZURE_PIPELINES != '' && vars.USE_AZURE_PIPELINES || 'false' }}
+      TF_VAR_azure_pipelines_ready: ${{ github.event_name == 'pull_request' && 'false' || vars.AZURE_PIPELINES_READY != '' && vars.AZURE_PIPELINES_READY || 'false' }}
+      TF_VAR_enable_azure_pipelines_toggle_variable: 'false'
+      TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL != '' && vars.AZURE_DEVOPS_ORG_URL || '' }}
+      TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT != '' && secrets.AZURE_DEVOPS_PAT || '' }}
+      TF_VAR_azure_devops_client_id: ${{ vars.AZURE_DEVOPS_CLIENT_ID != '' && vars.AZURE_DEVOPS_CLIENT_ID || vars.AZURE_CLIENT_ID != '' && vars.AZURE_CLIENT_ID || secrets.AZURE_DEVOPS_CLIENT_ID != '' && secrets.AZURE_DEVOPS_CLIENT_ID || secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_ID || '' }}
+      TF_VAR_azure_devops_client_secret: ${{ secrets.AZURE_DEVOPS_CLIENT_SECRET != '' && secrets.AZURE_DEVOPS_CLIENT_SECRET || secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_SECRET || '' }}
+      TF_VAR_azure_devops_tenant_id: ${{ vars.AZURE_DEVOPS_TENANT_ID != '' && vars.AZURE_DEVOPS_TENANT_ID || vars.AZURE_TENANT_ID != '' && vars.AZURE_TENANT_ID || secrets.AZURE_DEVOPS_TENANT_ID != '' && secrets.AZURE_DEVOPS_TENANT_ID || secrets.AZURE_TENANT_ID != '' && secrets.AZURE_TENANT_ID || '' }}
+      TF_VAR_azure_pipelines_monthly_minutes_limit: ${{ vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT != '' && vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT || '1800' }}
+      TF_VAR_enable_quota_reset_offload: 'false'
+      TF_VAR_github_token: ${{ github.event_name == 'pull_request' && '' || secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_ntfy_token: ${{ github.event_name == 'pull_request' && '' || secrets.NTFY_TOKEN }}
+      TOFU_REPLACE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tofu_replace || '' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: ci-runners/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        env:
+          TOFU_BACKEND_STATE_KEY: ci-runners/terraform.tfstate
+        run: |
+          PLAN_LOG="/tmp/tofu-ci-runners-plan.log"
+          LOCK_TIMEOUT="15m"
+          PLAN_CMD_TIMEOUT="16m"
+
+          run_plan() {
+            set +e
+            timeout --preserve-status "${PLAN_CMD_TIMEOUT}" \
+              tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" ${TOFU_REPLACE:+-replace="$TOFU_REPLACE"} 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          }
+
+          run_plan
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying CI Runners plan after stale lock cleanup..."
+            run_plan
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            run_plan
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            exit "${PLAN_EXIT}"
+          fi
+
+  homelab-plan:
+    name: OpenTofu Plan (Cloudflare Access)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.homelab == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON(format('["{0}"]', vars.AZURE_VM_RUNNER_LABEL != '' && vars.AZURE_VM_RUNNER_LABEL || 'home-gh-runner')) || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    concurrency:
+      group: tofu-cloudflare-access-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: terraform/homelab
+    env:
+      TF_VAR_azure_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID != '' && vars.AZURE_SUBSCRIPTION_ID || '' }}
+      TF_VAR_azure_tenant_id: ${{ secrets.AZURE_TENANT_ID != '' && secrets.AZURE_TENANT_ID || '' }}
+      TF_VAR_azure_client_id: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_ID || '' }}
+      TF_VAR_azure_client_secret: ${{ secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_SECRET || '' }}
+      TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+      TF_VAR_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_tunnel_id: ${{ secrets.TF_VAR_TUNNEL_ID }}
+      TF_VAR_keycloak_client_secret: ${{ secrets.TF_VAR_KEYCLOAK_CLIENT_SECRET }}
+      TF_VAR_zone_id_archer_casa: ${{ secrets.TF_VAR_ZONE_ID_ARCHER_CASA }}
+      TF_VAR_zone_id_archerfamily_io: ${{ secrets.TF_VAR_ZONE_ID_ARCHERFAMILY_IO }}
+      TF_VAR_enable_github_actions_secrets_sync: 'false'
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_enable_codebuild_runner_project: ${{ vars.ENABLE_CODEBUILD_RUNNER_PROJECT != '' && vars.ENABLE_CODEBUILD_RUNNER_PROJECT || 'false' }}
+      TF_VAR_enable_codebuild_runner_repo_variables: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
+      TF_VAR_enable_codebuild_runner_toggle_variable: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
+      TF_VAR_enable_runner_provider_mode_variable: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
+      TF_VAR_enable_self_hosted_runner_toggle_variable: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
+      TF_VAR_codebuild_runner_project_name: ${{ vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && vars.AWS_CODEBUILD_RUNNER_PROJECT || 'home-pr-runner' }}
+      TF_VAR_codebuild_runner_github_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_runner_provider_mode: ${{ vars.RUNNER_PROVIDER_MODE != '' && vars.RUNNER_PROVIDER_MODE || 'github-hosted' }}
+      TF_VAR_enable_azure_student_vm: ${{ github.event_name == 'pull_request' && 'false' || vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_bootstrap_enabled: ${{ github.event_name == 'pull_request' && 'false' || vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_registration_pat: ${{ github.event_name == 'pull_request' && '' || secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_azure_student_vm_github_runner_count: '2'
+      TF_VAR_azure_student_vm_github_runner_labels: '["self-hosted","linux","x64","az-vm-gha"]'
+      TF_VAR_azure_vm_runner_label: 'az-vm-gha'
+      TF_VAR_azure_student_vm_github_runner_version: '2.333.1'
+      TF_VAR_azure_pipelines_mode_enabled: ${{ github.event_name == 'pull_request' && 'false' || vars.USE_AZURE_PIPELINES != '' && vars.USE_AZURE_PIPELINES || 'false' }}
+      TF_VAR_enable_azure_pipelines_toggle_variable: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
+      # OpenClaw
+      TF_VAR_enable_openclaw_management: ${{ github.event_name == 'pull_request' && 'false' || 'true' }}
+      TF_VAR_openclaw_url: wss://openclaw.archer.casa
+      TF_VAR_openclaw_token: ${{ secrets.OPENCLAW_GATEWAY_TOKEN }}
+      TF_VAR_discord_bot_token: ${{ secrets.OPENCLAW_DISCORD_BOT_TOKEN }}
+      TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+      TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL != '' && vars.AZURE_DEVOPS_ORG_URL || '' }}
+      TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT != '' && vars.AZURE_DEVOPS_PROJECT || '' }}
+      TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID != '' && vars.AZURE_DEVOPS_PIPELINE_ID || '' }}
+      TF_VAR_azure_pipelines_monthly_minutes_limit: ${{ vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT != '' && vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT || '1800' }}
+      TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT != '' && secrets.AZURE_DEVOPS_PAT || '' }}
+      TF_VAR_azure_devops_client_id: ${{ vars.AZURE_DEVOPS_CLIENT_ID != '' && vars.AZURE_DEVOPS_CLIENT_ID || vars.AZURE_CLIENT_ID != '' && vars.AZURE_CLIENT_ID || secrets.AZURE_DEVOPS_CLIENT_ID != '' && secrets.AZURE_DEVOPS_CLIENT_ID || secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_ID || '' }}
+      TF_VAR_azure_devops_client_secret: ${{ secrets.AZURE_DEVOPS_CLIENT_SECRET != '' && secrets.AZURE_DEVOPS_CLIENT_SECRET || secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_SECRET || '' }}
+      TF_VAR_azure_devops_tenant_id: ${{ vars.AZURE_DEVOPS_TENANT_ID != '' && vars.AZURE_DEVOPS_TENANT_ID || vars.AZURE_TENANT_ID != '' && vars.AZURE_TENANT_ID || secrets.AZURE_DEVOPS_TENANT_ID != '' && secrets.AZURE_DEVOPS_TENANT_ID || secrets.AZURE_TENANT_ID != '' && secrets.AZURE_TENANT_ID || '' }}
+      AZDO_PERSONAL_ACCESS_TOKEN: ${{ github.event_name == 'pull_request' && '' || secrets.AZURE_DEVOPS_PAT != '' && secrets.AZURE_DEVOPS_PAT || '' }}
+      AZDO_ORG_SERVICE_URL: ${{ github.event_name == 'pull_request' && '' || vars.AZURE_DEVOPS_ORG_URL != '' && vars.AZURE_DEVOPS_ORG_URL || '' }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ secrets.GCP_REGION != '' && secrets.GCP_REGION || vars.GCP_REGION != '' && vars.GCP_REGION || 'us-central1' }}
+      TF_VAR_zone: ${{ secrets.GCP_ZONE != '' && secrets.GCP_ZONE || vars.GCP_ZONE != '' && vars.GCP_ZONE || 'us-central1-a' }}
+      TF_VAR_k3s_token: ${{ secrets.K3S_TOKEN }}
+      TF_VAR_k3s_url: ${{ secrets.K3S_URL }}
+      TF_VAR_grafana_auth: ${{ secrets.GRAFANA_ADMIN_PASSWORD != '' && format('admin:{0}', secrets.GRAFANA_ADMIN_PASSWORD) || '' }}
+      TOFU_REPLACE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tofu_replace || '' }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Azure Connectivity Pre-flight
+        if: env.TF_VAR_azure_pipelines_mode_enabled == 'true' || env.TF_VAR_runner_provider_mode == 'azure-pipelines'
+        shell: bash
+        env:
+          AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZURE_DEVOPS_ORG_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+        run: |
+          set -euo pipefail
+          echo "Verifying Azure DevOps connectivity..."
+          if [ -z "${AZURE_DEVOPS_PAT:-}" ]; then
+            echo "::error::AZURE_DEVOPS_PAT secret is empty or missing while Azure Pipelines mode is enabled."
+            exit 1
+          fi
+
+          if [ -z "${AZURE_DEVOPS_ORG_URL:-}" ]; then
+            echo "::error::AZURE_DEVOPS_ORG_URL is empty or missing while Azure Pipelines mode is enabled."
+            exit 1
+          fi
+
+          echo "Azure DevOps inputs are present."
+          
+          echo "Testing DNS and HTTPS reachability for dev.azure.com..."
+          if curl -I -sS --max-time 10 https://dev.azure.com > /dev/null; then
+            echo "Successfully reached dev.azure.com"
+          else
+            echo "Failed to reach dev.azure.com"
+          fi
+
+          echo "Testing reachability for login.microsoftonline.com..."
+          if curl -I -sS --max-time 10 https://login.microsoftonline.com > /dev/null; then
+            echo "Successfully reached login.microsoftonline.com"
+          else
+            echo "Failed to reach login.microsoftonline.com"
+          fi
+
+      - name: Setup Cluster Access for Grafana
+        uses: ./.github/actions/setup-cluster-access
+        id: grafana_cluster_access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Start local Grafana tunnel
+        if: steps.grafana_cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          nohup kubectl -n monitoring port-forward svc/prometheus-grafana 3000:80 >/tmp/grafana-port-forward.log 2>&1 &
+          echo $! >/tmp/grafana-port-forward.pid
+          sleep 3
+          if ! kill -0 "$(cat /tmp/grafana-port-forward.pid)" >/dev/null 2>&1; then
+            echo "Grafana port-forward failed to start."
+            cat /tmp/grafana-port-forward.log || true
+            exit 1
+          fi
+          echo "TF_VAR_grafana_url=http://127.0.0.1:3000" >> "$GITHUB_ENV"
+          echo "Using local Grafana tunnel endpoint for Terraform provider."
+
+      - name: Start local OpenClaw tunnel
+        if: steps.grafana_cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          nohup kubectl -n ai port-forward svc/openclaw 8888:8080 >/tmp/openclaw-port-forward.log 2>&1 &
+          echo $! >/tmp/openclaw-port-forward.pid
+          sleep 3
+          if ! kill -0 "$(cat /tmp/openclaw-port-forward.pid)" >/dev/null 2>&1; then
+            echo "OpenClaw port-forward failed to start."
+            cat /tmp/openclaw-port-forward.log || true
+            echo "::warning::OpenClaw tunnel not available; OpenClaw TF resources may show errors in plan."
+          else
+            echo "TF_VAR_openclaw_url=ws://127.0.0.1:8888" >> "$GITHUB_ENV"
+            echo "Using local OpenClaw tunnel endpoint for Terraform provider."
+          fi
+
+      - name: Resolve Grafana auth for plan (best effort)
+        if: steps.grafana_cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          grafana_password="$(kubectl -n monitoring get secret prometheus-grafana -o jsonpath='{.data.admin-password}' 2>/dev/null | base64 -d | tr -d '\r\n' || true)"
+          if [ -n "$grafana_password" ]; then
+            echo "::add-mask::${grafana_password}"
+            echo "::add-mask::admin:${grafana_password}"
+            echo "TF_VAR_grafana_auth=admin:${grafana_password}" >> "$GITHUB_ENV"
+            echo "Resolved Grafana auth from monitoring/prometheus-grafana secret."
+          else
+            echo "Could not resolve Grafana password from cluster secret; using existing TF_VAR_grafana_auth."
+          fi
+
+      - name: Preflight Grafana connectivity
+        run: |
+          set -euo pipefail
+          check_grafana_health() {
+            local url="$1"
+            local out_file="$2"
+            local code
+
+            code="$(curl -sS -o "$out_file" -w '%{http_code}' -u "$TF_VAR_grafana_auth" "${url%/}/api/health" || true)"
+            if [ "$code" != "200" ]; then
+              echo "Grafana preflight failed for ${url} (HTTP ${code})."
+              cat "$out_file" || true
+              return 1
+            fi
+
+            if ! grep -q '"database"' "$out_file"; then
+              echo "Grafana preflight received unexpected payload from ${url}."
+              cat "$out_file" || true
+              return 1
+            fi
+
+            return 0
+          }
+
+          check_grafana_front_door() {
+            local url="$1"
+            local header_file="$2"
+            local code
+
+            code="$(curl -sS -D "$header_file" -o /dev/null -w '%{http_code}' "${url%/}/" || true)"
+            case "$code" in
+              200|301|302|307|308)
+                if grep -qi '^www-authenticate: Cloudflare-Access' "$header_file" || grep -qi '^location: .*cloudflareaccess\.com/' "$header_file"; then
+                  echo "Grafana front-door preflight reached protected endpoint ${url} (HTTP ${code})."
+                  return 0
+                fi
+                ;;
+            esac
+
+            echo "Grafana front-door preflight failed for ${url} (HTTP ${code})."
+            cat "$header_file" || true
+            return 1
+          }
+
+          wait_for_grafana() {
+            local url="$1"
+            local attempts=8
+            local out_file="/tmp/grafana-health.json"
+
+            for attempt in $(seq 1 "$attempts"); do
+              if check_grafana_health "$url" "$out_file"; then
+                return 0
+              fi
+
+              if [ "$attempt" -lt "$attempts" ]; then
+                echo "Retrying Grafana preflight (${attempt}/${attempts}) for ${url}..."
+                sleep 3
+              fi
+            done
+
+            return 1
+          }
+
+          wait_for_grafana_front_door() {
+            local url="$1"
+            local attempts=8
+            local header_file="/tmp/grafana-front-door.headers"
+
+            for attempt in $(seq 1 "$attempts"); do
+              if check_grafana_front_door "$url" "$header_file"; then
+                return 0
+              fi
+
+              if [ "$attempt" -lt "$attempts" ]; then
+                echo "Retrying Grafana front-door preflight (${attempt}/${attempts}) for ${url}..."
+                sleep 3
+              fi
+            done
+
+            return 1
+          }
+
+          GRAFANA_URL="${TF_VAR_grafana_url:-https://metrics.archer.casa}"
+          if wait_for_grafana "$GRAFANA_URL"; then
+            echo "Grafana preflight passed for ${GRAFANA_URL}."
+            exit 0
+          fi
+
+          if [ "$GRAFANA_URL" = "http://127.0.0.1:3000" ]; then
+            FALLBACK_GRAFANA_URL="https://metrics.archer.casa"
+            echo "Local Grafana tunnel preflight failed; trying fallback endpoint ${FALLBACK_GRAFANA_URL}."
+            if wait_for_grafana_front_door "$FALLBACK_GRAFANA_URL"; then
+              echo "::warning::Grafana API tunnel unavailable; verified the protected public endpoint instead."
+              echo "Grafana preflight passed via protected fallback endpoint ${FALLBACK_GRAFANA_URL}."
+              exit 0
+            fi
+          fi
+
+          echo "Grafana preflight failed after retries."
+          exit 1
+
+      - name: Create variables file
+        run: |
+          echo 'allowed_emails = ${{ secrets.TF_VAR_ALLOWED_EMAILS }}' >> secrets.auto.tfvars
+          echo 'allowed_email_domains = ${{ secrets.TF_VAR_ALLOWED_EMAIL_DOMAINS }}' >> secrets.auto.tfvars
+          echo 'allowed_family_emails = ${{ secrets.TF_VAR_ALLOWED_FAMILY_EMAILS }}' >> secrets.auto.tfvars
+          echo 'enable_apex_redirect = true' >> secrets.auto.tfvars
+          echo 'keycloak_realm = "homelab"' >> secrets.auto.tfvars
+          echo 'enable_unifi_access = true' >> secrets.auto.tfvars
+          echo 'unifi_domain = "unifi.archer.casa"' >> secrets.auto.tfvars
+          echo 'unifi_origin = "https://home.local:8443"' >> secrets.auto.tfvars
+          echo 'ntfy_topic = "gha"' >> secrets.auto.tfvars
+          echo 'ntfy_token = "${{ secrets.NTFY_TOKEN }}"' >> secrets.auto.tfvars
+          echo 'automation_ui_health = { tailscale_auth_key = "${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}" }' >> secrets.auto.tfvars
+
+      - name: Verify and inject encryption secret
+        run: |
+          if [ -z "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}" ]; then
+            echo "TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE is missing"
+            exit 1
+          fi
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"/g' backend.tf
+
+      - name: Disable Azure Terraform for PR validation
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          for filename in ("azure-functions-build-dispatch.tf", "azure-student-vm.tf"):
+              path = Path(filename)
+              if path.exists():
+                  path.rename(path.with_suffix(path.suffix + ".pr-disabled"))
+
+          Path("azure-pr-stubs.tf").write_text(
+              (
+                  "locals {\n"
+                  "  azure_functions_build_dispatch_dispatch_url = \"\"\n"
+                  "  azure_functions_build_dispatch_health_url   = \"\"\n"
+                  "  azure_student_vm_provider_enabled           = var.enable_azure_student_vm\n"
+                  "  azure_student_vm_subscription_id            = trimspace(var.azure_subscription_id) != \"\" ? trimspace(var.azure_subscription_id) : \"00000000-0000-0000-0000-000000000000\"\n"
+                  "  azure_student_vm_tenant_id                  = trimspace(var.azure_tenant_id) != \"\" ? trimspace(var.azure_tenant_id) : (trimspace(var.azure_devops_tenant_id) != \"\" ? trimspace(var.azure_devops_tenant_id) : \"00000000-0000-0000-0000-000000000000\")\n"
+                  "  azure_student_vm_client_id                  = trimspace(var.azure_client_id) != \"\" ? trimspace(var.azure_client_id) : (trimspace(var.azure_devops_client_id) != \"\" ? trimspace(var.azure_devops_client_id) : \"00000000-0000-0000-0000-000000000000\")\n"
+                  "  azure_student_vm_client_secret              = trimspace(var.azure_client_secret) != \"\" ? var.azure_client_secret : (trimspace(var.azure_devops_client_secret) != \"\" ? var.azure_devops_client_secret : \"disabled\")\n"
+                  "}\n"
+                  "\n"
+                  "provider \"azurerm\" {\n"
+                  "  alias = \"student_vm\"\n"
+                  "\n"
+                  "  features {}\n"
+                  "\n"
+                  "  use_cli = false\n"
+                  "\n"
+                  "  resource_provider_registrations = local.azure_student_vm_provider_enabled ? \"core\" : \"none\"\n"
+                  "  subscription_id                 = local.azure_student_vm_subscription_id\n"
+                  "  tenant_id                       = local.azure_student_vm_tenant_id\n"
+                  "  client_id                       = local.azure_student_vm_client_id\n"
+                  "  client_secret                   = local.azure_student_vm_client_secret\n"
+                  "}\n"
+              ),
+              encoding="utf-8",
+          )
+          PY
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: cloudflare-access/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Prune legacy resources from state (non-destructive)
+        run: |
+          set -euo pipefail
+          LEGACY_ADDR_REGEX='^(tailscale_.*|github_actions_secret\.cleanarr_client_(id|secret)\[0\]|cloudflare_zero_trust_access_application\.acme_challenge_bypass\[.*\]|cloudflare_zero_trust_access_application\.calibre|cloudflare_zero_trust_access_policy\.(acme_challenge_bypass|app_launcher_family|admin_.*|family_.*|jellyfin_streaming_bypass|keycloak_bypass|pocket_id_bypass|rancher_bootstrap_bypass|sonarr_api_bypass|github_argocd_bypass|unifi_terraform\[0\]|vaultwarden_.*_bypass))$'
+
+          STATE_LIST="$(tofu state list 2>/dev/null || true)"
+          if [ -z "${STATE_LIST}" ]; then
+            exit 0
+          fi
+
+          LEGACY_ADDRS="$(echo "${STATE_LIST}" | grep -E "${LEGACY_ADDR_REGEX}" || true)"
+          if [ -z "${LEGACY_ADDRS}" ]; then
+            exit 0
+          fi
+
+          while IFS= read -r addr; do
+            [ -z "${addr}" ] && continue
+            tofu state rm "${addr}" || true
+          done <<< "${LEGACY_ADDRS}"
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "Pre-flight Cloudflare state reconciliation import (best effort)..."
+            if ! python3 ../../scripts/import-cloudflare-state.py --terraform-dir .; then
+              echo "Pre-flight import reported errors; continuing with plan."
+            fi
+          else
+            echo "Skipping pre-flight import during PR validation."
+          fi
+
+          PLAN_FILE="/tmp/tofu-cloudflare.tfplan"
+          PLAN_LOG="/tmp/tofu-homelab-plan.log"
+          LOCK_TIMEOUT="5m"
+          PLAN_CMD_TIMEOUT="16m"
+
+          REPLACE_ARG=""
+          if [ -n "${TOFU_REPLACE}" ]; then
+            REPLACE_ARG="-replace=${TOFU_REPLACE}"
+          fi
+
+          run_plan() {
+            set +e
+            timeout --preserve-status "${PLAN_CMD_TIMEOUT}" \
+              tofu plan -input=false -refresh=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" -out="${PLAN_FILE}" ${REPLACE_ARG:+"${REPLACE_ARG}"} -parallelism=10 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          }
+
+          run_plan
+          set -e
+
+          if [ "${PLAN_EXIT}" -eq 124 ]; then
+            echo "Cloudflare OpenTofu plan timed out after ${PLAN_CMD_TIMEOUT}."
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying Cloudflare plan after stale lock cleanup..."
+            run_plan
+          fi
+
+          if [ "${PLAN_EXIT}" -eq 124 ]; then
+            echo "Cloudflare OpenTofu plan timed out after ${PLAN_CMD_TIMEOUT}."
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            run_plan
+          fi
+
+          if [ "${PLAN_EXIT}" -eq 124 ]; then
+            echo "Cloudflare OpenTofu plan timed out after ${PLAN_CMD_TIMEOUT}."
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "Cloudflare OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+  identity-plan:
+    name: OpenTofu Validate (Identity)
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    concurrency:
+      group: tofu-identity-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: terraform/identity
+    env:
+      TF_VAR_keycloak_url: https://sso.archer.casa
+      TF_VAR_keycloak_client_id: admin-cli
+      TF_VAR_keycloak_client_secret: static-validation-secret
+      TF_VAR_keycloak_username: static-validation-admin
+      TF_VAR_keycloak_password: static-validation-password
+      TF_VAR_keycloak_realm: master
+      TF_VAR_pocketid_endpoint: https://passkey.archer.casa
+      TF_VAR_pocketid_api_token: static-validation-pocketid-api-token
+      TF_VAR_pocketid_client_id: static-validation-pocketid-client-id
+      TF_VAR_pocketid_client_secret: static-validation-pocketid-client-secret
+      TF_VAR_cloudflare_access_client_secret: static-validation-cloudflare-access-secret
+      TF_VAR_rancher_client_secret: static-validation-rancher-secret
+      TF_VAR_servarr_client_secret: static-validation-servarr-secret
+      TF_VAR_calibre_web_client_secret: static-validation-calibre-web-secret
+      TF_VAR_gh_oauth_client_id: static-validation-gh-client-id
+      TF_VAR_gh_oauth_client_secret: static-validation-gh-client-secret
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Check OpenTofu formatting
+        run: tofu fmt -check
+
+      - name: OpenTofu init
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh -backend=false
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+  gcp-worker-plan:
+    name: OpenTofu Plan (GCP Worker)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.gcp_worker == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    defaults:
+      run:
+        working-directory: terraform/gcp-worker
+    env:
+      TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_gcp_node_enabled: ${{ vars.GCP_NODE_ENABLED != '' && vars.GCP_NODE_ENABLED || 'false' }}
+      TF_VAR_k3s_token: ${{ secrets.K3S_TOKEN }}
+      TF_VAR_k3s_url: ${{ secrets.K3S_URL }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TF_VAR_enable_gcp_reconcile_scheduler: ${{ (vars.GCP_RECONCILE_SCHEDULER_ENABLED == 'true' || vars.GCP_RECONCILE_SCHEDULER_ENABLED == true) && 'true' || 'false' }}
+      TF_VAR_gcp_reconcile_scheduler_job_name: ${{ vars.GCP_RECONCILE_SCHEDULER_JOB_NAME != '' && vars.GCP_RECONCILE_SCHEDULER_JOB_NAME || 'github-gcp-reconcile-hourly' }}
+      TF_VAR_gcp_reconcile_scheduler_schedule: ${{ vars.GCP_RECONCILE_SCHEDULER_SCHEDULE != '' && vars.GCP_RECONCILE_SCHEDULER_SCHEDULE || '0 * * * *' }}
+      TF_VAR_gcp_reconcile_scheduler_time_zone: ${{ vars.GCP_RECONCILE_SCHEDULER_TIME_ZONE != '' && vars.GCP_RECONCILE_SCHEDULER_TIME_ZONE || 'Etc/UTC' }}
+      TF_VAR_gcp_reconcile_scheduler_paused: ${{ (vars.GCP_RECONCILE_SCHEDULER_PAUSED == 'true' || vars.GCP_RECONCILE_SCHEDULER_PAUSED == true) && 'true' || 'false' }}
+      TF_VAR_gcp_reconcile_scheduler_allow_deletions: ${{ (vars.GCP_RECONCILE_SCHEDULER_ALLOW_DELETIONS == 'true' || vars.GCP_RECONCILE_SCHEDULER_ALLOW_DELETIONS == true) && 'true' || 'false' }}
+      TF_VAR_github_actions_dispatch_secret_name: ${{ vars.GCP_RECONCILE_DISPATCH_SECRET_NAME != '' && vars.GCP_RECONCILE_DISPATCH_SECRET_NAME || 'github-scheduler-token' }}
+      TF_VAR_github_actions_dispatch_secret_version: ${{ vars.GCP_RECONCILE_DISPATCH_SECRET_VERSION != '' && vars.GCP_RECONCILE_DISPATCH_SECRET_VERSION || 'latest' }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+      TOFU_REPLACE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tofu_replace || '' }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Create variables file
+        run: |
+          echo 'allowed_emails = ${{ secrets.TF_VAR_ALLOWED_EMAILS }}' >> secrets.auto.tfvars
+
+      - name: Verify and inject encryption secret
+        run: |
+          if [ -z "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}" ]; then
+            echo "TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE is missing"
+            exit 1
+          fi
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"/g' backend.tf
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: gcp-worker/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        run: |
+          set -euo pipefail
+
+          PLAN_FILE="/tmp/tofu-gcp-worker.tfplan"
+          PLAN_LOG="/tmp/tofu-gcp-worker-plan.log"
+          REPLACE_ARG=""
+          if [ -n "${TOFU_REPLACE}" ]; then
+            REPLACE_ARG="-replace=${TOFU_REPLACE}"
+          fi
+
+          set +e
+          if [ -n "${REPLACE_ARG}" ]; then
+            tofu plan -input=false -detailed-exitcode -lock-timeout=5m -out="${PLAN_FILE}" "${REPLACE_ARG}" -parallelism=6 2>&1 | tee "${PLAN_LOG}"
+          else
+            tofu plan -input=false -detailed-exitcode -lock-timeout=5m -out="${PLAN_FILE}" -parallelism=6 2>&1 | tee "${PLAN_LOG}"
+          fi
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "GCP Worker OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "GCP Worker OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+  vaultwarden-plan:
+    name: OpenTofu Plan (Vaultwarden)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.vaultwarden == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    concurrency:
+      group: tofu-vaultwarden-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: terraform/vaultwarden
+    env:
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ secrets.GCP_REGION != '' && secrets.GCP_REGION || vars.GCP_REGION != '' && vars.GCP_REGION || 'us-central1' }}
+      TF_VAR_github_mcp_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_cloudflare_mcp_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_google_credentials: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_homeassistant_mcp_token: ${{ secrets.HOME_ASSISTANT_MCP_TOKEN }}
+      TF_VAR_paperless_mcp_api_token: ${{ secrets.PAPERLESS_MCP_API_TOKEN }}
+      TF_VAR_nextcloud_mcp_app_password: ${{ secrets.NEXTCLOUD_MCP_APP_PASSWORD }}
+      TF_VAR_grafana_mcp_token: ${{ secrets.GRAFANA_MCP_TOKEN }}
+      TF_VAR_ntfy_admin_password: ${{ secrets.NTFY_ADMIN_PASSWORD }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TF_VAR_pushover_user_key: ${{ secrets.PUSHOVER_USER_KEY || 'placeholder' }}
+      TF_VAR_pushover_api_token_default: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_media: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_system: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_cluster: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_backup: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_security: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Install Bitwarden CLI
+        run: |
+          if command -v bw >/dev/null 2>&1; then
+            bw --version
+            exit 0
+          fi
+          npm install -g @bitwarden/cli
+          bw --version
+
+      - name: Resolve Vaultwarden inputs
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          BRIDGE_NS="external-secrets"
+          ORG_NAME="homelab"
+          COLLECTION_NAME="K3s Secrets"
+
+          BW_SERVER="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_SERVER}' | base64 -d)"
+          BW_EMAIL="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_EMAIL}' | base64 -d)"
+          BW_PASSWORD="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_PASSWORD}' | base64 -d)"
+          KEYCLOAK_ADMIN_PASSWORD="$(kubectl get secret keycloak-admin -n auth -o jsonpath='{.data.KEYCLOAK_ADMIN_PASSWORD}' | base64 -d)"
+          POCKETID_CLIENT_ID="$(kubectl get secret pocket-id-oidc -n auth -o jsonpath='{.data.POCKETID_CLIENT_ID}' | base64 -d)"
+          POCKETID_CLIENT_SECRET="$(kubectl get secret pocket-id-oidc -n auth -o jsonpath='{.data.POCKETID_CLIENT_SECRET}' | base64 -d)"
+
+          for v in BW_SERVER BW_EMAIL BW_PASSWORD ORG_NAME COLLECTION_NAME KEYCLOAK_ADMIN_PASSWORD POCKETID_CLIENT_ID POCKETID_CLIENT_SECRET; do
+            eval "val=\${$v:-}"
+            if [ -z "${val}" ]; then
+              echo "Missing required Vaultwarden input ${v}."
+              exit 1
+            fi
+          done
+
+          echo "::add-mask::$BW_SERVER"
+          echo "::add-mask::$BW_EMAIL"
+          echo "::add-mask::$BW_PASSWORD"
+          echo "::add-mask::$KEYCLOAK_ADMIN_PASSWORD"
+          echo "::add-mask::$POCKETID_CLIENT_ID"
+          echo "::add-mask::$POCKETID_CLIENT_SECRET"
+
+          export BITWARDENCLI_APPDATA_DIR="$(mktemp -d)"
+          export BW_NOINTERACTION=true
+          bw config server "${BW_SERVER}"
+          bw logout >/dev/null 2>&1 || true
+          BW_SESSION="$(bw login "${BW_EMAIL}" "${BW_PASSWORD}" --raw)"
+          if [ -z "${BW_SESSION}" ]; then
+            echo "Bitwarden CLI login did not return a session."
+            exit 1
+          fi
+          echo "::add-mask::$BW_SESSION"
+          bw sync --session "${BW_SESSION}"
+          ORG_ID="$(bw list organizations --session "${BW_SESSION}" | jq -r --arg name "${ORG_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${ORG_ID}" ]; then
+            echo "Bitwarden CLI did not expose organization ${ORG_NAME}."
+            exit 1
+          fi
+          COLLECTION_ID="$(bw list org-collections --organizationid "${ORG_ID}" --session "${BW_SESSION}" | jq -r --arg name "${COLLECTION_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${COLLECTION_ID}" ]; then
+            echo "Bitwarden CLI did not expose collection ${COLLECTION_NAME} in organization ${ORG_NAME}."
+            exit 1
+          fi
+
+          echo "TF_VAR_bw_server_url=${BW_SERVER}" >> "$GITHUB_ENV"
+          echo "TF_VAR_bw_email=${BW_EMAIL}" >> "$GITHUB_ENV"
+          echo "TF_VAR_bw_master_password=${BW_PASSWORD}" >> "$GITHUB_ENV"
+          echo "TF_VAR_homelab_organization_id=${ORG_ID}" >> "$GITHUB_ENV"
+          echo "TF_VAR_k3s_secrets_collection_id=${COLLECTION_ID}" >> "$GITHUB_ENV"
+          echo "TF_VAR_keycloak_admin_password=${KEYCLOAK_ADMIN_PASSWORD}" >> "$GITHUB_ENV"
+          echo "TF_VAR_pocketid_client_id=${POCKETID_CLIENT_ID}" >> "$GITHUB_ENV"
+          echo "TF_VAR_pocketid_client_secret=${POCKETID_CLIENT_SECRET}" >> "$GITHUB_ENV"
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: vaultwarden/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        run: |
+          set -euo pipefail
+          PLAN_LOG="/tmp/tofu-vaultwarden-plan.log"
+          LOCK_TIMEOUT="15m"
+
+          set +e
+          tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying Vaultwarden plan after stale lock cleanup..."
+            set +e
+            tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            set +e
+            tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "Vaultwarden OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "Vaultwarden OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+  uptime-kuma-plan:
+    name: OpenTofu Plan (Uptime Kuma App Engine)
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON(format('["{0}"]', vars.AZURE_VM_RUNNER_LABEL != '' && vars.AZURE_VM_RUNNER_LABEL || 'home-gh-runner')) || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    defaults:
+      run:
+        working-directory: terraform/uptime-kuma-app-engine
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_github_repository: ${{ github.event.repository.name }}
+      # Disable secrets write during plan - secrets_sync only runs on apply
+      TF_VAR_enable_github_actions_secrets_sync: 'false'
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+      TOFU_REPLACE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tofu_replace || '' }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Verify and inject encryption secret
+        run: |
+          if [ -z "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}" ]; then
+            echo "TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE is missing"
+            exit 1
+          fi
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"/g' backend.tf
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: uptime-kuma-app-engine/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        run: |
+          set -euo pipefail
+
+          PLAN_FILE="/tmp/tofu-uptime-kuma.tfplan"
+          PLAN_LOG="/tmp/tofu-uptime-kuma-plan.log"
+          REPLACE_ARG=""
+          if [ -n "${TOFU_REPLACE}" ]; then
+            REPLACE_ARG="-replace=${TOFU_REPLACE}"
+          fi
+
+          set +e
+          if [ -n "${REPLACE_ARG}" ]; then
+            tofu plan -input=false -detailed-exitcode -lock-timeout=5m -out="${PLAN_FILE}" "${REPLACE_ARG}" -parallelism=6 2>&1 | tee "${PLAN_LOG}"
+          else
+            tofu plan -input=false -detailed-exitcode -lock-timeout=5m -out="${PLAN_FILE}" -parallelism=6 2>&1 | tee "${PLAN_LOG}"
+          fi
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "Uptime Kuma OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "Uptime Kuma OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+  unifi-plan:
+    name: OpenTofu Plan (UniFi)
+    needs: [detect-changes, homelab-plan]
+    if: (github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.unifi == 'true') && (needs.homelab-plan.result == 'success' || needs.homelab-plan.result == 'skipped')
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    defaults:
+      run:
+        working-directory: terraform/unifi
+    env:
+      TF_VAR_username: ${{ secrets.UNIFI_USERNAME }}
+      TF_VAR_password: ${{ secrets.UNIFI_PASSWORD }}
+      TF_VAR_site: default
+      TF_VAR_allow_insecure: 'true'
+      TF_VAR_api_url: 'http://127.0.0.1:8787'
+      UNIFI_LOGIN_STYLE: 'auth'
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CF_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ZERO_TRUST_HEADERS_JSON: ${{ secrets.UNIFI_ZERO_TRUST_HEADERS_JSON }}
+      ZERO_TRUST_HEADERS_JSON_FALLBACK: ${{ secrets.ZERO_TRUST_HEADERS_JSON }}
+      UNIFI_WLAN_PASSPHRASES_JSON: ${{ secrets.UNIFI_WLAN_PASSPHRASES_JSON }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+      TOFU_REPLACE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tofu_replace || '' }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Inject encryption passphrase (Cloudflare backend)
+        working-directory: terraform/homelab
+        run: |
+          if [ -n "${TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE}" ]; then
+            sed -i "s/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = \"$TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE\"/g" backend.tf
+          fi
+
+      - name: Inject encryption passphrase (UniFi backend)
+        run: |
+          if [ -n "${TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE}" ]; then
+            sed -i "s/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = \"$TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE\"/g" backend.tf
+          fi
+
+      - name: Refresh UniFi Access headers from Cloudflare state
+        working-directory: terraform/homelab
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: cloudflare-access/terraform.tfstate
+        run: |
+          set -euo pipefail
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+          UNIFI_CLIENT_ID=""
+          UNIFI_CLIENT_SECRET=""
+          if tofu -no-color output -raw unifi_terraform_client_id >/tmp/unifi_id.txt 2>/dev/null; then
+            UNIFI_CLIENT_ID="$(tail -n 1 /tmp/unifi_id.txt | tr -d '\r\n')"
+          fi
+          if tofu -no-color output -raw unifi_terraform_client_secret >/tmp/unifi_secret.txt 2>/dev/null; then
+            UNIFI_CLIENT_SECRET="$(tail -n 1 /tmp/unifi_secret.txt | tr -d '\r\n')"
+          fi
+
+          if [ -n "$UNIFI_CLIENT_ID" ] && [ -n "$UNIFI_CLIENT_SECRET" ]; then
+            UNIFI_JSON=$(UNIFI_CLIENT_ID="$UNIFI_CLIENT_ID" UNIFI_CLIENT_SECRET="$UNIFI_CLIENT_SECRET" python3 -c 'import json, os; print(json.dumps({"CF-Access-Client-Id": os.environ["UNIFI_CLIENT_ID"], "CF-Access-Client-Secret": os.environ["UNIFI_CLIENT_SECRET"]}))')
+            echo "::add-mask::$UNIFI_JSON"
+            echo "ZERO_TRUST_HEADERS_JSON=$UNIFI_JSON" >> "$GITHUB_ENV"
+          fi
+
+      - name: Normalize ZERO_TRUST_HEADERS_JSON
+        run: |
+          set -euo pipefail
+
+          normalize_json_object() {
+            local value="$1"
+            printf '%s' "$value" | jq -ce 'if type == "object" then . else error("not object") end' 2>/dev/null || true
+          }
+
+          normalized="$(normalize_json_object "${ZERO_TRUST_HEADERS_JSON:-}")"
+
+          if [ -z "$normalized" ] && [ -n "${ZERO_TRUST_HEADERS_JSON_FALLBACK:-}" ]; then
+            normalized="$(normalize_json_object "$ZERO_TRUST_HEADERS_JSON_FALLBACK")"
+            if [ -n "$normalized" ]; then
+              echo "Primary UNIFI_ZERO_TRUST_HEADERS_JSON is invalid; using ZERO_TRUST_HEADERS_JSON fallback."
+            fi
+          fi
+
+          if [ -z "$normalized" ]; then
+            echo "ZERO_TRUST_HEADERS_JSON is missing or invalid; using empty object for local UniFi probing."
+            normalized='{}'
+          fi
+
+          echo "::add-mask::$normalized"
+          echo "ZERO_TRUST_HEADERS_JSON=$normalized" >> "$GITHUB_ENV"
+
+      - name: Validate UniFi credentials
+        run: |
+          if [ -z "$TF_VAR_username" ] || [ -z "$TF_VAR_password" ]; then
+            echo "Missing UNIFI_USERNAME or UNIFI_PASSWORD secrets."
+            exit 1
+          fi
+
+      - name: Validate ZERO_TRUST_HEADERS_JSON
+        run: |
+          echo "$ZERO_TRUST_HEADERS_JSON" | jq -e 'type == "object"' > /dev/null
+
+      - name: Start Zero Trust proxy
+        run: |
+          set -euo pipefail
+          TARGET_BASE_URL="https://unifi.archer.casa"
+          if curl -k --max-time 3 -sS -o /dev/null https://home.local:8443/api/self; then
+            TARGET_BASE_URL="https://home.local:8443"
+          elif curl -k --max-time 3 -sS -o /dev/null https://192.168.1.150:8443/api/self; then
+            TARGET_BASE_URL="https://192.168.1.150:8443"
+          fi
+          echo "UNIFI_PROXY_TARGET_BASE_URL=${TARGET_BASE_URL}" >> "$GITHUB_ENV"
+
+          python3 ../../scripts/unifi/zero_trust_proxy.py \
+            --target-base-url "${TARGET_BASE_URL}" \
+            --listen-host 127.0.0.1 \
+            --listen-port 8787 \
+            --allow-insecure >/tmp/unifi-zero-trust-proxy.log 2>&1 &
+          PROXY_PID=$!
+          echo "ZERO_TRUST_PROXY_PID=$PROXY_PID" >> "$GITHUB_ENV"
+
+      - name: Probe UniFi API via Zero Trust proxy
+        run: |
+          set -euo pipefail
+          status="000"
+          for i in {1..30}; do
+            status=$(curl -k -sS --max-time 5 -o /tmp/unifi-probe-body.txt -w '%{http_code}' http://127.0.0.1:8787/api/self || true)
+            if [ "${status}" = "200" ] || [ "${status}" = "401" ]; then
+              break
+            fi
+            sleep 2
+          done
+
+          if [ "${status}" != "200" ] && [ "${status}" != "401" ]; then
+            echo "UniFi probe never reached expected status (200/401)."
+            exit 1
+          fi
+
+      - name: Detect UniFi API login style
+        run: |
+          set -euo pipefail
+          login_ok() {
+            local body_file="$1"
+            jq -e '((.meta.rc // .meta.RC // "") | ascii_downcase) == "ok"' "$body_file" >/dev/null 2>&1
+          }
+
+          LOGIN_PAYLOAD="$(jq -nc --arg u "$TF_VAR_username" --arg p "$TF_VAR_password" '{username:$u,password:$p}')"
+
+          auth_status="$(curl -k -sS --max-time 10 -o /tmp/unifi-login-auth.json -w '%{http_code}' -H 'Content-Type: application/json' --data "$LOGIN_PAYLOAD" http://127.0.0.1:8787/api/auth/login || true)"
+          if [ "${auth_status}" = "200" ] && login_ok /tmp/unifi-login-auth.json; then
+            echo "UNIFI_LOGIN_STYLE=auth" >> "$GITHUB_ENV"
+            echo "TF_VAR_api_url=http://127.0.0.1:8787" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          legacy_status="$(curl -k -sS --max-time 10 -o /tmp/unifi-login-legacy.json -w '%{http_code}' -H 'Content-Type: application/json' --data "$LOGIN_PAYLOAD" http://127.0.0.1:8787/api/login || true)"
+          if [ "${legacy_status}" = "200" ] && login_ok /tmp/unifi-login-legacy.json; then
+            echo "UNIFI_LOGIN_STYLE=legacy" >> "$GITHUB_ENV"
+            echo "TF_VAR_api_url=http://127.0.0.1:8787/__legacy_style_probe__" >> "$GITHUB_ENV"
+            exit 0
+          fi
+
+          exit 1
+
+      - name: Materialize generated UniFi Terraform files
+        run: |
+          set -euo pipefail
+          [ -f generated/resources.auto.tf ]
+          [ -f generated/imports.tf ]
+          rm -f ./zz_generated_resources.auto.tf ./zz_generated_imports.auto.tf
+          cp generated/resources.auto.tf ./zz_generated_resources.auto.tf
+          cp generated/imports.tf ./zz_generated_imports.auto.tf
+
+      - name: Reconcile missing generated UniFi firewall-group imports
+        run: |
+          set -euo pipefail
+          python3 ../../scripts/unifi/reconcile_generated_imports.py \
+            --resources-file ./zz_generated_resources.auto.tf \
+            --imports-file ./zz_generated_imports.auto.tf \
+            --api-url "${TF_VAR_api_url}" \
+            --username "${TF_VAR_username}" \
+            --password "${TF_VAR_password}" \
+            --site "${TF_VAR_site}" \
+            --allow-insecure
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: unifi/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        run: |
+          set -euo pipefail
+          PLAN_FILE="/tmp/tofu-unifi.tfplan"
+          PLAN_LOG="/tmp/tofu-unifi-plan.log"
+
+          REPLACE_ARG=""
+          if [ -n "${TOFU_REPLACE}" ]; then
+            REPLACE_ARG="-replace=${TOFU_REPLACE}"
+          fi
+
+          set +e
+          if [ -n "${REPLACE_ARG}" ]; then
+            tofu plan -input=false -detailed-exitcode -lock-timeout=5m -out="${PLAN_FILE}" "${REPLACE_ARG}" -parallelism=1 2>&1 | tee "${PLAN_LOG}"
+          else
+            tofu plan -input=false -detailed-exitcode -lock-timeout=5m -out="${PLAN_FILE}" -parallelism=1 2>&1 | tee "${PLAN_LOG}"
+          fi
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "UniFi OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+      - name: Dump UniFi proxy log on failure
+        if: failure()
+        run: tail -n 300 /tmp/unifi-zero-trust-proxy.log || true
+
+      - name: Release State Lock on Cancel
+        if: cancelled()
+        run: |
+          echo "Job cancelled. Discovering and releasing state lock..."
+          tofu plan -input=false -lock-timeout=1s > /tmp/cancel-lock.log 2>&1 || true
+          LOCK_ID=$(sed -n 's/.*ID:[[:space:]]*\(.*\)$/\1/p' /tmp/cancel-lock.log | tail -n 1 | tr -d '\r' | xargs || true)
+          if [ -n "$LOCK_ID" ]; then
+            echo "Force unlocking $LOCK_ID..."
+            tofu force-unlock -force "$LOCK_ID"
+          else
+            echo "No active lock found."
+          fi
+
+  arr-config-plan:
+    name: OpenTofu Plan (ARR Config)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.arr_config == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    concurrency:
+      group: opentofu-plan-arr-config
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: terraform/arr-config
+    env:
+      TF_VAR_radarr_api_key: ${{ secrets.RADARR_APIKEY != '' && secrets.RADARR_APIKEY || secrets.RADARR_API_KEY }}
+      TF_VAR_sonarr_api_key: ${{ secrets.SONARR_APIKEY != '' && secrets.SONARR_APIKEY || secrets.SONARR_API_KEY }}
+      TF_VAR_lidarr_api_key: ${{ secrets.LIDARR_APIKEY != '' && secrets.LIDARR_APIKEY || secrets.LIDARR_API_KEY }}
+      TF_VAR_readarr_api_key: ${{ secrets.READARR_APIKEY != '' && secrets.READARR_APIKEY || secrets.READARR_API_KEY }}
+      TF_VAR_prowlarr_api_key: ${{ secrets.PROWLARR_APIKEY != '' && secrets.PROWLARR_APIKEY || secrets.PROWLARR_API_KEY }}
+      TF_VAR_seerr_api_key: ${{ secrets.JELLYSEERR_APIKEY != '' && secrets.JELLYSEERR_APIKEY || secrets.JELLYSEERR_API_KEY }}
+      TF_VAR_ntfy_admin_password: ${{ secrets.NTFY_ADMIN_PASSWORD }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TOFU_REPLACE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tofu_replace || '' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Install Seerr provider release mirror
+        run: |
+          bash ../../scripts/install-seerr-provider-release.sh
+
+      - name: Inject encryption passphrase (ARR backend)
+        run: |
+          if [ -z "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}" ]; then
+            echo "TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE is missing"
+            exit 1
+          fi
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"/g' backend.tf
+
+      - name: Install cloudflared
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.local/bin"
+          curl -fsSL "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" \
+            -o "$HOME/.local/bin/cloudflared"
+          chmod +x "$HOME/.local/bin/cloudflared"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Install kubectl (ARR fallback)
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access (ARR fallback)
+        id: arr_cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Start ARR Cloudflare TCP forwards
+        env:
+          USE_SELF_HOSTED: ${{ vars.USE_SELF_HOSTED }}
+          PR_VALIDATION: ${{ github.event_name == 'pull_request' }}
+          ARR_CLUSTER_CONFIGURED: ${{ steps.arr_cluster_access.outputs.configured }}
+          CF_ACCESS_CLIENT_ID: ${{ secrets.CF_ARR_ACCESS_CLIENT_ID }}
+          CF_ACCESS_CLIENT_SECRET: ${{ secrets.CF_ARR_ACCESS_CLIENT_SECRET }}
+          ARR_RADARR_HOSTNAME: ${{ vars.ARR_RADARR_HOSTNAME }}
+          ARR_SONARR_HOSTNAME: ${{ vars.ARR_SONARR_HOSTNAME }}
+          ARR_LIDARR_HOSTNAME: ${{ vars.ARR_LIDARR_HOSTNAME }}
+          ARR_READARR_HOSTNAME: ${{ vars.ARR_READARR_HOSTNAME }}
+          ARR_PROWLARR_HOSTNAME: ${{ vars.ARR_PROWLARR_HOSTNAME }}
+        run: |
+          set -euo pipefail
+
+          echo "ARR_PLAN_CONNECTIVITY_OK=true" >> "$GITHUB_ENV"
+
+          mark_arr_connectivity_unavailable() {
+            local reason="$1"
+
+            if [ "${PR_VALIDATION:-false}" = "true" ]; then
+              echo "::warning::${reason}; skipping ARR OpenTofu plan during PR validation."
+              echo "ARR_PLAN_CONNECTIVITY_OK=false" >> "$GITHUB_ENV"
+              return 0
+            fi
+
+            echo "${reason}"
+            return 1
+          }
+
+          missing=""
+          for v in CF_ACCESS_CLIENT_ID CF_ACCESS_CLIENT_SECRET ARR_RADARR_HOSTNAME ARR_SONARR_HOSTNAME ARR_LIDARR_HOSTNAME ARR_READARR_HOSTNAME ARR_PROWLARR_HOSTNAME; do
+            eval "val=\${$v:-}"
+            if [ -z "$val" ]; then
+              missing="${missing} ${v}"
+            fi
+          done
+
+          if [ -n "${missing}" ]; then
+            if [ "${USE_SELF_HOSTED:-}" = "true" ] || [ "${USE_SELF_HOSTED:-}" = "True" ]; then
+              if [ "${ARR_CLUSTER_CONFIGURED:-false}" = "true" ]; then
+                echo "Cloudflare ARR tunnel inputs missing (${missing}). Falling back to kubectl port-forward."
+
+                mkdir -p /tmp/arr-k8s-pf
+
+                start_pf() {
+                  local svc="$1"
+                  local local_port="$2"
+                  local target_port="$3"
+                  nohup kubectl -n media port-forward --address 127.0.0.1 "svc/${svc}" "${local_port}:${target_port}" \
+                    >/tmp/arr-k8s-pf/"${svc}".log 2>&1 &
+                }
+
+                start_pf radarr-service 17878 7878
+                start_pf sonarr-service 18989 8989
+                start_pf lidarr-service 18686 8686
+                start_pf readarr-service 18787 8787
+                start_pf prowlarr-service 19696 9696
+                start_pf jellyseerr 15055 5055
+
+                wait_port() {
+                  local name="$1"
+                  local port="$2"
+                  for _ in $(seq 1 90); do
+                    if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:${port}/"; then
+                      return 0
+                    fi
+                    sleep 1
+                  done
+                  echo "Port-forward for ${name} failed on :${port}"
+                  tail -n 120 /tmp/arr-k8s-pf/"${name}".log || true
+                  return 1
+                }
+
+                if ! wait_port radarr-service 17878 || ! wait_port sonarr-service 18989 || ! wait_port lidarr-service 18686 || ! wait_port readarr-service 18787 || ! wait_port prowlarr-service 19696 || ! wait_port jellyseerr 15055; then
+                  mark_arr_connectivity_unavailable "ARR kubectl port-forward preflight is unavailable on the current runner" || exit 1
+                  exit 0
+                fi
+
+                {
+                  echo "TF_VAR_radarr_url=http://127.0.0.1:17878"
+                  echo "TF_VAR_sonarr_url=http://127.0.0.1:18989"
+                  echo "TF_VAR_lidarr_url=http://127.0.0.1:18686"
+                  echo "TF_VAR_readarr_url=http://127.0.0.1:18787"
+                  echo "TF_VAR_prowlarr_provider_url=http://127.0.0.1:19696"
+                  echo "TF_VAR_seerr_url=http://127.0.0.1:15055"
+
+                  echo "TF_VAR_prowlarr_url=http://127.0.0.1:19696"
+                  echo "TF_VAR_prowlarr_radarr_base_url=http://127.0.0.1:17878"
+                  echo "TF_VAR_prowlarr_sonarr_base_url=http://127.0.0.1:18989"
+                  echo "TF_VAR_prowlarr_lidarr_base_url=http://127.0.0.1:18686"
+                  echo "TF_VAR_prowlarr_readarr_base_url=http://127.0.0.1:18787"
+                } >> "$GITHUB_ENV"
+              else
+                echo "Cloudflare ARR tunnel inputs missing (${missing}). Falling back to in-cluster service URLs on self-hosted runner."
+                {
+                  echo "TF_VAR_radarr_url=http://radarr-service.media.svc.cluster.local:7878"
+                  echo "TF_VAR_sonarr_url=http://sonarr-service.media.svc.cluster.local:8989"
+                  echo "TF_VAR_lidarr_url=http://lidarr-service.media.svc.cluster.local:8686"
+                  echo "TF_VAR_readarr_url=http://readarr-service.media.svc.cluster.local:8787"
+                  echo "TF_VAR_prowlarr_provider_url=http://prowlarr-service.media.svc.cluster.local:9696"
+                  echo "TF_VAR_seerr_url=http://jellyseerr.media.svc.cluster.local:5055"
+
+                  echo "TF_VAR_prowlarr_url=http://prowlarr-service:9696"
+                  echo "TF_VAR_prowlarr_radarr_base_url=http://radarr-service:7878"
+                  echo "TF_VAR_prowlarr_sonarr_base_url=http://sonarr-service:8989"
+                  echo "TF_VAR_prowlarr_lidarr_base_url=http://lidarr-service:8686"
+                  echo "TF_VAR_prowlarr_readarr_base_url=http://readarr-service:8787"
+                } >> "$GITHUB_ENV"
+              fi
+              exit 0
+            fi
+            echo "Missing required ARR Cloudflare secret/variable(s):${missing}"
+            exit 1
+          fi
+
+          mkdir -p /tmp/arr-cf
+
+          start_cf() {
+            local name="$1"
+            local local_port="$2"
+            local host="$3"
+            nohup cloudflared access tcp \
+              --hostname "$host" \
+              --url "127.0.0.1:${local_port}" \
+              --service-token-id "$CF_ACCESS_CLIENT_ID" \
+              --service-token-secret "$CF_ACCESS_CLIENT_SECRET" \
+              >/tmp/arr-cf/"${name}".log 2>&1 &
+          }
+
+          start_cf radarr 17878 "$ARR_RADARR_HOSTNAME"
+          start_cf sonarr 18989 "$ARR_SONARR_HOSTNAME"
+          start_cf lidarr 18686 "$ARR_LIDARR_HOSTNAME"
+          start_cf readarr 18787 "$ARR_READARR_HOSTNAME"
+          start_cf prowlarr 19696 "$ARR_PROWLARR_HOSTNAME"
+
+          wait_port() {
+            local name="$1"
+            local port="$2"
+            for _ in $(seq 1 60); do
+              if curl -sS --max-time 2 -o /dev/null "http://127.0.0.1:${port}/"; then
+                return 0
+              fi
+              sleep 1
+            done
+            echo "Cloudflare tunnel for ${name} failed on :${port}"
+            tail -n 120 /tmp/arr-cf/"${name}".log || true
+            return 1
+          }
+
+          if ! wait_port radarr 17878 || ! wait_port sonarr 18989 || ! wait_port lidarr 18686 || ! wait_port readarr 18787 || ! wait_port prowlarr 19696; then
+            mark_arr_connectivity_unavailable "ARR Cloudflare TCP forwards are unavailable on the current runner" || exit 1
+            exit 0
+          fi
+
+          {
+            echo "TF_VAR_radarr_url=http://127.0.0.1:17878"
+            echo "TF_VAR_sonarr_url=http://127.0.0.1:18989"
+            echo "TF_VAR_lidarr_url=http://127.0.0.1:18686"
+            echo "TF_VAR_readarr_url=http://127.0.0.1:18787"
+            echo "TF_VAR_prowlarr_provider_url=http://127.0.0.1:19696"
+
+            echo "TF_VAR_prowlarr_url=http://prowlarr-service:9696"
+            echo "TF_VAR_prowlarr_radarr_base_url=http://radarr-service:7878"
+            echo "TF_VAR_prowlarr_sonarr_base_url=http://sonarr-service:8989"
+            echo "TF_VAR_prowlarr_lidarr_base_url=http://lidarr-service:8686"
+            echo "TF_VAR_prowlarr_readarr_base_url=http://readarr-service:8787"
+          } >> "$GITHUB_ENV"
+
+      - name: Validate ARR API key inputs
+        run: |
+          set -euo pipefail
+          for v in TF_VAR_radarr_api_key TF_VAR_sonarr_api_key TF_VAR_lidarr_api_key TF_VAR_readarr_api_key TF_VAR_prowlarr_api_key TF_VAR_seerr_api_key TF_VAR_ntfy_admin_password TF_VAR_ntfy_token; do
+            eval "val=\${$v:-}"
+            if [ -z "${val}" ]; then
+              echo "Missing required secret for ${v}."
+              exit 1
+            fi
+          done
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: arr-config/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        run: |
+          set -euo pipefail
+          if [ "${ARR_PLAN_CONNECTIVITY_OK:-true}" != "true" ]; then
+            echo "::warning::Skipping ARR Config OpenTofu plan because live ARR endpoints are unavailable on this PR runner."
+            exit 0
+          fi
+
+          PLAN_FILE="/tmp/tofu-arr-config.tfplan"
+          PLAN_LOG="/tmp/tofu-arr-config-plan.log"
+          LOCK_TIMEOUT="15m"
+
+          REPLACE_ARG=""
+          if [ -n "${TOFU_REPLACE}" ]; then
+            REPLACE_ARG="-replace=${TOFU_REPLACE}"
+          fi
+
+          set +e
+          if [ -n "${REPLACE_ARG}" ]; then
+            tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" -out="${PLAN_FILE}" "${REPLACE_ARG}" -parallelism=4 2>&1 | tee "${PLAN_LOG}"
+          else
+            tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" -out="${PLAN_FILE}" -parallelism=4 2>&1 | tee "${PLAN_LOG}"
+          fi
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying ARR Config plan after stale lock cleanup..."
+            set +e
+            if [ -n "${REPLACE_ARG}" ]; then
+              tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" -out="${PLAN_FILE}" "${REPLACE_ARG}" -parallelism=4 2>&1 | tee "${PLAN_LOG}"
+            else
+              tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" -out="${PLAN_FILE}" -parallelism=4 2>&1 | tee "${PLAN_LOG}"
+            fi
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            set +e
+            if [ -n "${REPLACE_ARG}" ]; then
+              tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" -out="${PLAN_FILE}" "${REPLACE_ARG}" -parallelism=4 2>&1 | tee "${PLAN_LOG}"
+            else
+              tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" -out="${PLAN_FILE}" -parallelism=4 2>&1 | tee "${PLAN_LOG}"
+            fi
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "ARR Config OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+      - name: Dump ARR Cloudflare tunnel logs on failure
+        if: failure()
+        run: |
+          for f in /tmp/arr-cf/*.log; do
+            [ -f "$f" ] || continue
+            echo "--- $f ---"
+            tail -n 120 "$f" || true
+          done
+
+      - name: Install Bitwarden CLI
+        run: |
+          if command -v bw >/dev/null 2>&1; then
+            bw --version
+            exit 0
+          fi
+          npm install -g @bitwarden/cli
+          bw --version
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access (AWS Backup)
+        uses: ./.github/actions/setup-cluster-access
+        id: aws_cluster_access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: OpenTofu Plan (AWS Backup)
+        if: steps.aws_cluster_access.outputs.configured == 'true'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: aws-backup/terraform.tfstate
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/terraform/aws-backup"
+
+          echo "Deriving Bitwarden credentials..."
+          BRIDGE_NS="external-secrets"
+          ORG_NAME="homelab"
+          COLLECTION_NAME="K3s Secrets"
+          BW_SERVER="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_SERVER}' | base64 -d)"
+          BW_EMAIL="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_EMAIL}' | base64 -d)"
+          BW_PASSWORD="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_PASSWORD}' | base64 -d)"
+
+          export TF_VAR_bw_server_url="${BW_SERVER}"
+          export TF_VAR_bw_email="${BW_EMAIL}"
+          export TF_VAR_bw_master_password="${BW_PASSWORD}"
+          export TF_VAR_aws_access_key_id="${AWS_ACCESS_KEY_ID}"
+          export TF_VAR_aws_secret_access_key="${AWS_SECRET_ACCESS_KEY}"
+
+          echo "Resetting Bitwarden CLI and forcing sync..."
+          bw config server "${BW_SERVER}"
+          
+          echo "Authenticating..."
+          BW_SESSION=$(bw login "${BW_EMAIL}" "${BW_PASSWORD}" --raw)
+          
+          if [ -z "${BW_SESSION}" ]; then
+            echo "ERROR: Login failed - no session key returned"
+            exit 1
+          fi
+
+          echo "::add-mask::$BW_SESSION"
+
+          echo "Status:"
+          bw status --session "${BW_SESSION}"
+
+          echo "Syncing..."
+          bw sync --session "${BW_SESSION}"
+
+          echo "Resolving Bitwarden organization and collection..."
+          ORG_ID="$(bw list organizations --session "${BW_SESSION}" | jq -r --arg name "${ORG_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${ORG_ID}" ]; then
+            echo "ERROR: Bitwarden CLI did not expose organization ${ORG_NAME}"
+            exit 1
+          fi
+          COLLECTION_ID="$(bw list org-collections --organizationid "${ORG_ID}" --session "${BW_SESSION}" | jq -r --arg name "${COLLECTION_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${COLLECTION_ID}" ]; then
+            echo "ERROR: Bitwarden CLI did not expose collection ${COLLECTION_NAME} in organization ${ORG_NAME}"
+            exit 1
+          fi
+          export TF_VAR_homelab_organization_id="${ORG_ID}"
+          export TF_VAR_k3s_secrets_collection_id="${COLLECTION_ID}"
+          export TF_VAR_ntfy_token="${{ secrets.NTFY_TOKEN }}"
+
+          if [ -f terraform.tfvars ]; then
+            mv terraform.tfvars /tmp/aws-backup-terraform.tfvars
+          fi
+
+          echo "Injecting encryption passphrase..."
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "'"${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"'"/g' backend.tf
+
+          echo "initing..."
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+          tofu validate
+
+          PLAN_LOG="/tmp/tofu-aws-backup-plan.log"
+          LOCK_TIMEOUT="15m"
+
+          set +e
+          tofu plan -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying AWS Backup plan after stale lock cleanup..."
+            set +e
+            tofu plan -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            set +e
+            tofu plan -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "AWS Backup OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "AWS Backup OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+  velero-dr-validate:
+    name: OpenTofu Validate (Velero DR)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.velero == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: OpenTofu validate (Velero Backup)
+        working-directory: terraform/velero-backup
+        run: |
+          tofu init -backend=false
+          tofu validate
+
+      - name: OpenTofu validate (Velero Rescue Lambda)
+        working-directory: terraform/velero-rescue-lambda
+        run: |
+          tofu init -backend=false
+          tofu validate
+
+  aws-cleanarr-plan:
+    name: OpenTofu Plan (AWS Cleanarr)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.aws_cleanarr == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    concurrency:
+      group: opentofu-plan-aws-cleanarr-${{ github.event.pull_request.number || github.ref }}
+      cancel-in-progress: false
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+      - name: Install AWS CLI
+        uses: unfor19/install-aws-cli-action@v1
+      - name: Install zip
+        run: |
+          if ! command -v zip &> /dev/null; then
+            echo "zip not found, installing..."
+            sudo apt-get update && sudo apt-get install -y zip
+          fi
+      - name: OpenTofu Plan
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          TOFU_BACKEND_STATE_KEY: aws-cleanarr/terraform.tfstate
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+          TF_VAR_plex_baseurl: "https://plex.archer.casa"
+          TF_VAR_plex_token: ${{ secrets.PLEX_TOKEN }}
+          TF_VAR_sonarr_baseurl: "https://sonarr.archer.casa/api/v3/"
+          TF_VAR_sonarr_apikey: ${{ secrets.SONARR_APIKEY }}
+          TF_VAR_radarr_baseurl: "https://radarr.archer.casa/api/v3/"
+          TF_VAR_radarr_apikey: ${{ secrets.RADARR_APIKEY }}
+        run: |
+          set -euo pipefail
+          ACCOUNT_ID="$(aws sts get-caller-identity --query Account --output text)"
+          export TF_VAR_webhook_image="${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/cleanarr-webhook:latest"
+          export TF_VAR_job_image="${ACCOUNT_ID}.dkr.ecr.us-east-1.amazonaws.com/cleanarr-job:latest"
+
+          cd infrastructure/terraform/aws-cleanarr
+          PLAN_LOG="/tmp/tofu-aws-cleanarr-plan.log"
+          LOCK_TIMEOUT="15m"
+          bash ../../../scripts/tofu-init-with-retry.sh
+          tofu validate
+
+          set +e
+          tofu plan -input=false -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && bash ../../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying AWS Cleanarr plan after stale lock cleanup..."
+            set +e
+            tofu plan -input=false -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            set +e
+            tofu plan -input=false -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ]; then
+            exit "${PLAN_EXIT}"
+          fi
+
+  aws-lambda-cleanup-plan:
+    name: OpenTofu Plan (AWS Lambda Cleanup)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.aws_lambda_cleanup == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+      - name: Install AWS CLI
+        uses: unfor19/install-aws-cli-action@v1
+      - name: Install zip
+        run: |
+          if ! command -v zip &> /dev/null; then
+            echo "zip not found, installing..."
+            sudo apt-get update && sudo apt-get install -y zip
+          fi
+      - name: Create Dummy Lambda Package
+        run: |
+          cd infrastructure/terraform/aws-lambda-cleanup
+          zip lambda_function.zip main.tf
+      - name: OpenTofu Plan
+        env:
+          AWS_DEFAULT_REGION: us-east-1
+          TOFU_BACKEND_STATE_KEY: aws-lambda-cleanup/terraform.tfstate
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+          TF_VAR_cleanarr_plex_baseurl: "https://plex.archer.casa"
+          TF_VAR_cleanarr_plex_token: ${{ secrets.PLEX_TOKEN }}
+          TF_VAR_cleanarr_sonarr_baseurl: "https://sonarr.archer.casa/api/v3/"
+          TF_VAR_cleanarr_sonarr_apikey: ${{ secrets.SONARR_APIKEY }}
+          TF_VAR_cleanarr_radarr_baseurl: "https://radarr.archer.casa/api/v3/"
+          TF_VAR_cleanarr_radarr_apikey: ${{ secrets.RADARR_APIKEY }}
+          TF_VAR_cleanarr_transmission_host: "torrent.archer.casa"
+          TF_VAR_cleanarr_transmission_port: "443"
+        run: |
+          cd infrastructure/terraform/aws-lambda-cleanup
+          PLAN_LOG="/tmp/tofu-aws-lambda-cleanup-plan.log"
+          LOCK_TIMEOUT="15m"
+          PLAN_CMD_TIMEOUT="16m"
+          bash ../../../scripts/tofu-init-with-retry.sh
+          tofu validate
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if ! python3 -c 'import socket; socket.getaddrinfo("lambda.us-east-1.amazonaws.com", 443)'; then
+              echo "::warning::Skipping AWS Lambda Cleanup OpenTofu plan because the runner cannot resolve the AWS Lambda endpoint during PR validation."
+              exit 0
+            fi
+          fi
+
+          run_plan() {
+            set +e
+            timeout --preserve-status "${PLAN_CMD_TIMEOUT}" \
+              tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          }
+
+          run_plan
+
+          if [ "${PLAN_EXIT}" -eq 124 ]; then
+            echo "OpenTofu plan timed out after ${PLAN_CMD_TIMEOUT}."
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ] && bash ../../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying AWS Lambda Cleanup plan after stale lock cleanup..."
+            run_plan
+          fi
+
+          if [ "${PLAN_EXIT}" -eq 124 ]; then
+            echo "OpenTofu plan timed out after ${PLAN_CMD_TIMEOUT}."
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            run_plan
+          fi
+
+          if [ "${PLAN_EXIT}" -eq 124 ]; then
+            echo "OpenTofu plan timed out after ${PLAN_CMD_TIMEOUT}."
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "AWS Lambda Cleanup OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+      - name: Release State Lock on Cancel
+        if: cancelled()
+        run: |
+          cd infrastructure/terraform/aws-lambda-cleanup
+          echo "Job cancelled. Discovering and releasing state lock..."
+          tofu plan -input=false -lock-timeout=1s > /tmp/cancel-lock.log 2>&1 || true
+          LOCK_ID=$(sed -n 's/.*ID:[[:space:]]*\(.*\)$/\1/p' /tmp/cancel-lock.log | tail -n 1 | tr -d '\r' | xargs || true)
+          if [ -n "$LOCK_ID" ]; then
+            echo "Force unlocking $LOCK_ID..."
+            tofu force-unlock -force "$LOCK_ID"
+          else
+            echo "No active lock found."
+          fi
+
+  azure-lidarr-plan:
+    name: OpenTofu Plan (Azure Lidarr)
+    needs: detect-changes
+    if: github.event_name == 'workflow_dispatch' || needs.detect-changes.outputs.azure_lidarr == 'true'
+    runs-on: ${{ ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && fromJSON('["home-gh-runner"]') || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]')) }}
+    defaults:
+      run:
+        working-directory: infrastructure/terraform/azure-lidarr
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: "8657caf3-dbbb-4aa9-bff9-ed1aa26edb5e"
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      TF_VAR_location: "eastus"
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+      - name: OpenTofu init
+        env:
+          TOFU_BACKEND_STATE_KEY: azure-lidarr/terraform.tfstate
+        run: |
+          bash ../../../scripts/tofu-init-with-retry.sh --reconfigure
+      - name: OpenTofu validate
+        run: tofu validate
+      - name: OpenTofu plan
+        run: |
+          set +e
+          tofu plan -input=false -detailed-exitcode -lock-timeout=5m
+          PLAN_EXIT=$?
+          set -e
+          if [ $PLAN_EXIT -eq 2 ]; then
+            echo "Plan succeeded with changes."
+            exit 0
+          fi
+          exit $PLAN_EXIT

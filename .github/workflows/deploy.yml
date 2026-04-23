@@ -1,0 +1,2074 @@
+name: Deploy from Main
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+    inputs:
+      allow_ipv4:
+        description: 'Allow public IPv4 changes for GCP (manual only)'
+        type: boolean
+        required: false
+        default: false
+      build_consolidated_alerts:
+        description: 'Force build consolidated-alerts'
+        type: boolean
+        required: false
+        default: false
+      build_gamdl_automator:
+        description: 'Force build gamdl-automator'
+        type: boolean
+        required: false
+        default: false
+      build_postgres_backup:
+        description: 'Force build postgres-backup'
+        type: boolean
+        required: false
+        default: false
+      run_infra:
+        description: 'Run infrastructure apply jobs'
+        type: boolean
+        required: false
+        default: false
+      uecb_backend_apply:
+        description: 'Apply only the UECB broker cloud backend resources on this ref'
+        type: boolean
+        required: false
+        default: false
+      uecb_backend_smoke:
+        description: 'Run UECB broker cloud-run and lambda smoke jobs after targeted apply'
+        type: boolean
+        required: false
+        default: false
+      tofu_replace:
+        description: 'Optional OpenTofu -replace address (advanced)'
+        type: string
+        required: false
+        default: ''
+      allow_deletions:
+        description: 'Allow OpenTofu to destroy resources'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+  pull-requests: read
+  packages: write
+  actions: write
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TF_VAR_azure_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+  TF_VAR_azure_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+  TF_VAR_azure_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+  TF_VAR_azure_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+  TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+  TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT }}
+  TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+  TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT }}
+  TF_VAR_azure_devops_client_id: ${{ secrets.AZURE_CLIENT_ID }}
+  TF_VAR_azure_devops_client_secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+  TF_VAR_azure_devops_tenant_id: ${{ secrets.AZURE_TENANT_ID }}
+  AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+  AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+
+jobs:
+  # Job 1: Detect what changed
+  changes:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    outputs:
+      consolidated_alerts: ${{ steps.manual.outputs.no_build != 'true' && (steps.filter.outputs.consolidated_alerts == 'true' || inputs.build_consolidated_alerts == true) }}
+      gamdl_automator: ${{ steps.manual.outputs.no_build != 'true' && (steps.filter.outputs.gamdl_automator == 'true' || inputs.build_gamdl_automator == true) }}
+      postgres_backup: ${{ steps.manual.outputs.no_build != 'true' && (steps.filter.outputs.postgres_backup == 'true' || inputs.build_postgres_backup == true) }}
+      infra_changed: ${{ (steps.filter.outputs.infra == 'true' || steps.dispatch_flags.outputs.manual_infra == 'true') && 'true' || 'false' }}
+      ci_runners_changed: ${{ (steps.filter.outputs.ci_runners == 'true' || steps.dispatch_flags.outputs.manual_infra == 'true') && 'true' || 'false' }}
+      arr_config_changed: ${{ (steps.filter.outputs.arr_config == 'true' || steps.dispatch_flags.outputs.manual_infra == 'true') && 'true' || 'false' }}
+      vaultwarden_changed: ${{ (steps.filter.outputs.vaultwarden == 'true' || steps.dispatch_flags.outputs.manual_infra == 'true') && 'true' || 'false' }}
+      aws_backup_infra: ${{ (steps.filter.outputs.aws_backup_infra == 'true' || steps.dispatch_flags.outputs.manual_infra == 'true') && 'true' || 'false' }}
+      manual_infra: ${{ steps.dispatch_flags.outputs.manual_infra }}
+      manifests_changed: ${{ steps.filter.outputs.manifests }}
+      uecb_backend_smoke_requested: ${{ steps.uecb_smoke.outputs.requested }}
+      force_manifest_refresh: ${{ (steps.manual.outputs.no_build == 'true' && steps.dispatch_flags.outputs.manual_infra != 'true' && steps.uecb_smoke.outputs.requested != 'true') && 'true' || 'false' }}
+    steps:
+      - name: Cancel older queued deploy runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          CURRENT_BRANCH: ${{ github.ref_name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.request
+
+          current_run_id = int(os.environ["CURRENT_RUN_ID"])
+          github_token = os.environ["GH_TOKEN"]
+          headers = {
+              "Accept": "application/vnd.github+json",
+              "Authorization": f"Bearer {github_token}",
+              "X-GitHub-Api-Version": "2022-11-28",
+              "User-Agent": "home-deploy-cleanup",
+          }
+
+          def request(url: str, method: str = "GET") -> dict:
+              req = urllib.request.Request(url, headers=headers, method=method)
+              with urllib.request.urlopen(req) as response:
+                  body = response.read().decode("utf-8")
+              return json.loads(body) if body else {}
+
+          runs = request(
+              f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/actions/workflows/deploy.yml/runs"
+              f"?branch={os.environ['CURRENT_BRANCH']}&per_page=20"
+          ).get("workflow_runs", [])
+          queued_run_ids = sorted(
+              int(run["id"])
+              for run in runs
+              if int(run["id"]) != current_run_id and run.get("status") == "queued"
+          )
+
+          if not queued_run_ids:
+              print("No older queued deploy runs found.")
+              sys.exit(0)
+
+          for run_id in queued_run_ids:
+              print(f"Force-canceling stale queued deploy run {run_id}...")
+              request(
+                  f"https://api.github.com/repos/{os.environ['GITHUB_REPOSITORY']}/actions/runs/{run_id}/force-cancel",
+                  method="POST",
+              )
+          PY
+        shell: bash
+
+      - name: Detect manual no-build
+        id: manual
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && \
+             [ "${{ inputs.build_consolidated_alerts }}" != "true" ] && \
+             [ "${{ inputs.build_gamdl_automator }}" != "true" ] && \
+             [ "${{ inputs.build_postgres_backup }}" != "true" ]; then
+            echo "no_build=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "no_build=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Resolve manual infra dispatch flags
+        id: dispatch_flags
+        run: |
+          MANUAL_INFRA="false"
+          EVENT_INPUT_RUN_INFRA="${{ github.event.inputs.run_infra }}"
+          INPUTS_RUN_INFRA="${{ inputs.run_infra }}"
+          EVENT_INPUT_TOFU_REPLACE="${{ github.event.inputs.tofu_replace }}"
+          INPUTS_TOFU_REPLACE="${{ inputs.tofu_replace }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${EVENT_INPUT_RUN_INFRA}" = "true" ] || \
+               [ "${INPUTS_RUN_INFRA}" = "true" ] || \
+               [ -n "${EVENT_INPUT_TOFU_REPLACE}" ] || \
+               [ -n "${INPUTS_TOFU_REPLACE}" ]; then
+              MANUAL_INFRA="true"
+            fi
+          fi
+          echo "manual_infra=${MANUAL_INFRA}" >> "$GITHUB_OUTPUT"
+      - name: Resolve UECB smoke dispatch flag
+        id: uecb_smoke
+        run: |
+          REQUESTED="false"
+          EVENT_INPUT_UECB_BACKEND_SMOKE="${{ github.event.inputs.uecb_backend_smoke }}"
+          INPUTS_UECB_BACKEND_SMOKE="${{ inputs.uecb_backend_smoke }}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            if [ "${EVENT_INPUT_UECB_BACKEND_SMOKE}" = "true" ] || \
+               [ "${INPUTS_UECB_BACKEND_SMOKE}" = "true" ]; then
+              REQUESTED="true"
+            fi
+          fi
+          echo "requested=${REQUESTED}" >> "$GITHUB_OUTPUT"
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            consolidated_alerts:
+              - 'grok-servaar/monitoring/consolidated-alerts/Dockerfile'
+              - 'grok-servaar/monitoring/consolidated-alerts/**'
+            gamdl_automator:
+              - 'grok-servaar/images/gamdl-automator/Dockerfile'
+              - 'grok-servaar/images/gamdl-automator/**'
+            postgres_backup:
+              - 'grok-servaar/images/postgres-backup/Dockerfile'
+              - 'grok-servaar/images/postgres-backup/**'
+            manifests:
+              - 'grok-servaar/**/*.yaml'
+              - 'grok-servaar/**/*.yml'
+            infra:
+              - 'terraform/homelab/**'
+              - 'terraform/cloudflare-access/**'
+              - 'terraform/arr-config/**'
+              - 'terraform/grafana/**'
+              - 'terraform/nextcloud/**'
+              - 'scripts/import-cloudflare-dns-state.py'
+              - 'scripts/import-cloudflare-state.py'
+              - '.github/workflows/deploy.yml'
+              - '.github/workflows/unifi-reconcile.yml'
+            ci_runners:
+              - 'terraform/ci-runners/**'
+              - 'scripts/tofu-init-with-retry.sh'
+              - 'scripts/tofu-recover-stale-lock.sh'
+              - '.opentofu-version'
+              - '.github/workflows/deploy.yml'
+            arr_config:
+              - 'terraform/arr-config/**'
+              - 'scripts/install-seerr-provider-release.sh'
+              - 'scripts/tofu-init-with-retry.sh'
+              - 'scripts/tofu-recover-stale-lock.sh'
+              - '.opentofu-version'
+              - '.github/workflows/deploy.yml'
+            vaultwarden:
+              - 'terraform/vaultwarden/**'
+              - 'scripts/check-cluster-deploy-preflight.sh'
+              - 'scripts/tofu-init-with-retry.sh'
+              - '.opentofu-version'
+              - '.github/workflows/deploy.yml'
+            aws_backup_infra:
+              - 'terraform/aws-backup/**'
+              - 'scripts/unifi/zero_trust_proxy.py'
+              - 'scripts/tofu-init-with-retry.sh'
+              - '.github/workflows/deploy.yml'
+
+      - name: Update GitHub job summary
+        if: always()
+        env:
+          JOB_TITLE: ${{ github.job }}
+          JOB_STATUS: ${{ job.status }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: scripts/write_job_summary.sh
+
+  # Job 1a: Deploy Test Gate
+  tests:
+    needs: changes
+    runs-on: home-gh-runner
+    if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.uecb_backend_smoke == 'true') }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: |
+            .github/workflows/deps/unit-tests-pip.txt
+            .github/workflows/deps/ansible-syntax-pip.txt
+
+      - name: Set up OpenTofu
+        uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Install deploy test dependencies
+        run: |
+          pip install -r .github/workflows/deps/unit-tests-pip.txt -r .github/workflows/deps/ansible-syntax-pip.txt
+          npm ci
+
+      - name: Check OpenTofu formatting
+        run: tofu fmt -check -recursive terraform
+
+      - name: Run Python unit checks
+        run: |
+          python -m compileall scripts grok-servaar tests hls-downloader terraform/velero-rescue-lambda
+          python scripts/verify_music_manager_sync.py
+          npm test
+          python -m unittest discover -s tests -p 'test_*.py'
+
+      - name: Run repository validations
+        run: |
+          python scripts/validate_markdown_links.py
+          python scripts/validate_embedded_scripts.py --python
+          PYTHONIOENCODING=utf-8 python tests/arch-verification/argocd/verify_catalog.py
+          flake8 scripts grok-servaar tests hls-downloader --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Run contract & policy tests
+        run: |
+          bash scripts/ci/run_contract_test_suite.sh all
+
+      - name: Run shellcheck locally
+        run: bash scripts/ci/run_shellcheck.sh
+
+      - name: Run ansible syntax locally
+        run: bash scripts/ci/run_ansible_syntax.sh
+
+  # Job 1b: Guard against accidental public IPv4 use
+  build-and-push:
+    name: Build ${{ matrix.image }}
+    needs: [changes]
+    runs-on: home-gh-runner
+    if: |
+      needs.changes.outputs.consolidated_alerts == 'true' ||
+      needs.changes.outputs.gamdl_automator == 'true' ||
+      needs.changes.outputs.postgres_backup == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: consolidated_alerts
+            image: ghcr.io/josh-archer/consolidated-alerts
+            context: grok-servaar/monitoring/consolidated-alerts
+            file: grok-servaar/monitoring/consolidated-alerts/Dockerfile
+          - name: gamdl_automator
+            image: ghcr.io/josh-archer/gamdl-automator
+            context: grok-servaar/images/gamdl-automator
+            file: grok-servaar/images/gamdl-automator/Dockerfile
+          - name: postgres_backup
+            image: ghcr.io/josh-archer/postgres-backup
+            context: grok-servaar/images/postgres-backup
+            file: grok-servaar/images/postgres-backup/Dockerfile
+
+    steps:
+      - name: Checkout
+        if: needs.changes.outputs[matrix.name] == 'true'
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker Hub
+        if: needs.changes.outputs[matrix.name] == 'true'
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up QEMU
+        if: needs.changes.outputs[matrix.name] == 'true'
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        if: needs.changes.outputs[matrix.name] == 'true'
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Log in to GitHub Container Registry
+
+        if: needs.changes.outputs[matrix.name] == 'true'
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN != '' && secrets.GHCR_TOKEN || (secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token) }}
+
+      - name: Extract metadata (tags, labels)
+        if: needs.changes.outputs[matrix.name] == 'true'
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ matrix.image }}
+          tags: |
+            type=raw,value=latest
+            type=sha,format=long
+
+      - name: Build and push
+        if: needs.changes.outputs[matrix.name] == 'true'
+        uses: docker/build-push-action@v7
+        timeout-minutes: 15
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ matrix.image }}:latest
+          cache-to: type=gha,mode=max
+
+      - name: Update GitHub job summary
+        if: always() && needs.changes.outputs[matrix.name] == 'true'
+        env:
+          JOB_TITLE: ${{ github.job }}
+          JOB_STATUS: ${{ job.status }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: scripts/write_job_summary.sh
+
+  # Job 3: Update manifests with new image tags
+  update-manifests:
+    needs: [changes, build-and-push, tests]
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    concurrency:
+      group: update-manifests-${{ github.ref }}
+      cancel-in-progress: false
+    if: |
+      always() &&
+      (needs.tests.result == 'success' || needs.tests.result == 'skipped') &&
+      (
+        needs.changes.outputs.force_manifest_refresh == 'true' ||
+        (
+          needs.build-and-push.result == 'success' &&
+          (needs.changes.outputs.consolidated_alerts == 'true' ||
+           needs.changes.outputs.gamdl_automator == 'true' ||
+           needs.changes.outputs.postgres_backup == 'true')
+        )
+      )
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+
+      - name: Update manifests with latest GHCR tags
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "Refreshing manifests with the latest GHCR tags..."
+          python3 scripts/update_manifest_tags.py --token "${GITHUB_TOKEN}"
+
+      - name: Commit and push manifest updates
+        env:
+          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "github-actions@github.com"
+          
+          # Check if there are changes
+          if git diff --quiet; then
+            echo "No changes to commit (tags might already be up to date)"
+          else
+            git add .
+            git commit -m "chore: sync manifests with latest GHCR tags [skip actions]"
+            if [ -z "$GITOPS_PAT" ]; then
+              echo "GITOPS_PAT is required to bypass branch protection for manifest updates."
+              exit 1
+            fi
+            git config --local --unset-all http.https://github.com/.extraheader || true
+            git remote set-url origin "https://x-access-token:$GITOPS_PAT@github.com/Josh-Archer/home.git"
+            git push
+            echo "ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ Manifests updated and pushed"
+          fi
+
+
+  opentofu_ci_runners:
+    name: Opentofu Apply -input=false (CI Runners)
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    concurrency:
+      group: tofu-ci-runners
+      cancel-in-progress: false
+    needs:
+      - changes
+      - tests
+      - build-and-push
+    if: |
+      always() &&
+      vars.ENABLE_CI_RUNNERS_ROOT == 'true' &&
+      vars.CI_RUNNERS_STATE_MIGRATED == 'true' &&
+      (needs.tests.result == 'success' || needs.tests.result == 'skipped') &&
+      (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.changes.outputs.ci_runners_changed == 'true'
+      )
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: write
+    defaults:
+      run:
+        working-directory: terraform/ci-runners
+    env:
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+      GITHUB_TOKEN: ${{ secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || (secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || github.token) }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_enable_codebuild_runner_project: ${{ vars.ENABLE_CODEBUILD_RUNNER_PROJECT != '' && vars.ENABLE_CODEBUILD_RUNNER_PROJECT || 'false' }}
+      TF_VAR_enable_codebuild_runner_repo_variables: ${{ (secrets.GH_ADMIN_TOKEN != '' || secrets.GITOPS_PAT != '') && 'true' || 'false' }}
+      TF_VAR_codebuild_runner_project_name: ${{ vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && vars.AWS_CODEBUILD_RUNNER_PROJECT || 'home-pr-runner' }}
+      TF_VAR_codebuild_runner_github_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_enable_codebuild_runner_toggle_variable: 'false'
+      TF_VAR_enable_runner_provider_mode_variable: 'true'
+      TF_VAR_runner_provider_mode: self-hosted
+      TF_VAR_enable_self_hosted_runner_toggle_variable: 'true'
+      TF_VAR_self_hosted_mode_enabled: 'true'
+      TF_VAR_enable_azure_pipelines_toggle_variable: 'false'
+      TF_VAR_azure_pipelines_mode_enabled: ${{ vars.USE_AZURE_PIPELINES != '' && vars.USE_AZURE_PIPELINES || 'false' }}
+      TF_VAR_azure_vm_offload_enabled: ${{ vars.USE_AZURE_VM != '' && vars.USE_AZURE_VM || 'false' }}
+      TF_VAR_azure_vm_runner_label: ${{ vars.AZURE_VM_RUNNER_LABEL != '' && vars.AZURE_VM_RUNNER_LABEL || 'az-vm-gha' }}
+      TF_VAR_azure_pipelines_ready: ${{ vars.AZURE_PIPELINES_READY != '' && vars.AZURE_PIPELINES_READY || 'false' }}
+      TF_VAR_azure_pipelines_monthly_minutes_limit: ${{ vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT != '' && vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT || '1800' }}
+      TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL != '' && vars.AZURE_DEVOPS_ORG_URL || '' }}
+      TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT != '' && secrets.AZURE_DEVOPS_PAT || '' }}
+      TF_VAR_azure_devops_client_id: ${{ vars.AZURE_DEVOPS_CLIENT_ID != '' && vars.AZURE_DEVOPS_CLIENT_ID || vars.AZURE_CLIENT_ID != '' && vars.AZURE_CLIENT_ID || secrets.AZURE_DEVOPS_CLIENT_ID != '' && secrets.AZURE_DEVOPS_CLIENT_ID || secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_ID || '' }}
+      TF_VAR_azure_devops_client_secret: ${{ secrets.AZURE_DEVOPS_CLIENT_SECRET != '' && secrets.AZURE_DEVOPS_CLIENT_SECRET || secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_SECRET || '' }}
+      TF_VAR_azure_devops_tenant_id: ${{ vars.AZURE_DEVOPS_TENANT_ID != '' && vars.AZURE_DEVOPS_TENANT_ID || vars.AZURE_TENANT_ID != '' && vars.AZURE_TENANT_ID || secrets.AZURE_DEVOPS_TENANT_ID != '' && secrets.AZURE_DEVOPS_TENANT_ID || secrets.AZURE_TENANT_ID != '' && secrets.AZURE_TENANT_ID || '' }}
+      TF_VAR_azure_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID != '' && vars.AZURE_SUBSCRIPTION_ID || '' }}
+      TF_VAR_azure_tenant_id: ${{ secrets.AZURE_TENANT_ID != '' && secrets.AZURE_TENANT_ID || '' }}
+      TF_VAR_azure_client_id: ${{ secrets.AZURE_CLIENT_ID != '' && secrets.AZURE_CLIENT_ID || '' }}
+      TF_VAR_azure_client_secret: ${{ secrets.AZURE_CLIENT_SECRET != '' && secrets.AZURE_CLIENT_SECRET || '' }}
+      TF_VAR_enable_azure_student_vm: ${{ vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_bootstrap_enabled: ${{ vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_registration_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_azure_student_vm_github_runner_count: '2'
+      TF_VAR_azure_student_vm_github_runner_labels: '["self-hosted","linux","x64","az-vm-gha"]'
+      TF_VAR_azure_student_vm_github_runner_version: '2.333.1'
+      TF_VAR_enable_quota_reset_offload: 'false'
+      TF_VAR_github_token: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: OpenTofu Init, Validate, and Apply (CI Runners)
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RUN_CI_RUNNERS_APPLY: ${{ needs.changes.outputs.ci_runners_changed == 'true' && 'true' || 'false' }}
+          TOFU_BACKEND_STATE_KEY: ci-runners/terraform.tfstate
+        run: |
+          set -euo pipefail
+
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "'"${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"'"/g' backend.tf
+
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+          tofu validate
+
+          if [ "${RUN_CI_RUNNERS_APPLY}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            APPLY_LOG="/tmp/tofu-ci-runners-apply.log"
+            set +e
+            timeout 15m tofu apply -input=false -auto-approve -lock-timeout=60s 2>&1 | tee "${APPLY_LOG}"
+            APPLY_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "${APPLY_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${APPLY_LOG}"; then
+              echo "Retrying OpenTofu Apply after stale lock cleanup..."
+              set +e
+              timeout 15m tofu apply -input=false -auto-approve -lock-timeout=60s 2>&1 | tee "${APPLY_LOG}"
+              APPLY_EXIT=${PIPESTATUS[0]}
+              set -e
+            fi
+
+            if [ "${APPLY_EXIT}" -ne 0 ]; then
+              exit "${APPLY_EXIT}"
+            fi
+          elif [ "${RUN_CI_RUNNERS_APPLY}" = "true" ]; then
+            PLAN_LOG="/tmp/tofu-ci-runners-plan.log"
+            set +e
+            tofu plan -input=false -lock-timeout=60s 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "${PLAN_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+              echo "Retrying OpenTofu Plan after stale lock cleanup..."
+              set +e
+              tofu plan -input=false -lock-timeout=60s 2>&1 | tee "${PLAN_LOG}"
+              PLAN_EXIT=${PIPESTATUS[0]}
+              set -e
+            fi
+
+            if [ "${PLAN_EXIT}" -ne 0 ]; then
+              exit "${PLAN_EXIT}"
+            fi
+          else
+            echo "Skipping CI Runners apply."
+          fi
+
+      - name: Release CI Runners state lock on cancel
+        if: cancelled()
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: ci-runners/terraform.tfstate
+        run: |
+          echo "Job cancelled. Discovering and releasing CI Runners state lock..."
+          tofu plan -input=false -lock-timeout=1s > /tmp/cancel-lock.log 2>&1 || true
+          LOCK_ID=$(sed -n 's/.*ID:[[:space:]]*\(.*\)$/\1/p' /tmp/cancel-lock.log | tail -n 1 | tr -d '\r' | xargs || true)
+          if [ -n "$LOCK_ID" ]; then
+            echo "Force unlocking $LOCK_ID..."
+            tofu force-unlock -force "$LOCK_ID"
+          else
+            echo "No active lock found."
+          fi
+
+  # Job: OpenTofu Infrastructure (Homelab Core)
+  opentofu_homelab:
+    name: Opentofu Apply -input=false (Homelab)
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && format('["{0}"]', vars.AZURE_VM_RUNNER_LABEL != '' && vars.AZURE_VM_RUNNER_LABEL || 'home-gh-runner')) || '["ubuntu-latest"]') }}
+    concurrency:
+      group: tofu-homelab
+      cancel-in-progress: false
+    needs:
+      - changes
+      - tests
+      - build-and-push
+    if: |
+      always() &&
+      (
+        (
+          github.event_name == 'workflow_dispatch' &&
+          needs.changes.outputs.manual_infra == 'true'
+        ) ||
+        (
+          (needs.tests.result == 'success' || needs.tests.result == 'skipped') &&
+          (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped')
+        )
+      ) &&
+      (
+        github.event_name == 'workflow_dispatch' ||
+        needs.changes.outputs.infra_changed == 'true' ||
+        needs.changes.outputs.vaultwarden_changed == 'true'
+      )
+    # Run only when infrastructure-related files change (or manual dispatch).
+    permissions:
+      contents: read
+      pull-requests: write
+      packages: read
+      id-token: write # Required for Google Auth
+      actions: write
+    defaults:
+      run:
+        working-directory: terraform/homelab
+    env:
+      ALLOW_DELETIONS: 'true'
+      # Tailscale
+      TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+      # Cloudflare
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+      # Terraform GitHub provider reads GITHUB_TOKEN.
+      # Prefer GH_ADMIN_TOKEN, then GITOPS_PAT, and only then github.token.
+      # github.token may not be allowed to manage repository Actions variables.
+      GITHUB_TOKEN: ${{ secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || (secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || github.token) }}
+      TF_VAR_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_allowed_emails: ${{ secrets.TF_VAR_ALLOWED_EMAILS }}
+      TF_VAR_allowed_email_domains: ${{ secrets.TF_VAR_ALLOWED_EMAIL_DOMAINS }}
+      TF_VAR_allowed_family_emails: ${{ secrets.TF_VAR_ALLOWED_FAMILY_EMAILS }}
+      TF_VAR_tunnel_id: ${{ secrets.TF_VAR_TUNNEL_ID }}
+      TF_VAR_keycloak_client_secret: ${{ secrets.TF_VAR_KEYCLOAK_CLIENT_SECRET }}
+      TF_VAR_zone_id_archer_casa: ${{ secrets.TF_VAR_ZONE_ID_ARCHER_CASA }}
+      TF_VAR_zone_id_archerfamily_io: ${{ secrets.TF_VAR_ZONE_ID_ARCHERFAMILY_IO }}
+      TF_VAR_enable_unifi_access: ${{ secrets.UNIFI_ZERO_TRUST_HEADERS_JSON != '' && 'true' || 'false' }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_enable_codebuild_runner_project: ${{ vars.ENABLE_CODEBUILD_RUNNER_PROJECT != '' && vars.ENABLE_CODEBUILD_RUNNER_PROJECT || 'false' }}
+      TF_VAR_enable_codebuild_runner_repo_variables: ${{ (secrets.GH_ADMIN_TOKEN != '' || secrets.GITOPS_PAT != '') && 'true' || 'false' }}
+      TF_VAR_codebuild_runner_project_name: ${{ vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && vars.AWS_CODEBUILD_RUNNER_PROJECT || 'home-pr-runner' }}
+      TF_VAR_codebuild_runner_github_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_runner_provider_mode: self-hosted
+      TF_VAR_self_hosted_mode_enabled: 'true'
+      TF_VAR_enable_azure_student_vm: ${{ vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_bootstrap_enabled: ${{ vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true' }}
+      TF_VAR_azure_student_vm_github_runner_registration_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_azure_student_vm_github_runner_count: '2'
+      TF_VAR_azure_student_vm_github_runner_labels: '["self-hosted","linux","x64","az-vm-gha"]'
+      TF_VAR_azure_vm_runner_label: 'az-vm-gha'
+      TF_VAR_azure_student_vm_github_runner_version: '2.333.1'
+      TF_VAR_azure_pipelines_mode_enabled: ${{ vars.USE_AZURE_PIPELINES != '' && vars.USE_AZURE_PIPELINES || 'false' }}
+      TF_VAR_enable_azure_pipelines_toggle_variable: 'false'
+      TF_VAR_enable_self_hosted_runner_toggle_variable: 'true'
+      TF_VAR_enable_runner_provider_mode_variable: 'true'
+      TF_VAR_enable_codebuild_runner_toggle_variable: 'false'
+      TF_VAR_enable_openclaw_management: 'false'
+      # OpenClaw
+      TF_VAR_openclaw_url: wss://openclaw.archer.casa
+      TF_VAR_openclaw_token: ${{ secrets.OPENCLAW_GATEWAY_TOKEN }}
+      TF_VAR_discord_bot_token: ${{ secrets.OPENCLAW_DISCORD_BOT_TOKEN }}
+      TF_VAR_openai_api_key: ${{ secrets.OPENAI_API_KEY }}
+      # Imported service tokens do not return client_secret, which breaks
+      # github_actions_secret resources that expect plaintext token secrets.
+      # Keep Terraform sync disabled in CI and use explicit gh secret sync steps.
+      TF_VAR_enable_github_actions_secrets_sync: 'false'
+      
+      # GCP
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_uptime_kuma_gcp_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ secrets.GCP_REGION }}
+      TF_VAR_zone: ${{ secrets.GCP_ZONE }}
+      TF_VAR_gcp_node_enabled: 'false'
+      
+      # K3s Integration
+      TF_VAR_k3s_token: ${{ secrets.K3S_TOKEN }}
+      TF_VAR_k3s_url: ${{ secrets.K3S_URL }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TF_VAR_grafana_url: "https://metrics.archer.casa"
+      TF_VAR_grafana_auth: ${{ secrets.GRAFANA_ADMIN_PASSWORD != '' && format('admin:{0}', secrets.GRAFANA_ADMIN_PASSWORD) || '' }}
+      
+      # State Encryption (using sed injection instead of env vars)
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+      
+      - id: 'auth'
+        uses: 'google-github-actions/auth@v3'
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access for Grafana
+        if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.uecb_backend_smoke == 'true' && github.event.inputs.uecb_backend_apply != 'true') }}
+        uses: ./.github/actions/setup-cluster-access
+        id: grafana_cluster_access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Start local Grafana tunnel
+        if: steps.grafana_cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          nohup kubectl -n monitoring port-forward svc/prometheus-grafana 3000:80 >/tmp/grafana-port-forward.log 2>&1 &
+          echo $! >/tmp/grafana-port-forward.pid
+          
+          # Readiness check
+          GRAFANA_URL="http://127.0.0.1:3000"
+          echo "Waiting for Grafana tunnel to be ready at ${GRAFANA_URL}..."
+          
+          MAX_RETRIES=24
+          RETRY_COUNT=0
+          READY=false
+          
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            if curl -s -o /dev/null -w "%{http_code}" "${GRAFANA_URL}/api/health" | grep -q "200"; then
+              echo "âœ… Grafana is ready!"
+              READY=true
+              break
+            fi
+            echo "Still waiting... ($((RETRY_COUNT + 1))/$MAX_RETRIES)"
+            sleep 5
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+          done
+          
+          if [ "$READY" = "false" ]; then
+            FALLBACK_GRAFANA_URL="${TF_VAR_grafana_url:-}"
+            FALLBACK_GRAFANA_AUTH="${TF_VAR_grafana_auth:-}"
+            echo "Grafana port-forward failed to become ready within 120s."
+            cat /tmp/grafana-port-forward.log || true
+            if [ -n "$FALLBACK_GRAFANA_URL" ]; then
+              echo "Attempting fallback to configured Grafana URL ${FALLBACK_GRAFANA_URL}..."
+              if [ -n "$FALLBACK_GRAFANA_AUTH" ]; then
+                FALLBACK_CODE="$(curl -k -s -L -u "${FALLBACK_GRAFANA_AUTH}" -o /dev/null -w "%{http_code}" "${FALLBACK_GRAFANA_URL%/}/api/health" || true)"
+              else
+                FALLBACK_CODE="$(curl -k -s -L -o /dev/null -w "%{http_code}" "${FALLBACK_GRAFANA_URL%/}/api/health" || true)"
+              fi
+              if [ "$FALLBACK_CODE" = "200" ]; then
+                echo "Using configured Grafana URL fallback for Terraform provider."
+                exit 0
+              fi
+              echo "Configured Grafana URL fallback failed with HTTP ${FALLBACK_CODE:-000}."
+            fi
+            exit 1
+          fi
+          
+          echo "TF_VAR_grafana_url=${GRAFANA_URL}" >> "$GITHUB_ENV"
+          echo "Using local Grafana tunnel endpoint for Terraform provider."
+
+      - name: Start local OpenClaw tunnel
+        if: steps.grafana_cluster_access.outputs.configured == 'true' && env.TF_VAR_enable_openclaw_management == 'true'
+        run: |
+          set -euo pipefail
+
+          dump_openclaw_diag() {
+            kubectl -n ai get pods -l app=openclaw -o wide || true
+            kubectl -n ai describe deployment openclaw || true
+            kubectl -n ai describe pods -l app=openclaw || true
+            kubectl -n ai logs deployment/openclaw -c openclaw --tail=200 || true
+            kubectl -n ai logs deployment/openclaw -c openclaw --previous --tail=200 || true
+          }
+
+          echo "Waiting for OpenClaw deployment to be ready..."
+          if ! kubectl -n ai rollout status deployment/openclaw --timeout=300s; then
+            echo "OpenClaw deployment rollout did not complete."
+            dump_openclaw_diag
+            exit 1
+          fi
+          if ! kubectl -n ai wait --for=condition=ready pod -l app=openclaw --timeout=300s; then
+            echo "OpenClaw pods did not become Ready."
+            dump_openclaw_diag
+            exit 1
+          fi
+
+          nohup kubectl -n ai port-forward svc/openclaw 18080:8080 >/tmp/openclaw-port-forward.log 2>&1 &
+          echo $! >/tmp/openclaw-port-forward.pid
+
+          OPENCLAW_HTTP_URL="http://127.0.0.1:18080"
+          OPENCLAW_WS_URL="ws://127.0.0.1:18080"
+          echo "Waiting for OpenClaw tunnel to be reachable at ${OPENCLAW_HTTP_URL}..."
+
+          MAX_RETRIES=24
+          RETRY_COUNT=0
+          READY=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            openclaw_pid="$(cat /tmp/openclaw-port-forward.pid 2>/dev/null || true)"
+            if [ -z "${openclaw_pid}" ] || ! kill -0 "${openclaw_pid}" >/dev/null 2>&1; then
+              echo "OpenClaw port-forward exited before the tunnel became ready."
+              cat /tmp/openclaw-port-forward.log || true
+              dump_openclaw_diag
+              exit 1
+            fi
+
+            code="$(curl -fsS -o /dev/null -w "%{http_code}" --max-time 5 "${OPENCLAW_HTTP_URL}/healthz" || true)"
+            if [ -n "$code" ] && [ "$code" != "000" ]; then
+              echo "OpenClaw tunnel responded with HTTP ${code}."
+              READY=true
+              break
+            fi
+            echo "Still waiting... ($((RETRY_COUNT + 1))/$MAX_RETRIES)"
+            sleep 5
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+          done
+
+          if [ "$READY" = "false" ]; then
+            echo "OpenClaw port-forward failed to become reachable within 120s."
+            cat /tmp/openclaw-port-forward.log || true
+            dump_openclaw_diag
+            exit 1
+          fi
+
+          if ! curl -fsS --max-time 5 "${OPENCLAW_HTTP_URL}/healthz" >/dev/null; then
+            echo "OpenClaw health check failed after the tunnel became reachable."
+            cat /tmp/openclaw-port-forward.log || true
+            dump_openclaw_diag
+            exit 1
+          fi
+
+          echo "TF_VAR_openclaw_url=${OPENCLAW_WS_URL}" >> "$GITHUB_ENV"
+          echo "Using local OpenClaw tunnel endpoint for Terraform provider."
+
+      - name: Backfill OpenClaw tokens from cluster secret
+        if: steps.grafana_cluster_access.outputs.configured == 'true' && env.TF_VAR_enable_openclaw_management == 'true'
+        run: |
+          set -euo pipefail
+
+          fetch_secret_key() {
+            local key="$1"
+            kubectl -n ai get secret openclaw-token -o "jsonpath={.data.${key}}" 2>/dev/null | tr -d '\r\n' || true
+          }
+
+          if [ -z "${TF_VAR_openclaw_token:-}" ]; then
+            token_b64="$(fetch_secret_key token)"
+            if [ -n "${token_b64}" ]; then
+              token="$(printf '%s' "${token_b64}" | base64 -d)"
+              if [ -n "${token}" ]; then
+                echo "::add-mask::${token}"
+                echo "TF_VAR_openclaw_token=${token}" >> "$GITHUB_ENV"
+                echo "Backfilled TF_VAR_openclaw_token from Kubernetes secret."
+              fi
+            fi
+          fi
+
+          if [ -z "${TF_VAR_discord_bot_token:-}" ]; then
+            discord_b64="$(fetch_secret_key DISCORD_BOT_TOKEN)"
+            if [ -n "${discord_b64}" ]; then
+              discord="$(printf '%s' "${discord_b64}" | base64 -d)"
+              if [ -n "${discord}" ]; then
+                echo "::add-mask::${discord}"
+                echo "TF_VAR_discord_bot_token=${discord}" >> "$GITHUB_ENV"
+                echo "Backfilled TF_VAR_discord_bot_token from Kubernetes secret."
+              fi
+            fi
+          fi
+
+          if [ -z "${TF_VAR_openai_api_key:-}" ]; then
+            openai_b64="$(fetch_secret_key OPENAI_API_KEY)"
+            if [ -n "${openai_b64}" ]; then
+              openai_api_key="$(printf '%s' "${openai_b64}" | base64 -d)"
+              if [ -n "${openai_api_key}" ]; then
+                echo "::add-mask::${openai_api_key}"
+                echo "TF_VAR_openai_api_key=${openai_api_key}" >> "$GITHUB_ENV"
+                echo "Backfilled TF_VAR_openai_api_key from Kubernetes secret."
+              fi
+            fi
+          fi
+
+      - name: Backfill Bitwarden provider credentials for Homelab legacy state cleanup
+        if: steps.grafana_cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+
+          BRIDGE_NS="external-secrets"
+          BW_SERVER=""
+          BW_EMAIL=""
+          BW_PASSWORD=""
+
+          for attempt in 1 2 3 4 5; do
+            if BW_SERVER="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_SERVER}' | base64 -d)" &&
+               BW_EMAIL="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_EMAIL}' | base64 -d)" &&
+               BW_PASSWORD="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_PASSWORD}' | base64 -d)"; then
+              break
+            fi
+
+            echo "Unable to read Bitwarden bridge secret from the cluster API; retrying (${attempt}/5)..."
+            sleep 15
+          done
+
+          for v in BW_SERVER BW_EMAIL BW_PASSWORD; do
+            eval "val=\${$v:-}"
+            if [ -z "${val}" ]; then
+              echo "Missing required Homelab Bitwarden input ${v}."
+              exit 1
+            fi
+          done
+
+          echo "::add-mask::$BW_SERVER"
+          echo "::add-mask::$BW_EMAIL"
+          echo "::add-mask::$BW_PASSWORD"
+
+          echo "TF_VAR_bw_server_url=${BW_SERVER}" >> "$GITHUB_ENV"
+          echo "TF_VAR_bw_email=${BW_EMAIL}" >> "$GITHUB_ENV"
+          echo "TF_VAR_bw_master_password=${BW_PASSWORD}" >> "$GITHUB_ENV"
+          echo "Backfilled Bitwarden provider credentials for Homelab legacy state cleanup."
+
+      - name: Install AWS CLI for targeted UECB backend apply
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.uecb_backend_apply == 'true' }}
+        uses: unfor19/install-aws-cli-action@v1
+
+      - name: Configure AWS credentials for targeted UECB backend apply
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.uecb_backend_apply == 'true' }}
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: OpenTofu Init, Validate, and Apply (Homelab)
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          RUN_HOMELAB_APPLY: ${{ needs.changes.outputs.infra_changed == 'true' && 'true' || 'false' }}
+          UECB_BACKEND_APPLY: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.uecb_backend_apply == 'true' && 'true' || 'false' }}
+          UECB_BACKEND_SMOKE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.uecb_backend_smoke == 'true' && 'true' || 'false' }}
+          TOFU_BACKEND_STATE_KEY: cloudflare-access/terraform.tfstate
+        run: |
+          set -euo pipefail
+
+          export TF_VAR_aws_access_key_id="${AWS_ACCESS_KEY_ID}"
+          export TF_VAR_aws_secret_access_key="${AWS_SECRET_ACCESS_KEY}"
+          export TF_VAR_aws_region="${TF_VAR_aws_region:-us-east-1}"
+          export AWS_REGION="${AWS_REGION:-${TF_VAR_aws_region}}"
+          export AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION:-${AWS_REGION}}"
+          export TF_VAR_ntfy_token="${{ secrets.NTFY_TOKEN }}"
+
+          if [ "${UECB_BACKEND_SMOKE}" = "true" ] && [ "${UECB_BACKEND_APPLY}" != "true" ]; then
+            echo "Skipping Homelab tofu work for UECB smoke-only run."
+            exit 0
+          fi
+
+          if [ -f terraform.tfvars ]; then
+            mv terraform.tfvars /tmp/aws-backup-terraform.tfvars
+          fi
+
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "'"${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"'"/g' backend.tf
+
+            bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+            if [ "${TF_VAR_enable_azure_student_vm:-false}" = "true" ] && [ "${TF_VAR_azure_student_vm_github_runner_bootstrap_enabled:-false}" = "true" ]; then
+              AZURE_VM_EXTENSION_ADDR='module.azure_student_vm[0].azurerm_virtual_machine_extension.github_runner_bootstrap[0]'
+              AZURE_VM_EXTENSION_ID="/subscriptions/${TF_VAR_azure_subscription_id}/resourceGroups/${TF_VAR_azure_student_vm_resource_group_name:-student-free-vm-rg}/providers/Microsoft.Compute/virtualMachines/${TF_VAR_azure_student_vm_name:-student-free-vm}/extensions/github-runner-bootstrap"
+
+              if ! tofu state list | grep -Fx "${AZURE_VM_EXTENSION_ADDR}" >/dev/null 2>&1; then
+                echo "Attempting to import pre-existing Azure VM runner bootstrap extension..."
+                set +e
+                IMPORT_OUTPUT="$(tofu import "${AZURE_VM_EXTENSION_ADDR}" "${AZURE_VM_EXTENSION_ID}" 2>&1)"
+                IMPORT_EXIT=$?
+                set -e
+
+                if [ "${IMPORT_EXIT}" -eq 0 ]; then
+                  echo "${IMPORT_OUTPUT}"
+                elif printf '%s' "${IMPORT_OUTPUT}" | grep -qi 'Cannot import non-existent remote object'; then
+                  echo "Azure VM runner bootstrap extension does not exist yet; continuing without import."
+                else
+                  echo "${IMPORT_OUTPUT}"
+                  exit "${IMPORT_EXIT}"
+                fi
+              fi
+            fi
+
+            tofu validate
+            if [ "${UECB_BACKEND_APPLY}" = "true" ]; then
+              PREP_LOG="/tmp/tofu-homelab-uecb-prep.log"
+              set +e
+              timeout 10m tofu apply \
+                -refresh=false \
+                -input=false \
+                -auto-approve \
+                -lock-timeout=60s \
+                -target=aws_ecr_repository.uecb_lambda_runner[0] 2>&1 | tee "${PREP_LOG}"
+              PREP_EXIT=${PIPESTATUS[0]}
+              set -e
+
+              if [ "${PREP_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PREP_LOG}"; then
+                echo "Retrying UECB Lambda image preparation apply after stale lock cleanup..."
+                set +e
+                timeout 10m tofu apply \
+                  -refresh=false \
+                  -input=false \
+                  -auto-approve \
+                  -lock-timeout=60s \
+                  -target=aws_ecr_repository.uecb_lambda_runner[0] 2>&1 | tee "${PREP_LOG}"
+                PREP_EXIT=${PIPESTATUS[0]}
+                set -e
+              fi
+
+              if [ "${PREP_EXIT}" -ne 0 ]; then
+                exit "${PREP_EXIT}"
+              fi
+
+              UECB_LAMBDA_IMAGE_URI="$(tofu output -raw uecb_lambda_runner_image_uri)"
+              if [ -z "${UECB_LAMBDA_IMAGE_URI}" ]; then
+                echo "Unable to determine UECB Lambda image URI." >&2
+                exit 1
+              fi
+
+              UECB_LAMBDA_REGISTRY="${UECB_LAMBDA_IMAGE_URI%%/*}"
+              echo "${{ github.token }}" | docker login ghcr.io --username "${{ github.actor }}" --password-stdin
+              aws ecr get-login-password --region "${AWS_REGION}" | docker login --username AWS --password-stdin "${UECB_LAMBDA_REGISTRY}"
+              docker build --pull --platform linux/amd64 --provenance=false --sbom=false -t "${UECB_LAMBDA_IMAGE_URI}" "${GITHUB_WORKSPACE}/terraform/homelab/uecb-lambda-runner"
+              docker push "${UECB_LAMBDA_IMAGE_URI}"
+
+              UECB_REGION="${TF_VAR_region:-us-central1}"
+
+              restore_secret_if_pending_delete() {
+                local secret_name="$1"
+                local deleted_date
+
+                deleted_date="$(aws secretsmanager describe-secret --secret-id "${secret_name}" --query 'DeletedDate' --output text 2>/dev/null || true)"
+                if [ -n "${deleted_date}" ] && [ "${deleted_date}" != "None" ]; then
+                  echo "Restoring pending-deletion UECB secret ${secret_name}..."
+                  aws secretsmanager restore-secret --secret-id "${secret_name}" >/dev/null
+                fi
+              }
+
+              secret_arn_if_exists() {
+                local secret_name="$1"
+
+                aws secretsmanager describe-secret --secret-id "${secret_name}" --query 'ARN' --output text 2>/dev/null || true
+              }
+
+              lambda_function_url_import_id_if_exists() {
+                local function_name="$1"
+
+                if aws lambda get-function-url-config --function-name "${function_name}" >/dev/null 2>&1; then
+                  printf '%s' "${function_name}"
+                fi
+              }
+
+              kubernetes_secret_import_id_if_exists() {
+                local namespace="$1"
+                local secret_name="$2"
+
+                if kubectl -n "${namespace}" get secret "${secret_name}" -o name >/dev/null 2>&1; then
+                  printf '%s/%s' "${namespace}" "${secret_name}"
+                fi
+              }
+
+              restore_secret_if_pending_delete "uecb-codebuild-runner-github-pat"
+              restore_secret_if_pending_delete "uecb-lambda-runner-github-pat"
+
+              UECB_CODEBUILD_SECRET_ARN="$(secret_arn_if_exists "uecb-codebuild-runner-github-pat")"
+              UECB_LAMBDA_SECRET_ARN="$(secret_arn_if_exists "uecb-lambda-runner-github-pat")"
+              UECB_CODEBUILD_CONTROLLER_URL_IMPORT_ID="$(lambda_function_url_import_id_if_exists "uecb-lambda-runner-controller")"
+              UECB_LAMBDA_CONTROLLER_URL_IMPORT_ID="$(lambda_function_url_import_id_if_exists "uecb-lambda-dispatch-controller")"
+              UECB_CLOUD_RUN_K8S_SECRET_IMPORT_ID="$(kubernetes_secret_import_id_if_exists "arc-systems" "uecb-cloud-run")"
+              UECB_CODEBUILD_K8S_SECRET_IMPORT_ID="$(kubernetes_secret_import_id_if_exists "arc-systems" "uecb-codebuild")"
+              UECB_LAMBDA_K8S_SECRET_IMPORT_ID="$(kubernetes_secret_import_id_if_exists "arc-systems" "uecb-lambda")"
+              declare -a UECB_IMPORTS=(
+                "aws_secretsmanager_secret.uecb_runner_pat[0]|${UECB_CODEBUILD_SECRET_ARN}"
+                "aws_secretsmanager_secret.uecb_lambda_runner_pat[0]|${UECB_LAMBDA_SECRET_ARN}"
+                "google_cloudfunctions_function.uecb_cloud_run_controller[0]|projects/${TF_VAR_project_id}/locations/${UECB_REGION}/functions/uecb-cloud-run-runner-controller"
+                "aws_lambda_function.uecb_lambda_controller[0]|uecb-lambda-runner-controller"
+                "aws_lambda_function_url.uecb_lambda_controller[0]|${UECB_CODEBUILD_CONTROLLER_URL_IMPORT_ID}"
+                "aws_lambda_function_url.uecb_lambda_dispatch_controller[0]|${UECB_LAMBDA_CONTROLLER_URL_IMPORT_ID}"
+                "kubernetes_secret_v1.uecb_cloud_run[0]|${UECB_CLOUD_RUN_K8S_SECRET_IMPORT_ID}"
+                "kubernetes_secret_v1.uecb_codebuild[0]|${UECB_CODEBUILD_K8S_SECRET_IMPORT_ID}"
+                "kubernetes_secret_v1.uecb_lambda[0]|${UECB_LAMBDA_K8S_SECRET_IMPORT_ID}"
+              )
+
+              for entry in "${UECB_IMPORTS[@]}"; do
+                UECB_ADDR="${entry%%|*}"
+                UECB_ID="${entry#*|}"
+
+                if tofu state list | grep -Fx "${UECB_ADDR}" >/dev/null 2>&1; then
+                  continue
+                fi
+
+                if [ -z "${UECB_ID}" ] || [ "${UECB_ID}" = "None" ]; then
+                  echo "UECB resource ${UECB_ADDR} does not exist remotely; continuing without import."
+                  continue
+                fi
+
+                echo "Attempting to import pre-existing UECB resource ${UECB_ADDR}..."
+                set +e
+                IMPORT_OUTPUT="$(tofu import "${UECB_ADDR}" "${UECB_ID}" 2>&1)"
+                IMPORT_EXIT=$?
+                set -e
+
+                if [ "${IMPORT_EXIT}" -eq 0 ]; then
+                  echo "${IMPORT_OUTPUT}"
+                elif printf '%s' "${IMPORT_OUTPUT}" | grep -Eqi 'Cannot import non-existent remote object|Cannot find|not found|404'; then
+                  echo "UECB resource ${UECB_ADDR} does not exist remotely; continuing without import."
+                else
+                  echo "${IMPORT_OUTPUT}"
+                  exit "${IMPORT_EXIT}"
+                fi
+              done
+
+              APPLY_LOG="/tmp/tofu-homelab-uecb-apply.log"
+              set +e
+              timeout 20m tofu apply \
+                -refresh=false \
+                -input=false \
+                -auto-approve \
+                -lock-timeout=60s \
+                -target=google_cloud_run_v2_job.uecb_runner[0] \
+                -target=google_cloudfunctions_function.uecb_cloud_run_controller[0] \
+                -target=google_secret_manager_secret_version.uecb_runner_pat[0] \
+                -target=aws_codebuild_project.uecb_codebuild_runner[0] \
+                -target=aws_lambda_function.uecb_lambda_controller[0] \
+                -target=aws_lambda_function_url.uecb_lambda_controller[0] \
+                -target=aws_dynamodb_table.uecb_lambda_status[0] \
+                -target=aws_secretsmanager_secret_version.uecb_lambda_runner_pat[0] \
+                -target=aws_lambda_function.uecb_lambda_runner[0] \
+                -target=aws_lambda_function.uecb_lambda_dispatch_controller[0] \
+                -target=aws_lambda_function_url.uecb_lambda_dispatch_controller[0] \
+                -target=kubernetes_secret_v1.uecb_cloud_run[0] \
+                -target=kubernetes_secret_v1.uecb_codebuild[0] \
+                -target=kubernetes_secret_v1.uecb_lambda[0] 2>&1 | tee "${APPLY_LOG}"
+              APPLY_EXIT=${PIPESTATUS[0]}
+              set -e
+
+              if [ "${APPLY_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${APPLY_LOG}"; then
+                echo "Retrying targeted UECB backend apply after stale lock cleanup..."
+                set +e
+                timeout 20m tofu apply \
+                  -refresh=false \
+                  -input=false \
+                  -auto-approve \
+                  -lock-timeout=60s \
+                  -target=google_cloud_run_v2_job.uecb_runner[0] \
+                  -target=google_cloudfunctions_function.uecb_cloud_run_controller[0] \
+                  -target=google_secret_manager_secret_version.uecb_runner_pat[0] \
+                  -target=aws_codebuild_project.uecb_codebuild_runner[0] \
+                  -target=aws_lambda_function.uecb_lambda_controller[0] \
+                  -target=aws_lambda_function_url.uecb_lambda_controller[0] \
+                  -target=aws_dynamodb_table.uecb_lambda_status[0] \
+                  -target=aws_secretsmanager_secret_version.uecb_lambda_runner_pat[0] \
+                  -target=aws_lambda_function.uecb_lambda_runner[0] \
+                  -target=aws_lambda_function.uecb_lambda_dispatch_controller[0] \
+                  -target=aws_lambda_function_url.uecb_lambda_dispatch_controller[0] \
+                  -target=kubernetes_secret_v1.uecb_cloud_run[0] \
+                  -target=kubernetes_secret_v1.uecb_codebuild[0] \
+                  -target=kubernetes_secret_v1.uecb_lambda[0] 2>&1 | tee "${APPLY_LOG}"
+                APPLY_EXIT=${PIPESTATUS[0]}
+                set -e
+              fi
+
+              if [ "${APPLY_EXIT}" -ne 0 ]; then
+                exit "${APPLY_EXIT}"
+              fi
+            elif [ "${RUN_HOMELAB_APPLY}" = "true" ] && [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            APPLY_LOG="/tmp/tofu-homelab-apply.log"
+            set +e
+            timeout 30m tofu apply -input=false -auto-approve -lock-timeout=60s 2>&1 | tee "${APPLY_LOG}"
+            APPLY_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "${APPLY_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${APPLY_LOG}"; then
+              echo "Retrying OpenTofu Apply after stale lock cleanup..."
+              set +e
+              timeout 30m tofu apply -input=false -auto-approve -lock-timeout=60s 2>&1 | tee "${APPLY_LOG}"
+              APPLY_EXIT=${PIPESTATUS[0]}
+              set -e
+            fi
+
+            if [ "${APPLY_EXIT}" -ne 0 ]; then
+              exit "${APPLY_EXIT}"
+            fi
+          elif [ "${RUN_HOMELAB_APPLY}" = "true" ]; then
+            PLAN_LOG="/tmp/tofu-homelab-plan.log"
+            set +e
+            tofu plan -input=false -lock-timeout=60s 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "${PLAN_EXIT}" -ne 0 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+              echo "Retrying OpenTofu Plan after stale lock cleanup..."
+              set +e
+              tofu plan -input=false -lock-timeout=60s 2>&1 | tee "${PLAN_LOG}"
+              PLAN_EXIT=${PIPESTATUS[0]}
+              set -e
+            fi
+
+            if [ "${PLAN_EXIT}" -ne 0 ]; then
+              exit "${PLAN_EXIT}"
+            fi
+          else
+            echo "Skipping Homelab apply; exporting existing state outputs for dependent jobs."
+          fi
+
+      - name: Apply UECB broker overlay
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.uecb_backend_apply == 'true' && steps.grafana_cluster_access.outputs.configured == 'true' }}
+        run: |
+          set -euo pipefail
+
+          if [ "${TF_VAR_enable_azure_student_vm:-false}" != "true" ] || [ -z "${TF_VAR_codebuild_runner_github_pat:-}" ]; then
+            echo "Skipping UECB broker overlay because the Azure Functions backend is not provisioned."
+            exit 0
+          fi
+
+          kubectl apply -k "${GITHUB_WORKSPACE}/grok-servaar/ops/arc/unified-ephemeral-runner-broker"
+          kubectl -n arc-systems rollout restart deployment/unified-ephemeral-runner-broker
+          kubectl -n arc-systems rollout status deployment/unified-ephemeral-runner-broker --timeout=300s
+          kubectl -n arc-systems get secret uecb-cloud-run uecb-codebuild uecb-lambda
+
+      - name: Release Homelab state lock on cancel
+        if: cancelled()
+        run: |
+          echo "Job cancelled. Discovering and releasing Homelab state lock..."
+          tofu plan -input=false -lock-timeout=1s > /tmp/cancel-lock.log 2>&1 || true
+          LOCK_ID=$(sed -n 's/.*ID:[[:space:]]*\(.*\)$/\1/p' /tmp/cancel-lock.log | tail -n 1 | tr -d '\r' | xargs || true)
+          if [ -n "$LOCK_ID" ]; then
+            echo "Force unlocking $LOCK_ID..."
+            tofu force-unlock -force "$LOCK_ID"
+          else
+            echo "No active lock found."
+          fi
+
+  # Job: OpenTofu Infrastructure (Vaultwarden / ntfy auth)
+  opentofu_vaultwarden:
+    name: Opentofu Apply -input=false (Vaultwarden)
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && format('["{0}"]', vars.AZURE_VM_RUNNER_LABEL != '' && vars.AZURE_VM_RUNNER_LABEL || 'home-gh-runner')) || '["ubuntu-latest"]') }}
+    environment:
+      name: production
+    timeout-minutes: 20
+    concurrency:
+      group: tofu-vaultwarden
+      cancel-in-progress: false
+    needs:
+      - changes
+      - opentofu_homelab
+    if: ${{ always() && needs.opentofu_homelab.result == 'success' && !(github.event_name == 'workflow_dispatch' && (github.event.inputs.uecb_backend_apply == 'true' || inputs.uecb_backend_apply == true)) }}
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: terraform/vaultwarden
+    env:
+      TF_VAR_github_mcp_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_cloudflare_mcp_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_google_credentials: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_homeassistant_mcp_token: ${{ secrets.HOME_ASSISTANT_MCP_TOKEN }}
+      TF_VAR_paperless_mcp_api_token: ${{ secrets.PAPERLESS_MCP_API_TOKEN }}
+      TF_VAR_nextcloud_mcp_app_password: ${{ secrets.NEXTCLOUD_MCP_APP_PASSWORD }}
+      TF_VAR_grafana_mcp_token: ${{ secrets.GRAFANA_MCP_TOKEN }}
+      TF_VAR_ntfy_admin_password: ${{ secrets.NTFY_ADMIN_PASSWORD }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ secrets.GCP_REGION != '' && secrets.GCP_REGION || vars.GCP_REGION != '' && vars.GCP_REGION || 'us-central1' }}
+      TF_VAR_pushover_user_key: ${{ secrets.PUSHOVER_USER_KEY || 'placeholder' }}
+      TF_VAR_pushover_api_token_default: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_media: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_system: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_cluster: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_backup: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_security: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - name: Resolve Vaultwarden apply gate
+        id: vaultwarden_gate
+        working-directory: ${{ github.workspace }}
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_INPUT_RUN_INFRA: ${{ github.event.inputs.run_infra }}
+          EVENT_INPUT_TOFU_REPLACE: ${{ github.event.inputs.tofu_replace }}
+          EVENT_INPUT_UECB_BACKEND_APPLY: ${{ github.event.inputs.uecb_backend_apply }}
+          INPUTS_UECB_BACKEND_APPLY: ${{ inputs.uecb_backend_apply }}
+          MANUAL_INFRA: ${{ needs.changes.outputs.manual_infra }}
+          VAULTWARDEN_CHANGED: ${{ needs.changes.outputs.vaultwarden_changed }}
+          INFRA_CHANGED: ${{ needs.changes.outputs.infra_changed }}
+        run: |
+          set -euo pipefail
+
+          RUN_VAULTWARDEN_APPLY="false"
+          if [ "${EVENT_NAME}" = "workflow_dispatch" ] && { [ "${EVENT_INPUT_UECB_BACKEND_APPLY}" = "true" ] || [ "${INPUTS_UECB_BACKEND_APPLY}" = "true" ]; }; then
+            RUN_VAULTWARDEN_APPLY="false"
+          elif [ "${EVENT_NAME}" = "workflow_dispatch" ] && { [ "${EVENT_INPUT_RUN_INFRA}" = "true" ] || [ -n "${EVENT_INPUT_TOFU_REPLACE}" ]; }; then
+            RUN_VAULTWARDEN_APPLY="true"
+          fi
+          if [ "${MANUAL_INFRA}" = "true" ] || [ "${VAULTWARDEN_CHANGED}" = "true" ] || [ "${INFRA_CHANGED}" = "true" ]; then
+            RUN_VAULTWARDEN_APPLY="true"
+          fi
+
+          echo "event_name=${EVENT_NAME}"
+          echo "event_input_run_infra=${EVENT_INPUT_RUN_INFRA}"
+          echo "event_input_tofu_replace_length=${#EVENT_INPUT_TOFU_REPLACE}"
+          echo "manual_infra=${MANUAL_INFRA}"
+          echo "vaultwarden_changed=${VAULTWARDEN_CHANGED}"
+          echo "infra_changed=${INFRA_CHANGED}"
+          echo "run_apply=${RUN_VAULTWARDEN_APPLY}"
+          echo "run_apply=${RUN_VAULTWARDEN_APPLY}" >> "$GITHUB_OUTPUT"
+
+      - name: Skip Vaultwarden apply
+        if: steps.vaultwarden_gate.outputs.run_apply != 'true'
+        working-directory: ${{ github.workspace }}
+        run: |
+          echo "Skipping Vaultwarden apply; gate resolved false."
+
+      - uses: actions/checkout@v6
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ steps.vaultwarden_gate.outputs.run_apply == 'true' && runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Install kubectl
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Set up Node
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install Bitwarden CLI
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        run: |
+          if command -v bw >/dev/null 2>&1; then
+            bw --version
+            exit 0
+          fi
+          npm install -g @bitwarden/cli
+          bw --version
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Verify cluster access for Vaultwarden bootstrap
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cluster_access.outputs.configured }}" != "true" ]; then
+            echo "No usable kubectl context available for Vaultwarden bootstrap."
+            exit 1
+          fi
+          kubectl get ns default >/dev/null
+
+      - name: Preflight cluster health for Vaultwarden deploy path
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        run: |
+          set -euo pipefail
+          chmod +x "$GITHUB_WORKSPACE/scripts/check-cluster-deploy-preflight.sh"
+          "$GITHUB_WORKSPACE/scripts/check-cluster-deploy-preflight.sh"
+
+      - name: OpenTofu Init, Validate, and Apply (Vaultwarden)
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true'
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: vaultwarden/terraform.tfstate
+        run: |
+          set -euo pipefail
+
+          BRIDGE_NS="external-secrets"
+          ORG_NAME="homelab"
+          COLLECTION_NAME="K3s Secrets"
+
+          BW_SERVER="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_SERVER}' | base64 -d)"
+          BW_EMAIL="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_EMAIL}' | base64 -d)"
+          BW_PASSWORD="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_PASSWORD}' | base64 -d)"
+          KEYCLOAK_ADMIN_PASSWORD="$(kubectl get secret keycloak-admin -n auth -o jsonpath='{.data.KEYCLOAK_ADMIN_PASSWORD}' | base64 -d)"
+          POCKETID_CLIENT_ID="$(kubectl get secret pocket-id-oidc -n auth -o jsonpath='{.data.POCKETID_CLIENT_ID}' | base64 -d)"
+          POCKETID_CLIENT_SECRET="$(kubectl get secret pocket-id-oidc -n auth -o jsonpath='{.data.POCKETID_CLIENT_SECRET}' | base64 -d)"
+
+          for v in BW_SERVER BW_EMAIL BW_PASSWORD ORG_NAME COLLECTION_NAME KEYCLOAK_ADMIN_PASSWORD POCKETID_CLIENT_ID POCKETID_CLIENT_SECRET TF_VAR_github_mcp_pat TF_VAR_cloudflare_mcp_api_token TF_VAR_google_credentials TF_VAR_ntfy_admin_password TF_VAR_ntfy_token TF_VAR_pushover_user_key TF_VAR_pushover_api_token_default TF_VAR_pushover_api_token_media TF_VAR_pushover_api_token_system TF_VAR_pushover_api_token_cluster TF_VAR_pushover_api_token_backup TF_VAR_pushover_api_token_security TF_VAR_paperless_mcp_api_token TF_VAR_nextcloud_mcp_app_password TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE; do
+            eval "val=\${$v:-}"
+            if [ -z "${val}" ]; then
+              echo "Missing required Vaultwarden input ${v}."
+              exit 1
+            fi
+          done
+
+          echo "::add-mask::$BW_SERVER"
+          echo "::add-mask::$BW_EMAIL"
+          echo "::add-mask::$BW_PASSWORD"
+          echo "::add-mask::$KEYCLOAK_ADMIN_PASSWORD"
+          echo "::add-mask::$POCKETID_CLIENT_ID"
+          echo "::add-mask::$POCKETID_CLIENT_SECRET"
+          echo "::add-mask::$TF_VAR_github_mcp_pat"
+          echo "::add-mask::$TF_VAR_google_credentials"
+          echo "::add-mask::$TF_VAR_paperless_mcp_api_token"
+          echo "::add-mask::$TF_VAR_nextcloud_mcp_app_password"
+
+          export BITWARDENCLI_APPDATA_DIR="$(mktemp -d)"
+          export BW_NOINTERACTION=true
+          bw config server "${BW_SERVER}"
+          bw logout >/dev/null 2>&1 || true
+          BW_SESSION="$(bw login "${BW_EMAIL}" "${BW_PASSWORD}" --raw)"
+          if [ -z "${BW_SESSION}" ]; then
+            echo "Bitwarden CLI login did not return a session."
+            exit 1
+          fi
+          echo "::add-mask::$BW_SESSION"
+          bw sync --session "${BW_SESSION}"
+          ORG_ID="$(bw list organizations --session "${BW_SESSION}" | jq -r --arg name "${ORG_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${ORG_ID}" ]; then
+            echo "Bitwarden CLI did not expose organization ${ORG_NAME}."
+            exit 1
+          fi
+          COLLECTION_ID="$(bw list org-collections --organizationid "${ORG_ID}" --session "${BW_SESSION}" | jq -r --arg name "${COLLECTION_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${COLLECTION_ID}" ]; then
+            echo "Bitwarden CLI did not expose collection ${COLLECTION_NAME} in organization ${ORG_NAME}."
+            exit 1
+          fi
+
+          export TF_VAR_bw_server_url="${BW_SERVER}"
+          export TF_VAR_bw_email="${BW_EMAIL}"
+          export TF_VAR_bw_master_password="${BW_PASSWORD}"
+          export TF_VAR_homelab_organization_id="${ORG_ID}"
+          export TF_VAR_k3s_secrets_collection_id="${COLLECTION_ID}"
+          export TF_VAR_keycloak_admin_password="${KEYCLOAK_ADMIN_PASSWORD}"
+          export TF_VAR_pocketid_client_id="${POCKETID_CLIENT_ID}"
+          export TF_VAR_pocketid_client_secret="${POCKETID_CLIENT_SECRET}"
+
+          IMMICH_ITEM_NAME="media/immich-mobile-cloudflare-access"
+          EXISTING_IMMICH_CLIENT_ID=""
+          EXISTING_IMMICH_CLIENT_SECRET=""
+          IMMICH_CLIENT_ID=""
+          IMMICH_CLIENT_SECRET=""
+
+          EXISTING_IMMICH_ITEM_JSON="$(bw list items --search "${IMMICH_ITEM_NAME}" --organizationid "${ORG_ID}" --session "${BW_SESSION}" | jq -c --arg name "${IMMICH_ITEM_NAME}" '.[] | select(.name == $name)' | head -n1)"
+          if [ -n "${EXISTING_IMMICH_ITEM_JSON}" ]; then
+            EXISTING_IMMICH_CLIENT_ID="$(echo "${EXISTING_IMMICH_ITEM_JSON}" | jq -r '.login.username // empty' | tr -d '\r\n')"
+            EXISTING_IMMICH_CLIENT_SECRET="$(echo "${EXISTING_IMMICH_ITEM_JSON}" | jq -r '.login.password // empty' | tr -d '\r\n')"
+          fi
+
+          HOMELAB_DIR="${GITHUB_WORKSPACE}/terraform/homelab"
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "'"$TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE"'"/g' "${HOMELAB_DIR}/backend.tf"
+          pushd "${HOMELAB_DIR}" >/dev/null
+          TOFU_BACKEND_STATE_KEY=cloudflare-access/terraform.tfstate bash ../../scripts/tofu-init-with-retry.sh --reconfigure >/dev/null
+
+          if tofu -no-color output -raw immich_mobile_client_id >/tmp/immich_mobile_client_id.txt 2>/dev/null; then
+            IMMICH_CLIENT_ID="$(tail -n 1 /tmp/immich_mobile_client_id.txt | tr -d '\r\n')"
+          fi
+          if tofu -no-color output -raw immich_mobile_client_secret >/tmp/immich_mobile_client_secret.txt 2>/dev/null; then
+            IMMICH_CLIENT_SECRET="$(tail -n 1 /tmp/immich_mobile_client_secret.txt | tr -d '\r\n')"
+          fi
+
+          if [ -n "${EXISTING_IMMICH_CLIENT_SECRET}" ] && [ -n "${EXISTING_IMMICH_CLIENT_ID}" ]; then
+            if [ -z "${IMMICH_CLIENT_ID}" ]; then
+              IMMICH_CLIENT_ID="${EXISTING_IMMICH_CLIENT_ID}"
+            fi
+            if [ -z "${IMMICH_CLIENT_SECRET}" ] && [ "${IMMICH_CLIENT_ID}" = "${EXISTING_IMMICH_CLIENT_ID}" ]; then
+              IMMICH_CLIENT_SECRET="${EXISTING_IMMICH_CLIENT_SECRET}"
+            fi
+          fi
+
+          if [ -z "${IMMICH_CLIENT_ID}" ] || [ -z "${IMMICH_CLIENT_SECRET}" ]; then
+            echo "Cloudflare state did not return a complete Immich mobile service token; rotating via Cloudflare API."
+            IMMICH_TOKEN_ID="$(tofu state pull | jq -r '.resources[] | select(.type == "cloudflare_zero_trust_access_service_token" and .name == "immich_mobile") | .instances[0].attributes.id // empty' | head -n 1 | tr -d '\r\n')"
+            if [ -z "${IMMICH_TOKEN_ID}" ]; then
+              TOKEN_LOOKUP_RESPONSE="$(curl -fsS \
+                "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/service_tokens?name=Immich%20Mobile%20App&per_page=100" \
+                -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+                -H "Content-Type: application/json" || true)"
+              if [ -n "${TOKEN_LOOKUP_RESPONSE}" ]; then
+                IMMICH_TOKEN_ID="$(echo "${TOKEN_LOOKUP_RESPONSE}" | jq -r '.result[] | select((.name // .client_name // .service_token_name // "") == "Immich Mobile App") | .id' | head -n 1 | tr -d '\r\n')"
+              fi
+            fi
+            if [ -z "${IMMICH_TOKEN_ID}" ]; then
+              echo "Unable to determine Immich mobile service token ID from Terraform state or Cloudflare list API."
+              exit 1
+            fi
+            ROTATE_RESPONSE="$(curl -fsS -X POST \
+              "https://api.cloudflare.com/client/v4/accounts/${CLOUDFLARE_ACCOUNT_ID}/access/service_tokens/${IMMICH_TOKEN_ID}/rotate" \
+              -H "Authorization: Bearer ${CLOUDFLARE_API_TOKEN}" \
+              -H "Content-Type: application/json")"
+            if [ "$(echo "${ROTATE_RESPONSE}" | jq -r '.success')" != "true" ]; then
+              echo "Cloudflare API failed to rotate the Immich mobile service token."
+              echo "Cloudflare rotate errors: $(echo "${ROTATE_RESPONSE}" | jq -c '.errors // []')"
+              exit 1
+            fi
+            IMMICH_CLIENT_ID="$(echo "${ROTATE_RESPONSE}" | jq -r '.result.client_id // empty' | tr -d '\r\n')"
+            IMMICH_CLIENT_SECRET="$(echo "${ROTATE_RESPONSE}" | jq -r '.result.client_secret // empty' | tr -d '\r\n')"
+          fi
+          popd >/dev/null
+
+          export TF_VAR_immich_mobile_client_id="${IMMICH_CLIENT_ID}"
+          export TF_VAR_immich_mobile_client_secret="${IMMICH_CLIENT_SECRET}"
+
+          for v in TF_VAR_immich_mobile_client_id TF_VAR_immich_mobile_client_secret; do
+            eval "val=\${$v:-}"
+            if [ -z "${val}" ]; then
+              echo "Missing required Cloudflare Access output ${v}."
+              exit 1
+            fi
+            echo "::add-mask::${val}"
+          done
+
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "'"$TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE"'"/g' backend.tf
+
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+          tofu validate
+          if [ "${{ github.ref }}" = "refs/heads/main" ]; then
+            timeout 15m tofu apply -input=false -auto-approve -lock-timeout=60s
+          else
+            tofu plan -input=false
+          fi
+
+      - name: Force refresh ntfy ExternalSecret
+        if: steps.vaultwarden_gate.outputs.run_apply == 'true' && github.ref == 'refs/heads/main'
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cluster_access.outputs.configured }}" != "true" ]; then
+            echo "::warning::Cluster access unavailable; skipping ntfy ExternalSecret refresh."
+            exit 0
+          fi
+
+          print_eso_diagnostics() {
+            echo "--- external-secrets pods ---"
+            kubectl get pods -n external-secrets -o wide || true
+            echo "--- vaultwarden-webhook store ---"
+            kubectl get clustersecretstore vaultwarden-webhook -o yaml || true
+            echo "--- ntfy-secret ExternalSecret ---"
+            kubectl get externalsecret ntfy-secret -n monitoring -o yaml || true
+          }
+
+          wait_for_eso_health() {
+            if kubectl auth can-i get deployments.apps -n external-secrets >/dev/null 2>&1; then
+              kubectl rollout status deployment/external-secrets -n external-secrets --timeout=300s
+              if kubectl get deployment external-secrets-webhook -n external-secrets >/dev/null 2>&1; then
+                kubectl rollout status deployment/external-secrets-webhook -n external-secrets --timeout=300s
+              fi
+              kubectl rollout status deployment/vaultwarden-eso-bridge -n external-secrets --timeout=300s
+            else
+              echo "Skipping deployment rollout checks (insufficient RBAC for external-secrets namespace)."
+            fi
+
+            if kubectl auth can-i get clustersecretstores.external-secrets.io >/dev/null 2>&1; then
+              for _ in $(seq 1 30); do
+                store_ready="$(kubectl get clustersecretstore vaultwarden-webhook -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || true)"    
+                if [ "${store_ready}" = "True" ]; then
+                  return 0
+                fi
+                sleep 10
+              done
+              echo "ClusterSecretStore vaultwarden-webhook is not Ready."
+              kubectl get clustersecretstore vaultwarden-webhook -o yaml || true
+              return 1
+            fi
+
+            echo "Skipping ClusterSecretStore readiness check (insufficient RBAC)."
+            return 0
+          }
+
+          refresh_ntfy_secret() {
+            local attempt="$1"
+            kubectl annotate externalsecret ntfy-secret -n monitoring "force-sync=$(date +%s)-${attempt}" --overwrite
+            kubectl wait --for=jsonpath='{.status.conditions[?(@.type=="Ready")].status}'=True externalsecret/ntfy-secret -n monitoring --timeout=300s
+            kubectl get secret ntfy-secret -n monitoring -o jsonpath='{.data.auth_access}' | base64 -d
+            echo
+            kubectl get secret ntfy-secret -n monitoring -o jsonpath='{.data.auth_users}' | base64 -d
+            echo
+          }
+          for attempt in 1 2 3; do
+            echo "Refreshing ntfy ExternalSecret (attempt ${attempt}/3)..."
+            if wait_for_eso_health && refresh_ntfy_secret "${attempt}"; then
+              exit 0
+            fi
+
+            echo "ntfy ExternalSecret refresh attempt ${attempt} failed."
+            print_eso_diagnostics
+            sleep $((attempt * 15))
+          done
+
+          echo "::warning::ntfy ExternalSecret refresh failed after retries; Opentofu apply -input=false already succeeded."
+          exit 0
+
+  uecb_smoke_cloud_run_allocate:
+    name: UECB Smoke Allocate (cloud-run)
+    needs: [changes, opentofu_homelab]
+    runs-on: home-gh-runner
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.event.inputs.uecb_backend_smoke == 'true' || inputs.uecb_backend_smoke == true) && (needs.opentofu_homelab.result == 'success' || needs.opentofu_homelab.result == 'skipped') }}
+    outputs:
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      selected_backend: ${{ steps.allocate.outputs.selected_backend }}
+    env:
+      UECB_BROKER_URL: http://unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+    steps:
+      - name: Allocate runner
+        id: allocate
+        shell: bash
+        env:
+          REQUESTED_BACKEND: cloud-run
+        run: |
+          set -euo pipefail
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=uecb-broker")"
+          id_token="$(printf '%s' "${oidc_response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          request_body="$(python3 -c 'import json,os; print(json.dumps({"pool":"lite","backend":os.environ["REQUESTED_BACKEND"],"labels":["uecb-smoke"]}))')"
+          response_file="$(mktemp)"
+          http_status="$(curl -sS -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${id_token}" -H "Content-Type: application/json" -d "${request_body}" "${UECB_BROKER_URL}/v1/allocations")"
+          if [ "${http_status}" -lt 200 ] || [ "${http_status}" -ge 300 ]; then
+            echo "Broker allocation failed with HTTP ${http_status}" >&2
+            cat "${response_file}" >&2 || true
+            exit 1
+          fi
+          response="$(cat "${response_file}")"
+
+          echo "allocation_id=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+          echo "runner_label=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+          echo "selected_backend=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+
+  uecb_smoke_cloud_run:
+    name: UECB Smoke Run (cloud-run)
+    needs: [uecb_smoke_cloud_run_allocate]
+    if: ${{ always() && needs.uecb_smoke_cloud_run_allocate.result == 'success' }}
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ needs.uecb_smoke_cloud_run_allocate.outputs.runner_label }}
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "allocation_id=${{ needs.uecb_smoke_cloud_run_allocate.outputs.allocation_id }}"
+          echo "selected_backend=${{ needs.uecb_smoke_cloud_run_allocate.outputs.selected_backend }}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "CLOUD_RUN_JOB=${CLOUD_RUN_JOB:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "cloud-run" ]; then
+            echo "Expected UECB_PROVIDER=cloud-run, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${CLOUD_RUN_JOB:-}" ]; then
+            echo "Expected CLOUD_RUN_JOB on cloud-run-backed runner." >&2
+            exit 1
+          fi
+
+  uecb_smoke_codebuild_allocate:
+    name: UECB Smoke Allocate (codebuild)
+    needs: [changes, opentofu_homelab]
+    runs-on: home-gh-runner
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.event.inputs.uecb_backend_smoke == 'true' || inputs.uecb_backend_smoke == true) && (needs.opentofu_homelab.result == 'success' || needs.opentofu_homelab.result == 'skipped') }}
+    outputs:
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      selected_backend: ${{ steps.allocate.outputs.selected_backend }}
+    env:
+      UECB_BROKER_URL: http://unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+    steps:
+      - name: Allocate runner
+        id: allocate
+        shell: bash
+        env:
+          REQUESTED_BACKEND: codebuild
+        run: |
+          set -euo pipefail
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=uecb-broker")"
+          id_token="$(printf '%s' "${oidc_response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          request_body="$(python3 -c 'import json,os; print(json.dumps({"pool":"lite","backend":os.environ["REQUESTED_BACKEND"],"labels":["uecb-smoke"]}))')"
+          response_file="$(mktemp)"
+          http_status="$(curl -sS -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${id_token}" -H "Content-Type: application/json" -d "${request_body}" "${UECB_BROKER_URL}/v1/allocations")"
+          if [ "${http_status}" -lt 200 ] || [ "${http_status}" -ge 300 ]; then
+            echo "Broker allocation failed with HTTP ${http_status}" >&2
+            cat "${response_file}" >&2 || true
+            exit 1
+          fi
+          response="$(cat "${response_file}")"
+
+          echo "allocation_id=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+          echo "runner_label=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+          echo "selected_backend=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+
+  uecb_smoke_codebuild:
+    name: UECB Smoke Run (codebuild)
+    needs: [uecb_smoke_codebuild_allocate]
+    if: ${{ always() && needs.uecb_smoke_codebuild_allocate.result == 'success' }}
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ needs.uecb_smoke_codebuild_allocate.outputs.runner_label }}
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "allocation_id=${{ needs.uecb_smoke_codebuild_allocate.outputs.allocation_id }}"
+          echo "selected_backend=${{ needs.uecb_smoke_codebuild_allocate.outputs.selected_backend }}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "CODEBUILD_BUILD_ID=${CODEBUILD_BUILD_ID:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "codebuild" ]; then
+            echo "Expected UECB_PROVIDER=codebuild, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${CODEBUILD_BUILD_ID:-}" ]; then
+            echo "Expected CODEBUILD_BUILD_ID on codebuild-backed runner." >&2
+            exit 1
+          fi
+
+  uecb_smoke_lambda_allocate:
+    name: UECB Smoke Allocate (lambda)
+    needs: [changes, opentofu_homelab]
+    runs-on: home-gh-runner
+    if: ${{ always() && github.event_name == 'workflow_dispatch' && (github.event.inputs.uecb_backend_smoke == 'true' || inputs.uecb_backend_smoke == true) && (needs.opentofu_homelab.result == 'success' || needs.opentofu_homelab.result == 'skipped') }}
+    outputs:
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      selected_backend: ${{ steps.allocate.outputs.selected_backend }}
+    env:
+      UECB_BROKER_URL: http://unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+    steps:
+      - name: Allocate runner
+        id: allocate
+        shell: bash
+        env:
+          REQUESTED_BACKEND: lambda
+        run: |
+          set -euo pipefail
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=uecb-broker")"
+          id_token="$(printf '%s' "${oidc_response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          request_body="$(python3 -c 'import json,os; print(json.dumps({"pool":"lite","backend":os.environ["REQUESTED_BACKEND"],"labels":["uecb-smoke"]}))')"
+          response_file="$(mktemp)"
+          http_status="$(curl -sS -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${id_token}" -H "Content-Type: application/json" -d "${request_body}" "${UECB_BROKER_URL}/v1/allocations")"
+          if [ "${http_status}" -lt 200 ] || [ "${http_status}" -ge 300 ]; then
+            echo "Broker allocation failed with HTTP ${http_status}" >&2
+            cat "${response_file}" >&2 || true
+            exit 1
+          fi
+          response="$(cat "${response_file}")"
+
+          echo "allocation_id=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+          echo "runner_label=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+          echo "selected_backend=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+
+  uecb_smoke_lambda:
+    name: UECB Smoke Run (lambda)
+    needs: [uecb_smoke_lambda_allocate]
+    if: ${{ always() && needs.uecb_smoke_lambda_allocate.result == 'success' }}
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ needs.uecb_smoke_lambda_allocate.outputs.runner_label }}
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "allocation_id=${{ needs.uecb_smoke_lambda_allocate.outputs.allocation_id }}"
+          echo "selected_backend=${{ needs.uecb_smoke_lambda_allocate.outputs.selected_backend }}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "AWS_LAMBDA_FUNCTION_NAME=${AWS_LAMBDA_FUNCTION_NAME:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "lambda" ]; then
+            echo "Expected UECB_PROVIDER=lambda, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${AWS_LAMBDA_FUNCTION_NAME:-}" ]; then
+            echo "Expected AWS_LAMBDA_FUNCTION_NAME on lambda-backed runner." >&2
+            exit 1
+          fi
+
+  # Job 4: Trigger ArgoCD Sync
+  argocd-sync:
+    needs: [update-manifests, opentofu_homelab, opentofu_vaultwarden]
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    concurrency:
+      group: argocd-sync-${{ github.ref }}
+      cancel-in-progress: false
+    # This job requires reaching the in-cluster ArgoCD API via the LAN-only K8s API endpoint,
+    # so it must run on a self-hosted runner with network access.
+    if: |
+      always() &&
+      (needs.update-manifests.result == 'success' || needs.update-manifests.result == 'skipped') &&
+      (needs.opentofu_homelab.result == 'success' || needs.opentofu_homelab.result == 'skipped' || needs.opentofu_homelab.result == 'none') &&
+      (needs.opentofu_vaultwarden.result == 'success' || needs.opentofu_vaultwarden.result == 'skipped' || needs.opentofu_vaultwarden.result == 'none')
+    steps:
+      - name: Free Disk Space
+        run: |
+          echo "ÃƒÂ°Ã…Â¸Ã‚Â§Ã‚Â¹ Cleaning up runner..."
+          docker system prune -af --volumes 2>/dev/null || true
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: 'latest'
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Preflight cluster health for ArgoCD sync
+        run: |
+          set -euo pipefail
+          if [ "${{ steps.cluster_access.outputs.configured }}" != "true" ]; then
+            echo "No usable kubectl context available for ArgoCD sync."
+            exit 1
+          fi
+          chmod +x scripts/check-cluster-deploy-preflight.sh
+          scripts/check-cluster-deploy-preflight.sh
+          chmod +x scripts/check-critical-externalsecrets.sh
+          CRITICAL_EXTERNAL_SECRETS="${{ vars.SECRETS_PLATFORM_CRITICAL_EXTERNAL_SECRETS }}" \
+            scripts/check-critical-externalsecrets.sh
+
+      - name: Trigger ArgoCD Sync
+        run: |
+          echo "ÃƒÂ°Ã…Â¸Ã…Â¡Ã¢â€šÂ¬ Triggering ArgoCD sync for all OutOfSync applications..."
+          
+          # Get list of applications that are OutOfSync
+          OUT_OF_SYNC_APPS=$(kubectl get applications -n argocd -o jsonpath='{.items[?(@.status.sync.status=="OutOfSync")].metadata.name}')
+          
+          if [ -n "$OUT_OF_SYNC_APPS" ]; then
+            for app in $OUT_OF_SYNC_APPS; do
+              echo "Syncing $app..."
+              kubectl patch application "$app" -n argocd --type merge -p '{"operation": {"sync": {"prune": true}}}'
+            done
+          else
+            echo "ÃƒÂ¢Ã…â€œÃ¢â‚¬Â¦ All applications are already Synced."
+          fi
+          
+          # Also sync root app to be sure
+          echo "Finally, syncing 'root' app..."
+          kubectl patch application root -n argocd --type merge -p '{"operation": {"sync": {"prune": true}}}' || true
+
+      - name: Send Notification
+        if: success()
+        run: |
+          MESSAGE="Changes pushed to main. ArgoCD sync triggered."
+
+          if [ -z "${{ secrets.NTFY_TOKEN }}" ]; then
+            echo "NTFY_TOKEN not set; skipping deployment notification."
+            exit 0
+          fi
+
+          curl -sS -X POST "https://ntfy.archer.casa/gha" \
+            -H "Authorization: Bearer ${{ secrets.NTFY_TOKEN }}" \
+            -H "Title: Deployment Synced" \
+            -H "Priority: default" \
+            -H "Tags: rocket" \
+            -d "${MESSAGE}" >/dev/null
+
+  secrets-platform-smoke:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    needs: argocd-sync
+    concurrency:
+      group: secrets-platform-smoke-${{ github.ref }}
+      cancel-in-progress: false
+    if: |
+      always() &&
+      needs.argocd-sync.result == 'success'
+    env:
+      SECRETS_PLATFORM_CRITICAL_EXTERNAL_SECRETS: ${{ vars.SECRETS_PLATFORM_CRITICAL_EXTERNAL_SECRETS != '' && vars.SECRETS_PLATFORM_CRITICAL_EXTERNAL_SECRETS || 'monitoring/grafana-oidc,monitoring/prometheus-mcp-secret,monitoring/unifi-credentials,monitoring/gcp-cloud-logging-sa' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: latest
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Verify ESO platform core health
+        run: |
+          set -euo pipefail
+          if kubectl auth can-i get deployments.apps -n external-secrets >/dev/null 2>&1; then
+            kubectl rollout status deployment/external-secrets -n external-secrets --timeout=180s
+            if kubectl get deployment external-secrets-webhook -n external-secrets >/dev/null 2>&1; then
+              kubectl rollout status deployment/external-secrets-webhook -n external-secrets --timeout=180s
+            fi
+            kubectl rollout status deployment/vaultwarden-eso-bridge -n external-secrets --timeout=180s
+          else
+            echo "Skipping deployment rollout checks (insufficient RBAC for external-secrets namespace)."
+          fi
+
+          if kubectl auth can-i get clustersecretstores.external-secrets.io >/dev/null 2>&1; then
+            STORE_READY="$(kubectl get clustersecretstore vaultwarden-webhook -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}')"
+            if [ "$STORE_READY" != "True" ]; then
+              echo "ClusterSecretStore vaultwarden-webhook is not Ready"
+              kubectl get clustersecretstore vaultwarden-webhook -o yaml
+              exit 1
+            fi
+          else
+            echo "Skipping ClusterSecretStore readiness check (insufficient RBAC)."
+          fi
+
+      - name: Verify critical ExternalSecrets
+        run: |
+          set -euo pipefail
+          chmod +x scripts/check-critical-externalsecrets.sh
+          CRITICAL_EXTERNAL_SECRETS="$SECRETS_PLATFORM_CRITICAL_EXTERNAL_SECRETS" \
+            scripts/check-critical-externalsecrets.sh
+
+  ui-health-checks:
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && format('["{0}"]', vars.AZURE_VM_RUNNER_LABEL != '' && vars.AZURE_VM_RUNNER_LABEL || 'home-gh-runner')) || '["ubuntu-latest"]') }}
+    needs: [secrets-platform-smoke]
+    concurrency:
+      group: ui-health-checks-${{ github.ref }}
+      cancel-in-progress: false
+    if: |
+      (
+        (vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) ||
+        (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true)
+      ) &&
+      (vars.ENABLE_UI_HEALTH_CHECKS == 'true' || vars.ENABLE_UI_HEALTH_CHECKS == true) &&
+      always() &&
+      (needs.secrets-platform-smoke.result == 'success' || needs.secrets-platform-smoke.result == 'skipped')
+    env:
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      ARGOCD_SKIP_WAIT: "true"
+    steps:
+      - name: Check ArgoCD credentials
+        run: |
+          if [ -z "${ARGOCD_AUTH_TOKEN}" ]; then
+            echo "Skipping tests/health integration checks: ARGOCD_AUTH_TOKEN not configured."
+            echo "SKIP_UI=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout
+        if: env.SKIP_UI != 'true'
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        if: env.SKIP_UI != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies (Runner)
+        if: env.SKIP_UI != 'true'
+        run: |
+          npm ci --prefer-offline --no-audit
+
+      - name: Run tests/health checks
+        if: env.SKIP_UI != 'true'
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          ARGOCD_APP_FILTER_REGEX: ${{ secrets.ARGOCD_APP_FILTER_REGEX }}
+          ARGOCD_INSECURE: ${{ secrets.ARGOCD_INSECURE }}
+          ARGOCD_SKIP_WAIT: "true"
+          ZERO_TRUST_HEADERS_JSON: ${{ secrets.ZERO_TRUST_HEADERS_JSON }}
+          ZERO_TRUST_COOKIES_JSON: ${{ secrets.ZERO_TRUST_COOKIES_JSON }}
+          EXTERNAL_BASE_URL: ${{ secrets.EXTERNAL_BASE_URL }}
+          INTERNAL_BASE_URL: ${{ secrets.INTERNAL_BASE_URL }}
+          EXTERNAL_HOST_SUFFIX: ${{ secrets.EXTERNAL_HOST_SUFFIX }}
+          INTERNAL_HOST_SUFFIX: ${{ secrets.INTERNAL_HOST_SUFFIX }}
+          INTERNAL_HOST_MAP_JSON: ${{ secrets.INTERNAL_HOST_MAP_JSON }}
+          REQUIRED_APP_HINTS: ${{ secrets.REQUIRED_APP_HINTS }}
+          NTFY_TOPIC: gha
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          PLEX_TOKEN: ${{ secrets.PLEX_TOKEN }}
+          PLEX_URL: ${{ secrets.PLEX_URL != '' && secrets.PLEX_URL || 'https://plex.archer.casa' }}
+          CLEANARR_WEBHOOK_CLIENT_ID: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_ID }}
+          CLEANARR_WEBHOOK_CLIENT_SECRET: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_SECRET }}
+          HEALTH_RUNNER_PROFILE: ${{ (secrets.INTERNAL_BASE_URL != '' || secrets.INTERNAL_HOST_MAP_JSON != '' || secrets.INTERNAL_HOST_SUFFIX != '') && 'hybrid' || 'external' }}
+          # The harness now classifies internal and direct routes itself; keep explicit excludes only for out-of-scope proxies.
+          TARGET_HOST_EXCLUDE_REGEX: '(^jarvis-search\.192\.168\.68\.94\.nip\.io$)'
+        run: |
+          set -euo pipefail
+          
+          CLEANARR_ZERO_TRUST_HEADERS_JSON=""
+          if [ -n "${CLEANARR_WEBHOOK_CLIENT_ID:-}" ] && [ -n "${CLEANARR_WEBHOOK_CLIENT_SECRET:-}" ]; then
+            CLEANARR_ZERO_TRUST_HEADERS_JSON=$(CLEANARR_WEBHOOK_CLIENT_ID="$CLEANARR_WEBHOOK_CLIENT_ID" CLEANARR_WEBHOOK_CLIENT_SECRET="$CLEANARR_WEBHOOK_CLIENT_SECRET" python3 -c 'import json, os; print(json.dumps({"CF-Access-Client-Id": os.environ["CLEANARR_WEBHOOK_CLIENT_ID"], "CF-Access-Client-Secret": os.environ["CLEANARR_WEBHOOK_CLIENT_SECRET"]}))')
+            export CLEANARR_ZERO_TRUST_HEADERS_JSON
+          fi
+
+          echo "Running health checks on the active runner..."
+          npm run test:health

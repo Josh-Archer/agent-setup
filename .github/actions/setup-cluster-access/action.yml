@@ -1,0 +1,192 @@
+name: "Setup Cluster Access"
+description: "Configures kubectl and optionally Tailscale for cluster access"
+inputs:
+  tailscale_auth_key:
+    description: "Tailscale Auth Key (if running remotely)"
+    required: false
+  kube_ca_cert:
+    description: "Cluster CA Certificate (base64 or raw)"
+    required: false
+  kube_token:
+    description: "Cluster ServiceAccount Token (base64)"
+    required: false
+  cluster_server:
+    description: "Cluster API Server URL"
+    required: false
+    default: "https://192.168.68.94:6443"
+outputs:
+  configured:
+    description: "Whether kubectl was successfully configured"
+    value: ${{ steps.config.outputs.configured }}
+  access_mode:
+    description: "Selected kubectl access mode: local, remote, or none"
+    value: ${{ steps.check.outputs.access_mode }}
+
+runs:
+  using: "composite"
+  steps:
+    - name: Check environment
+      id: check
+      shell: bash
+      run: |
+        TOKEN_FILE="/var/run/secrets/kubernetes.io/serviceaccount/token"
+        CA_FILE="/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+        LOCAL_API="https://kubernetes.default.svc/readyz"
+
+        has_local="false"
+        has_remote="false"
+        access_mode="none"
+
+        if [ -f "$TOKEN_FILE" ] && [ -f "$CA_FILE" ]; then
+          has_local="true"
+        fi
+
+        if [ -n "${{ inputs.kube_token }}" ] && [ -n "${{ inputs.kube_ca_cert }}" ]; then
+          has_remote="true"
+        fi
+
+        probe_local_api() {
+          local token
+          token="$(cat "$TOKEN_FILE")"
+
+          for attempt in 1 2 3; do
+            if curl --silent --show-error --fail \
+              --connect-timeout 3 \
+              --max-time 8 \
+              --cacert "$CA_FILE" \
+              --header "Authorization: Bearer $token" \
+              "$LOCAL_API" > /dev/null; then
+              return 0
+            fi
+            sleep 2
+          done
+
+          return 1
+        }
+
+        if [ "$has_local" = "true" ]; then
+          if probe_local_api; then
+            access_mode="local"
+            echo "✅ In-cluster Kubernetes API probe passed; using local access"
+          elif [ "$has_remote" = "true" ]; then
+            access_mode="remote"
+            echo "⚠️  In-cluster API probe failed; falling back to remote access"
+          else
+            access_mode="local"
+            echo "⚠️  In-cluster API probe failed and no remote credentials provided; attempting local access"
+          fi
+        elif [ "$has_remote" = "true" ]; then
+          access_mode="remote"
+          echo "ℹ️  No in-cluster token; using remote access"
+        else
+          access_mode="none"
+          echo "⚠️  No in-cluster token or remote credentials provided"
+        fi
+
+        echo "has_local=$has_local" >> $GITHUB_OUTPUT
+        echo "has_remote=$has_remote" >> $GITHUB_OUTPUT
+        echo "access_mode=$access_mode" >> $GITHUB_OUTPUT
+
+    - name: Connect to Tailscale
+      if: steps.check.outputs.access_mode == 'remote' && inputs.tailscale_auth_key != ''
+      shell: bash
+      run: |
+        CACHE_DIR="${HOME:-/tmp}/.cache"
+        rm -f "$CACHE_DIR"/tailscale.tgz "$CACHE_DIR"/tailscale.tgz.sha256
+
+    - name: Reset stale Tailscale processes
+      if: steps.check.outputs.access_mode == 'remote' && inputs.tailscale_auth_key != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+
+        if command -v systemctl >/dev/null 2>&1; then
+          sudo systemctl stop tailscaled >/dev/null 2>&1 || true
+        fi
+
+        sudo pkill -x tailscaled >/dev/null 2>&1 || true
+        sudo rm -f /var/run/tailscale/tailscaled.sock /tmp/tailscaled.sock >/dev/null 2>&1 || true
+        sleep 2
+
+    - name: Start Tailscale
+      if: steps.check.outputs.access_mode == 'remote' && inputs.tailscale_auth_key != ''
+      uses: tailscale/github-action@v4
+      with:
+        authkey: ${{ inputs.tailscale_auth_key }}
+
+    - name: Accept Tailscale subnet routes
+      if: steps.check.outputs.access_mode == 'remote' && inputs.tailscale_auth_key != ''
+      shell: bash
+      run: |
+        set -euo pipefail
+        sudo tailscale set --accept-routes=true --accept-dns=false
+        sudo tailscale status
+
+    - name: Verify Tailscale Connection
+      if: steps.check.outputs.access_mode == 'remote' && inputs.tailscale_auth_key != ''
+      shell: bash
+      run: |
+        echo "🔗 Checking Tailscale status..."
+        sudo tailscale status
+        echo "📡 Testing connectivity to cluster API (IP: 192.168.68.94)..."
+        if ! curl -k -s --connect-timeout 5 https://192.168.68.94:6443 > /dev/null; then
+          echo "❌ Cluster API not reachable via Tailscale"
+          # Don't exit 1 here, let kubectl step fail with better error
+        else
+          echo "✅ Cluster API reachable"
+        fi
+
+    - name: Configure kubectl
+      id: config
+      shell: bash
+      run: |
+        KUBECONFIG_PATH="${HOME}/.kube/config"
+        mkdir -p "$(dirname "${KUBECONFIG_PATH}")"
+        : > "${KUBECONFIG_PATH}"
+        chmod 600 "${KUBECONFIG_PATH}"
+        echo "KUBECONFIG=${KUBECONFIG_PATH}" >> "$GITHUB_ENV"
+        echo "KUBE_CONFIG_PATH=${KUBECONFIG_PATH}" >> "$GITHUB_ENV"
+
+        validate_kubectl_auth() {
+          local attempt
+
+          for attempt in 1 2 3; do
+            if kubectl --kubeconfig "${KUBECONFIG_PATH}" get --raw=/readyz >/dev/null 2>&1; then
+              return 0
+            fi
+            sleep 2
+          done
+
+          return 1
+        }
+
+        if [ "${{ steps.check.outputs.access_mode }}" = "local" ]; then
+          echo "🔧 Configuring in-cluster kubectl..."
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config set-cluster homelab --server=https://kubernetes.default.svc --certificate-authority=/var/run/secrets/kubernetes.io/serviceaccount/ca.crt
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config set-credentials homelab-sync --token="$(cat /var/run/secrets/kubernetes.io/serviceaccount/token)"
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config set-context homelab --cluster=homelab --user=homelab-sync
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config use-context homelab
+          if ! validate_kubectl_auth; then
+            echo "❌ kubectl authentication validation failed for local access." >&2
+            echo "configured=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "configured=true" >> $GITHUB_OUTPUT
+        elif [ "${{ steps.check.outputs.access_mode }}" = "remote" ] && [ -n "${{ inputs.kube_token }}" ] && [ -n "${{ inputs.kube_ca_cert }}" ]; then
+          echo "🔧 Configuring remote kubectl..."
+          printf '%s\n' "${{ inputs.kube_ca_cert }}" > /tmp/homelab-ca.crt
+          TOKEN="$(printf '%s' "${{ inputs.kube_token }}" | base64 -d | tr -d '\r\n')"
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config set-cluster homelab --server="${{ inputs.cluster_server }}" --certificate-authority=/tmp/homelab-ca.crt
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config set-credentials homelab-sync --token="$TOKEN"
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config set-context homelab --cluster=homelab --user=homelab-sync
+          kubectl --kubeconfig "${KUBECONFIG_PATH}" config use-context homelab
+          if ! validate_kubectl_auth; then
+            echo "❌ kubectl authentication validation failed for remote access." >&2
+            echo "configured=false" >> $GITHUB_OUTPUT
+            exit 1
+          fi
+          echo "configured=true" >> $GITHUB_OUTPUT
+        else
+          echo "⚠️  No in-cluster token or remote credentials provided. kubectl not configured."
+          echo "configured=false" >> $GITHUB_OUTPUT
+        fi

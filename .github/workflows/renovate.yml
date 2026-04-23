@@ -1,0 +1,93 @@
+name: Renovate
+on:
+  schedule:
+    # Run every 4 hours
+    - cron: '0 */4 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  renovate:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    steps:
+      - name: Free Disk Space (Self-Hosted)
+        run: |
+          echo "🧹 Cleaning up runner..."
+          docker system prune -af --volumes 2>/dev/null || true
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Generate Token
+        uses: actions/create-github-app-token@v3
+        id: app-token
+        with:
+          app-id: ${{ secrets.RENOVATE_APP_ID }}
+          private-key: ${{ secrets.RENOVATE_APP_PRIVATE_KEY }}
+
+      - name: Renovate
+        id: renovate
+        uses: renovatebot/github-action@v46.1.10
+        with:
+          configurationFile: renovate.json
+          token: ${{ steps.app-token.outputs.token }}
+        env:
+          RENOVATE_REPOSITORIES: ${{ github.repository }}
+          RENOVATE_ONBOARDING: "false"
+          RENOVATE_PR_HOURLY_LIMIT: "0"
+          RENOVATE_PR_CONCURRENT_LIMIT: "0"
+          RENOVATE_RECREATE_CLOSED: "true"
+          LOG_LEVEL: debug
+          RENOVATE_PLATFORM: github
+
+      - name: Renovate summary
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+        run: |
+          echo "## Renovate summary" >> "$GITHUB_STEP_SUMMARY"
+          
+          # Run gh CLI via Docker for ephemeral access on self-hosted runners
+          docker run --rm -e GH_TOKEN -v "${{ github.workspace }}:/work" -w /work ghcr.io/cli/cli:latest \
+            pr list --author "app/renovate-josh-archer" --search "created:>=$GITHUB_RUN_STARTED_AT" --json number,title,url --jq '.[] | "#\(.number) \(.title) - \(.url)"' > prs.txt || true
+          
+          if [ ! -s prs.txt ]; then
+            echo "No Renovate PRs created in this run." >> "$GITHUB_STEP_SUMMARY"
+          else
+            cat prs.txt >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Ntfy notify
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+        run: |
+          if [ -z "$NTFY_TOKEN" ]; then
+            echo "NTFY_TOKEN secret not set; skipping notification."
+            exit 0
+          fi
+          
+          if [ ! -s prs.txt ]; then
+            msg="Renovate ran on $GITHUB_REPOSITORY — no PRs created."
+          else
+            prs=$(cat prs.txt)
+            msg="Renovate created PRs on $GITHUB_REPOSITORY:\n$prs"
+          fi
+          
+          curl -sS -X POST "https://ntfy.archer.casa/gha" \
+            -H "Authorization: Bearer $NTFY_TOKEN" \
+            -H "Title: Renovate run" \
+            -H "Priority: default" \
+            -H "Tags: package" \
+            -d "$msg" >/dev/null
+          
+          rm -f prs.txt

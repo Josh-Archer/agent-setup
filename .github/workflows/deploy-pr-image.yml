@@ -1,0 +1,82 @@
+name: Deploy PR to Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR Number to deploy (e.g. 52)'
+        required: true
+        type: string
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  deploy-pr:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+
+      - name: Deploy PR images
+        env:
+          PR_NUMBER: ${{ inputs.pr_number }}
+        run: |
+          echo "🧪 Deploying PR-${PR_NUMBER} images to production cluster..."
+          
+          if ! command -v kubectl &> /dev/null; then
+            echo "❌ kubectl not found!"
+            exit 1
+          fi
+
+          PR_TAG="pr-${PR_NUMBER}"
+          
+          # Define image-to-deployment mappings
+          declare -A DEPLOYMENTS=(
+            ["ghcr.io/josh-archer/gamdl-automator"]="media/gamdl"
+            ["ghcr.io/josh-archer/consolidated-alerts"]="monitoring/consolidated-alerts"
+            ["ghcr.io/josh-archer/postgres-backup"]="infra/postgres-backup"
+            ["ghcr.io/josh-archer/pgvecto-rs"]="infra/consolidated-postgres"
+          )
+          
+          for image in "${!DEPLOYMENTS[@]}"; do
+            deployment="${DEPLOYMENTS[$image]}"
+            ns="${deployment%%/*}"
+            name="${deployment##*/}"
+            
+            echo "📦 Patching ${ns}/${name} with ${image}:${PR_TAG}"
+            kubectl set image deployment/${name} -n ${ns} ${name}=${image}:${PR_TAG} --record || echo "⚠️ Skipped ${name}"
+          done
+
+      - name: Verify Rollout
+        run: |
+          echo "⏳ Monitor rollouts with: kubectl get pods -A | grep 'pr-${{ inputs.pr_number }}'"
+          kubectl rollout status deployment/gamdl -n media --timeout=60s || true
+
+      - name: Update GitHub job summary
+        if: always()
+        env:
+          JOB_TITLE: ${{ job.name || github.job }}
+          JOB_STATUS: ${{ job.status }}
+          EVENT_NAME: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          SHA: ${{ github.sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+        run: scripts/write_job_summary.sh
+
+      - name: Notify ntfy
+        if: always()
+        env:
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          NTFY_TOPIC: gha
+          NTFY_TITLE: "Deploy PR to Production"
+          NTFY_PRIORITY: ${{ job.status == 'success' && 'default' || 'high' }}
+          NTFY_TAGS: ${{ job.status == 'success' && 'rocket,check' || 'warning,rocket' }}
+          NTFY_MESSAGE: |
+            deploy-pr-image: ${{ job.status }}
+            pr_number: ${{ inputs.pr_number }}
+            repo: ${{ github.repository }}
+            run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/notify_ntfy.sh

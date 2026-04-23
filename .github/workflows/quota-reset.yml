@@ -1,0 +1,91 @@
+name: Monthly Quota Reset
+
+on:
+#  schedule:
+#    # Run at 00:00 on the 1st day of every month
+#    - cron: '0 0 1 * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  reset-runner-preference:
+    runs-on: home-gh-runner
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN || github.token }}
+
+      - name: Verify GitHub Runner Availability
+        run: echo "Control runner is available and monthly quota reset can proceed."
+
+      - name: Reset Preference to Monthly Default Mode
+        id: reset
+        env:
+          AZURE_AUTO_DISABLED: ${{ vars.AZURE_PIPELINES_AUTO_DISABLED_AT_LIMIT }}
+          AZURE_PIPELINES_READY: ${{ vars.AZURE_PIPELINES_READY }}
+          AZURE_PIPELINE_ID: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+        run: |
+          set -euo pipefail
+
+          is_true() {
+            case "${1:-}" in
+              true|True|TRUE|1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          month_key="$(date -u +%Y-%m)"
+          target_mode="github-hosted"
+          use_azure="false"
+          reset_reason="default-github-hosted"
+
+          if is_true "${AZURE_AUTO_DISABLED:-false}" && is_true "${AZURE_PIPELINES_READY:-false}" && [ -n "${AZURE_PIPELINE_ID:-}" ]; then
+            target_mode="azure-pipelines"
+            use_azure="true"
+            reset_reason="azure-reenabled"
+          elif is_true "${AZURE_AUTO_DISABLED:-false}"; then
+            reset_reason="azure-not-ready"
+          fi
+
+          echo "Resetting CI provider mode for a new month (${target_mode})..."
+          gh variable set RUNNER_PROVIDER_MODE --body "${target_mode}"
+          gh variable set USE_SELF_HOSTED --body "false"
+          gh variable set USE_AWS_CODEBUILD_RUNNERS --body "false"
+          gh variable set USE_AZURE_PIPELINES --body "${use_azure}"
+
+          gh variable set AZURE_PIPELINES_LAST_ALERT_LEVEL --body "0"
+          gh variable set AZURE_PIPELINES_LAST_ALERT_MONTH --body "${month_key}"
+          gh variable set AZURE_PIPELINES_USAGE_PERCENT --body "0"
+          gh variable set AZURE_PIPELINES_AUTO_DISABLED_AT_LIMIT --body "false"
+
+          echo "reset_mode=${target_mode}" >> "$GITHUB_OUTPUT"
+          echo "reset_reason=${reset_reason}" >> "$GITHUB_OUTPUT"
+
+      - name: Notify User
+        env:
+          RESET_MODE: ${{ steps.reset.outputs.reset_mode }}
+          RESET_REASON: ${{ steps.reset.outputs.reset_reason }}
+        run: |
+          if [ -z "${{ secrets.NTFY_TOKEN }}" ]; then
+            echo "NTFY_TOKEN not set; skipping notification."
+            exit 0
+          fi
+
+          message="New month detected. Switched back to github-hosted runners."
+          if [ "${RESET_REASON:-default-github-hosted}" = "azure-reenabled" ]; then
+            message="New month detected. Re-enabled Azure Pipelines mode and reset quota thresholds."
+          elif [ "${RESET_REASON:-default-github-hosted}" = "azure-not-ready" ]; then
+            message="New month detected. Reset Azure quota tracking but kept github-hosted mode because AZURE_PIPELINES_READY is not enabled."
+          fi
+
+          curl -sS -X POST "https://ntfy.archer.casa/gha" \
+            -H "Authorization: Bearer ${{ secrets.NTFY_TOKEN }}" \
+            -H "Title: Actions Quota Reset" \
+            -H "Priority: default" \
+            -H "Tags: arrows_counterclockwise" \
+            -d "${message}" >/dev/null

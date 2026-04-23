@@ -1,0 +1,90 @@
+name: UECB Manual Backend Smoke
+
+on:
+  push:
+    branches:
+      - codex/enable-uecb-cloud-backends
+    paths:
+      - .github/workflows/uecb-manual-smoke.yml
+
+jobs:
+  cloud_run:
+    name: UECB Manual Smoke (cloud-run)
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - uecb-manual-cloud-20260422
+    timeout-minutes: 10
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "CLOUD_RUN_JOB=${CLOUD_RUN_JOB:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "cloud-run" ]; then
+            echo "Expected UECB_PROVIDER=cloud-run, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${CLOUD_RUN_JOB:-}" ]; then
+            echo "Expected CLOUD_RUN_JOB on cloud-run-backed runner." >&2
+            exit 1
+          fi
+
+  codebuild:
+    name: UECB Manual Smoke (codebuild)
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - uecb-manual-codebuild-20260422
+    timeout-minutes: 10
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "CODEBUILD_BUILD_ID=${CODEBUILD_BUILD_ID:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "codebuild" ]; then
+            echo "Expected UECB_PROVIDER=codebuild, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${CODEBUILD_BUILD_ID:-}" ]; then
+            echo "Expected CODEBUILD_BUILD_ID on codebuild-backed runner." >&2
+            exit 1
+          fi
+
+  lambda:
+    name: UECB Manual Smoke (lambda)
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - uecb-manual-lambda-20260422
+    timeout-minutes: 10
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "AWS_LAMBDA_FUNCTION_NAME=${AWS_LAMBDA_FUNCTION_NAME:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "lambda" ]; then
+            echo "Expected UECB_PROVIDER=lambda, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${AWS_LAMBDA_FUNCTION_NAME:-}" ]; then
+            echo "Expected AWS_LAMBDA_FUNCTION_NAME on lambda-backed runner." >&2
+            exit 1
+          fi

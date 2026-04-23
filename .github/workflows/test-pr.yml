@@ -1,0 +1,1843 @@
+name: Test Pull Request
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:  # Manual trigger
+    inputs:
+      app_filter:
+        description: 'ArgoCD app filter regex (optional)'
+        required: false
+        default: '.*'
+      use_aws_codebuild:
+        description: 'Route image-build jobs to AWS CodeBuild'
+        type: boolean
+        required: false
+        default: false
+      codebuild_project:
+        description: 'Optional CodeBuild runner project override'
+        required: false
+        default: ''
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+  TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT }}
+  TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+  TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT }}
+  AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+  AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+
+
+permissions:
+  contents: read
+  pull-requests: read
+  packages: write
+  statuses: write
+
+jobs:
+  select-runner:
+    uses: ./.github/workflows/runner-selector.yml
+
+  resolve_build_runner:
+    needs: select-runner
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    outputs:
+      build_runner_base: ${{ steps.resolve.outputs.build_runner_base }}
+      build_runner_is_codebuild: ${{ steps.resolve.outputs.build_runner_is_codebuild }}
+      build_runner_description: ${{ steps.resolve.outputs.build_runner_description }}
+    steps:
+      - name: Resolve image-build runner
+        id: resolve
+        shell: bash
+        env:
+          RUNNER_PROVIDER_MODE: ${{ vars.RUNNER_PROVIDER_MODE }}
+          USE_SELF_HOSTED: ${{ vars.USE_SELF_HOSTED }}
+          USE_AWS_CODEBUILD_RUNNERS: ${{ vars.USE_AWS_CODEBUILD_RUNNERS }}
+          AWS_CODEBUILD_RUNNER_PROJECT: ${{ vars.AWS_CODEBUILD_RUNNER_PROJECT }}
+          USE_AZURE_PIPELINES: ${{ vars.USE_AZURE_PIPELINES }}
+          MANUAL_USE_AWS_CODEBUILD: ${{ github.event_name == 'workflow_dispatch' && inputs.use_aws_codebuild == true }}
+          MANUAL_CODEBUILD_PROJECT: ${{ github.event_name == 'workflow_dispatch' && inputs.codebuild_project || '' }}
+          GITHUB_RUN_ID_VALUE: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+          GITHUB_EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+
+          is_true() {
+            case "${1:-}" in
+              true|True|TRUE|1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          provider_mode="${RUNNER_PROVIDER_MODE:-}"
+
+          if [ "${GITHUB_EVENT_NAME:-}" = "pull_request" ]; then
+            provider_mode="github-hosted"
+          fi
+
+          codebuild_enabled="false"
+          codebuild_project="${AWS_CODEBUILD_RUNNER_PROJECT:-}"
+
+          if [ "${MANUAL_USE_AWS_CODEBUILD:-false}" = "true" ]; then
+            provider_mode="codebuild"
+            codebuild_enabled="true"
+            if [ -n "${MANUAL_CODEBUILD_PROJECT:-}" ]; then
+              codebuild_project="${MANUAL_CODEBUILD_PROJECT}"
+            fi
+          fi
+
+          # Fallback logic if primary mode is not active or missing
+          if [ "${provider_mode}" = "azure-pipelines" ] && ! is_true "${USE_AZURE_PIPELINES:-false}"; then
+            echo "?????? Azure Pipelines is requested but USE_AZURE_PIPELINES is false. Falling back."
+            provider_mode=""
+          fi
+
+          if [ "${provider_mode}" = "codebuild" ] && ! is_true "${USE_AWS_CODEBUILD_RUNNERS:-false}"; then
+            echo "?????? CodeBuild is requested but USE_AWS_CODEBUILD_RUNNERS is false. Falling back."
+            provider_mode=""
+          fi
+
+          if [ -z "${provider_mode}" ]; then
+            if is_true "${USE_AWS_CODEBUILD_RUNNERS:-false}" && [ -n "${AWS_CODEBUILD_RUNNER_PROJECT:-}" ]; then
+              provider_mode="codebuild"
+            elif is_true "${USE_SELF_HOSTED:-false}"; then
+              provider_mode="self-hosted"
+            elif is_true "${USE_AZURE_PIPELINES:-false}"; then
+              provider_mode="azure-pipelines"
+            else
+              provider_mode="github-hosted"
+            fi
+          fi
+
+          if [ "${provider_mode}" = "codebuild" ] && [ "${codebuild_enabled}" != "true" ]; then
+            codebuild_enabled="true"
+          fi
+
+          if [ "${provider_mode}" = "codebuild" ] && [ "${codebuild_enabled}" = "true" ] && [ -n "${codebuild_project}" ]; then
+            runner_base="codebuild-${codebuild_project}-${GITHUB_RUN_ID_VALUE}-${GITHUB_RUN_ATTEMPT_VALUE}"
+            runner_description="aws-codebuild:${codebuild_project}"
+            runner_is_codebuild="true"
+          elif [ "${provider_mode}" = "self-hosted" ]; then
+            runner_base="home-gh-runner"
+            runner_description="self-hosted:home-gh-runner"
+            runner_is_codebuild="false"
+          elif [ "${provider_mode}" = "azure-pipelines" ]; then
+            runner_base="ubuntu-latest"
+            runner_description="azure-pipelines:controller"
+            runner_is_codebuild="false"
+          else
+            runner_base="ubuntu-latest"
+            runner_description="github-hosted:ubuntu-latest"
+            runner_is_codebuild="false"
+          fi
+
+          echo "build_runner_base=${runner_base}" >> "$GITHUB_OUTPUT"
+          echo "build_runner_is_codebuild=${runner_is_codebuild}" >> "$GITHUB_OUTPUT"
+          echo "build_runner_description=${runner_description}" >> "$GITHUB_OUTPUT"
+
+  resolve_remote_build_provider:
+    uses: ./.github/workflows/remote-build-selector.yml
+    secrets: inherit
+
+  codebuild-smoke:
+    name: CodeBuild runner smoke test
+    needs: [resolve_build_runner, resolve_remote_build_provider]
+    if: needs.resolve_remote_build_provider.outputs['selected-provider'] == '' && needs.resolve_build_runner.outputs.build_runner_is_codebuild == 'true'
+    runs-on: ${{ fromJSON(format('["{0}","job-{1}"]', needs.resolve_build_runner.outputs.build_runner_base, github.job)) }}
+    steps:
+      - name: Show resolved runner
+        run: |
+          echo "Resolved build runner: ${{ needs.resolve_build_runner.outputs.build_runner_description }}"
+          echo "Runner name: ${RUNNER_NAME:-unknown}"
+          echo "Runner OS: ${RUNNER_OS:-unknown}"
+          echo "Runner arch: ${RUNNER_ARCH:-unknown}"
+
+      - name: Verify Docker availability
+        run: |
+          set -euo pipefail
+          docker version
+
+  # Layer 0: Detect changes
+  changes:
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    outputs:
+      consolidated_alerts: ${{ steps.detect_changes.outputs.consolidated_alerts }}
+      gamdl_automator: ${{ steps.detect_changes.outputs.gamdl_automator }}
+      postgres_backup: ${{ steps.detect_changes.outputs.postgres_backup }}
+      secrets_platform: ${{ steps.detect_changes.outputs.secrets_platform }}
+      zero_trust_routes: ${{ steps.detect_changes.outputs.zero_trust_routes }}
+      cleanarr_aws_infra: ${{ steps.detect_changes.outputs.cleanarr_aws_infra }}
+      contract_validation_required: ${{ steps.detect_changes.outputs.contract_validation_required }}
+      ai_changed: ${{ steps.detect_changes.outputs.ai_changed }}
+      infra_changed: ${{ steps.detect_changes.outputs.infra_changed }}
+      vaultwarden_changed: ${{ steps.detect_changes.outputs.vaultwarden_changed }}
+      runtime_k8s_changed: ${{ steps.detect_changes.outputs.runtime_k8s_changed }}
+      non_runtime_only: ${{ steps.detect_changes.outputs.non_runtime_only }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0  # Fetch full history for git-based file detection
+      - name: Detect changed files
+        id: detect_changes
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            changed_files="$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}")"
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            changed_files="$(git diff --name-only HEAD~1 HEAD)"
+          else
+            changed_files="$(git ls-files)"
+          fi
+
+          secrets_platform_regex='^(grok-servaar/infra/secrets-platform/|grok-servaar/infra/.*secret.*\.ya?ml$|grok-servaar/infra/kustomization\.yaml$|grok-servaar/mailu/.*secret.*\.ya?ml$|grok-servaar/mailu/.*externalsecret.*\.ya?ml$|grok-servaar/mailu/kustomization\.yaml$|grok-servaar/media/.*secret.*\.ya?ml$|grok-servaar/media/.*externalsecret.*\.ya?ml$|grok-servaar/media/.*/externalsecret.*\.ya?ml$|grok-servaar/media/kustomization\.yaml$|grok-servaar/auth/.*secret.*\.ya?ml$|grok-servaar/auth/.*externalsecret.*\.ya?ml$|grok-servaar/auth/kustomization\.yaml$|grok-servaar/home/.*secret.*\.ya?ml$|grok-servaar/home/.*externalsecret.*\.ya?ml$|grok-servaar/home/.*/externalsecret.*\.ya?ml$|grok-servaar/home/.*/kustomization\.yaml$|grok-servaar/argocd/.*secret.*\.ya?ml$|grok-servaar/argocd/.*externalsecret.*\.ya?ml$|grok-servaar/argocd/kustomization\.yaml$|grok-servaar/monitoring/.*secret.*\.ya?ml$|grok-servaar/monitoring/.*externalsecret.*\.ya?ml$|grok-servaar/monitoring/.*/externalsecret.*\.ya?ml$|grok-servaar/monitoring/.*/kustomization\.yaml$|grok-servaar/dns/.*secret.*\.ya?ml$|grok-servaar/dns/.*externalsecret.*\.ya?ml$|grok-servaar/dns/kustomization\.yaml$|grok-servaar/ops/arc/.*secret.*\.ya?ml$|grok-servaar/ops/arc/.*externalsecret.*\.ya?ml$|grok-servaar/ops/arc/kustomization\.yaml$|grok-servaar/nextcloud/.*secret.*\.ya?ml$|grok-servaar/nextcloud/.*externalsecret.*\.ya?ml$|grok-servaar/nextcloud/kustomization\.yaml$|scripts/test-eso-.*\.sh$|scripts/validate-secret-policy\.sh$|scripts/ci/run_contract_test_suite\.sh$|docs/secrets-.*\.md$|\.github/workflows/reusable-secrets-platform-tests\.yml$)'
+
+          has_match() {
+            local pattern="$1"
+            if printf '%s\n' "${changed_files}" | grep -Eq "${pattern}"; then
+              echo "true"
+            else
+              echo "false"
+            fi
+          }
+
+          non_runtime_only=true
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
+            case "$file" in
+              .github/*|docs/*|*.md) ;;
+              *)
+                non_runtime_only=false
+                break
+                ;;
+            esac
+          done <<< "$changed_files"
+
+          echo "consolidated_alerts=$(has_match '^grok-servaar/monitoring/consolidated-alerts/')" >> "$GITHUB_OUTPUT"
+          echo "gamdl_automator=$(has_match '^grok-servaar/images/gamdl-automator/')" >> "$GITHUB_OUTPUT"
+          echo "postgres_backup=$(has_match '^grok-servaar/images/postgres-backup/')" >> "$GITHUB_OUTPUT"
+          echo "secrets_platform=$(has_match "${secrets_platform_regex}")" >> "$GITHUB_OUTPUT"
+          echo "zero_trust_routes=$(has_match '^terraform/cloudflare-access/|^scripts/test-zero-trust-routes-contract\.sh$|^docs/zero-trust-route-contracts\.md$')" >> "$GITHUB_OUTPUT"
+          echo "cleanarr_aws_infra=$(has_match '^infrastructure/terraform/aws-cleanarr/|^grok-servaar/media/cleanarr/|^\.github/workflows/deploy-aws-cleanarr\.yml$|^\.github/workflows/sync-cleanarr-ecr\.yml$|^\.github/workflows/reusable-tests\.yml$|^\.github/workflows/test-pr\.yml$|^scripts/test-cleanarr-release-contract\.sh$|^scripts/test-cleanarr-sqs-contract\.sh$|^docs/cleanarr-migration\.md$|^docs/cleanarr-split\.md$|^docs/warp\.md$|^README\.md$')" >> "$GITHUB_OUTPUT"
+          echo "contract_validation_required=$(has_match '^grok-servaar/|^terraform/|^scripts/(test-.*contract\.sh|test-gcp-scheduler-plan\.sh|validate-secret-policy\.sh|ci/run_contract_test_suite\.sh|ci/run_unit_tests\.sh)$|^\.github/workflows/|^docs/(cleanarr-.*\.md|secrets-.*\.md|zero-trust-route-contracts\.md)$|^README\.md$')" >> "$GITHUB_OUTPUT"
+          echo "ai_changed=$(has_match '^grok-servaar/ai/')" >> "$GITHUB_OUTPUT"
+          echo "infra_changed=$(has_match '^terraform/cloudflare-access/')" >> "$GITHUB_OUTPUT"
+          echo "vaultwarden_changed=$(has_match '^terraform/vaultwarden/')" >> "$GITHUB_OUTPUT"
+          echo "runtime_k8s_changed=$(has_match '^grok-servaar/|^scripts/apply-manifests\.sh$|^scripts/filter_manifests\.py$|^scripts/deploy-to-test-namespace\.sh$|^scripts/wait-for-test-pods\.sh$|^scripts/test-deployment\.sh$|^scripts/cleanup-test-namespaces\.sh$')" >> "$GITHUB_OUTPUT"
+          echo "non_runtime_only=${non_runtime_only}" >> "$GITHUB_OUTPUT"
+
+  # New controller job to dispatch Azure Pipelines (async)
+  azure-status-controller:
+    name: Azure Status Controller
+    needs: [select-runner, changes, prepare-build-image-matrix, build-images, tests, secrets-platform-tests, static-validation]
+    if: always()
+    runs-on: ${{ fromJSON(needs.select-runner.outputs.dispatch-label) }}
+    env:
+      PROVIDER_MODE: ${{ needs.select-runner.outputs.provider-mode }}
+      RUN_TOFU_PLAN: ${{ needs.changes.outputs.infra_changed }}
+      RUN_CLUSTER_DRY_RUN: ${{ needs.changes.outputs.runtime_k8s_changed }}
+      TESTS_RESULT: ${{ needs.tests.result }}
+      STATIC_VALIDATION_RESULT: ${{ needs.static-validation.result }}
+      SECRETS_PLATFORM_REQUIRED: ${{ needs.changes.outputs.secrets_platform }}
+      SECRETS_PLATFORM_RESULT: ${{ needs.secrets-platform-tests.result }}
+      BUILD_IMAGES_REQUIRED: ${{ needs.prepare-build-image-matrix.outputs.has_images }}
+      BUILD_IMAGES_RESULT: ${{ needs.build-images.result }}
+      AZURE_DEVOPS_ORG_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+      AZURE_DEVOPS_PROJECT: ${{ vars.AZURE_DEVOPS_PROJECT }}
+      AZURE_DEVOPS_PIPELINE_ID: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+      AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+      TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+      TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT }}
+      TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+      TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT }}
+      AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+      AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      USE_AZURE_VM: ${{ vars.USE_AZURE_VM }}
+      GH_TOKEN: ${{ secrets.GITOPS_PAT || github.token }}
+      GITHUB_STATUS_TOKEN: ${{ secrets.GITOPS_PAT || github.token }}
+      GITHUB_STATUS_REPO: ${{ github.repository }}
+      GITHUB_STATUS_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      GITHUB_STATUS_CONTEXT: ci/azure-pipelines
+      GITHUB_STATUS_TARGET_URL: ${{ format('{0}/{1}/actions/runs/{2}', github.server_url, github.repository, github.run_id) }}
+      GITHUB_STATUS_DESCRIPTION_MAX_LEN: '140'
+      AZURE_GITHUB_REPOSITORY: ${{ github.repository }}
+      AZURE_GITHUB_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      AZURE_GITHUB_REF: ${{ github.event.pull_request.head.ref && format('refs/heads/{0}', github.event.pull_request.head.ref) || github.ref }}
+      AZURE_GITHUB_PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+      AZURE_GITHUB_RUN_ID: ${{ github.run_id }}
+      AZURE_GITHUB_RUN_ATTEMPT: ${{ github.run_attempt }}
+      AZURE_CHANGED_CONSOLIDATED_ALERTS: ${{ needs.changes.outputs.consolidated_alerts }}
+      AZURE_CHANGED_GAMDL_AUTOMATOR: ${{ needs.changes.outputs.gamdl_automator }}
+      AZURE_CHANGED_POSTGRES_BACKUP: ${{ needs.changes.outputs.postgres_backup }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Evaluate Azure lane
+        id: evaluate
+        shell: bash
+        run: |
+          chmod +x scripts/ci/evaluate_azure_lane.sh
+          failures=()
+
+          if [ "${TESTS_RESULT}" != "success" ] && [ "${TESTS_RESULT}" != "skipped" ]; then
+            failures+=("tests")
+          fi
+
+          if [ "${STATIC_VALIDATION_RESULT}" != "success" ] && [ "${STATIC_VALIDATION_RESULT}" != "skipped" ]; then
+            failures+=("static-validation")
+          fi
+
+          if [ "${SECRETS_PLATFORM_REQUIRED}" = "true" ] && [ "${SECRETS_PLATFORM_RESULT}" != "success" ] && [ "${SECRETS_PLATFORM_RESULT}" != "skipped" ]; then
+            failures+=("secrets-platform-tests")
+          fi
+
+          if [ "${BUILD_IMAGES_REQUIRED}" = "true" ] && [ "${BUILD_IMAGES_RESULT}" != "success" ] && [ "${BUILD_IMAGES_RESULT}" != "skipped" ]; then
+            failures+=("build-images")
+          fi
+
+          local_prereq_result="success"
+          local_prereq_failures=""
+          if [ "${#failures[@]}" -gt 0 ]; then
+            local_prereq_result="failure"
+            local_prereq_failures="$(IFS=,; echo "${failures[*]}")"
+          fi
+
+          eval "$(
+            LOCAL_PREREQ_RESULT="${local_prereq_result}" \
+            LOCAL_PREREQ_FAILURES="${local_prereq_failures}" \
+            scripts/ci/evaluate_azure_lane.sh
+          )"
+
+          echo "should_dispatch=${dispatch_allowed}" >> "$GITHUB_OUTPUT"
+          echo "status_state=${status_state}" >> "$GITHUB_OUTPUT"
+          echo "status_description=${status_description}" >> "$GITHUB_OUTPUT"
+          if [ "${status_state}" = "failure" ]; then
+            echo "fail_after_status=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "fail_after_status=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish resolved Azure status
+        if: steps.evaluate.outputs.should_dispatch != 'true'
+        shell: bash
+        run: |
+          chmod +x scripts/ci/post_github_status.sh
+          scripts/ci/post_github_status.sh \
+            "${{ steps.evaluate.outputs.status_state }}" \
+            "${{ steps.evaluate.outputs.status_description }}" \
+            "${GITHUB_STATUS_TARGET_URL:-}" \
+            "${GITHUB_STATUS_CONTEXT}"
+
+      - name: Trigger Azure Pipeline (Async)
+        if: steps.evaluate.outputs.should_dispatch == 'true'
+        shell: bash
+        env:
+          GITHUB_REPOSITORY: ${{ env.AZURE_GITHUB_REPOSITORY }}
+          GITHUB_SHA: ${{ env.AZURE_GITHUB_SHA }}
+          GITHUB_REF: ${{ env.AZURE_GITHUB_REF }}
+          GITHUB_PR_NUMBER: ${{ env.AZURE_GITHUB_PR_NUMBER }}
+          GITHUB_RUN_ID: ${{ env.AZURE_GITHUB_RUN_ID }}
+          GITHUB_RUN_ATTEMPT: ${{ env.AZURE_GITHUB_RUN_ATTEMPT }}
+          RUN_TOFU_PLAN: ${{ env.RUN_TOFU_PLAN }}
+          RUN_CLUSTER_DRY_RUN: ${{ env.RUN_CLUSTER_DRY_RUN }}
+          CHANGED_CONSOLIDATED_ALERTS: ${{ env.AZURE_CHANGED_CONSOLIDATED_ALERTS }}
+          CHANGED_GAMDL_AUTOMATOR: ${{ env.AZURE_CHANGED_GAMDL_AUTOMATOR }}
+          CHANGED_POSTGRES_BACKUP: ${{ env.AZURE_CHANGED_POSTGRES_BACKUP }}
+          USE_AZURE_VM: ${{ env.USE_AZURE_VM }}
+          STATUS_CONTEXT: ci/azure-pipelines
+        run: |
+          chmod +x scripts/trigger_azure_pipeline.sh
+          ./scripts/trigger_azure_pipeline.sh
+
+      - name: Fail controller after publishing status
+        if: steps.evaluate.outputs.fail_after_status == 'true'
+        shell: bash
+        run: |
+          echo "${{ steps.evaluate.outputs.status_description }}"
+          exit 1
+
+  # Job: Opentofu Plan -input=false (Cloudflare Access + Azure DevOps CI)
+  tofu-plan:
+    name: Opentofu Plan -input=false
+    # Use prioritize-self-hosted dispatch runner for control-plane tasks
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    needs: [select-runner, changes]
+    if: needs.select-runner.outputs.provider-mode != 'azure-pipelines' && needs.changes.outputs.infra_changed == 'true'
+    defaults:
+      run:
+        working-directory: terraform/cloudflare-access
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      GITHUB_TOKEN: ${{ secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+      AZURE_DEVOPS_EXT_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+      AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+      AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+      TF_VAR_account_id: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      TF_VAR_tunnel_id: ${{ secrets.TF_VAR_TUNNEL_ID }}
+      TF_VAR_keycloak_client_secret: ${{ secrets.TF_VAR_KEYCLOAK_CLIENT_SECRET }}
+      TF_VAR_zone_id_archer_casa: ${{ secrets.TF_VAR_ZONE_ID_ARCHER_CASA }}
+      TF_VAR_zone_id_archerfamily_io: ${{ secrets.TF_VAR_ZONE_ID_ARCHERFAMILY_IO }}
+      AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+      AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+      TF_VAR_enable_codebuild_runner_project: ${{ vars.ENABLE_CODEBUILD_RUNNER_PROJECT != '' && vars.ENABLE_CODEBUILD_RUNNER_PROJECT || 'false' }}
+      TF_VAR_codebuild_runner_project_name: ${{ vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && vars.AWS_CODEBUILD_RUNNER_PROJECT || 'home-pr-runner' }}
+      TF_VAR_codebuild_runner_github_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_runner_provider_mode: ${{ vars.RUNNER_PROVIDER_MODE != '' && vars.RUNNER_PROVIDER_MODE || 'github-hosted' }}
+      TF_VAR_azure_pipelines_mode_enabled: ${{ vars.USE_AZURE_PIPELINES != '' && vars.USE_AZURE_PIPELINES || 'false' }}
+      TF_VAR_github_token: ${{ secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+      TF_VAR_enable_github_actions_secrets_sync: 'false'
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ secrets.GCP_REGION }}
+      TF_VAR_zone: ${{ secrets.GCP_ZONE }}
+      TF_VAR_gcp_node_enabled: 'false'
+      TF_VAR_k3s_token: ${{ secrets.K3S_TOKEN }}
+      TF_VAR_k3s_url: ${{ secrets.K3S_URL }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TF_VAR_grafana_url: "https://metrics.archer.casa"
+      TF_VAR_grafana_auth: ${{ secrets.GRAFANA_ADMIN_PASSWORD != '' && format('admin:{0}', secrets.GRAFANA_ADMIN_PASSWORD) || '' }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Create variables file
+        run: |
+          echo 'allowed_emails = ["josh@archerfamily.io"]' >> secrets.auto.tfvars
+          echo 'allowed_email_domains = ["archerfamily.io"]' >> secrets.auto.tfvars
+          echo 'allowed_family_emails = []' >> secrets.auto.tfvars
+          echo 'enable_apex_redirect = true' >> secrets.auto.tfvars
+          echo 'keycloak_realm = "homelab"' >> secrets.auto.tfvars
+          echo 'enable_unifi_access = true' >> secrets.auto.tfvars
+          echo 'unifi_domain = "unifi.archer.casa"' >> secrets.auto.tfvars
+          echo 'unifi_origin = "https://home.local:8443"' >> secrets.auto.tfvars
+          echo 'ntfy_topic = "gha"' >> secrets.auto.tfvars
+          echo 'ntfy_token = "${{ secrets.NTFY_TOKEN }}"' >> secrets.auto.tfvars
+          echo 'automation_ui_health = { tailscale_auth_key = "${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}" }' >> secrets.auto.tfvars
+
+      - name: OpenTofu Init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+          TOFU_BACKEND_STATE_KEY: cloudflare-access/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Opentofu Plan -input=false
+        run: |
+          set +e
+          tofu plan -input=false -no-color -lock-timeout=5m 2>&1 | tee plan.log
+          PLAN_EXIT_CODE=$?
+          set -e
+
+          if [ $PLAN_EXIT_CODE -ne 0 ]; then
+            echo "Plan failed, checking for stale locks..."
+            if bash ../../scripts/tofu-recover-stale-lock.sh plan.log; then
+              echo "Stale lock recovered. Retrying plan..."
+              tofu plan -input=false -no-color -lock-timeout=5m
+            else
+              exit $PLAN_EXIT_CODE
+            fi
+          fi
+
+  vaultwarden-plan:
+    name: OpenTofu Plan (Vaultwarden)
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    needs: [select-runner, changes]
+    if: needs.select-runner.outputs.provider-mode != 'azure-pipelines' && needs.changes.outputs.vaultwarden_changed == 'true'
+    defaults:
+      run:
+        working-directory: terraform/vaultwarden
+    env:
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_region: ${{ secrets.GCP_REGION != '' && secrets.GCP_REGION || vars.GCP_REGION != '' && vars.GCP_REGION || 'us-central1' }}
+      TF_VAR_github_mcp_pat: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN }}
+      TF_VAR_cloudflare_mcp_api_token: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      TF_VAR_google_credentials: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_homeassistant_mcp_token: ${{ secrets.HOME_ASSISTANT_MCP_TOKEN }}
+      TF_VAR_paperless_mcp_api_token: ${{ secrets.PAPERLESS_MCP_API_TOKEN }}
+      TF_VAR_nextcloud_mcp_app_password: ${{ secrets.NEXTCLOUD_MCP_APP_PASSWORD }}
+      TF_VAR_grafana_mcp_token: ${{ secrets.GRAFANA_MCP_TOKEN }}
+      TF_VAR_ntfy_admin_password: ${{ secrets.NTFY_ADMIN_PASSWORD }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TF_VAR_pushover_user_key: ${{ secrets.PUSHOVER_USER_KEY || 'placeholder' }}
+      TF_VAR_pushover_api_token_default: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_media: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_system: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_cluster: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_backup: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_VAR_pushover_api_token_security: ${{ secrets.PUSHOVER_API_TOKEN || 'placeholder' }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+          tofu_wrapper: false
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Install Bitwarden CLI
+        run: |
+          if command -v bw >/dev/null 2>&1; then
+            bw --version
+            exit 0
+          fi
+          npm install -g @bitwarden/cli
+          bw --version
+
+      - name: Resolve Vaultwarden inputs
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          BRIDGE_NS="external-secrets"
+          ORG_NAME="homelab"
+          COLLECTION_NAME="K3s Secrets"
+
+          BW_SERVER="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_SERVER}' | base64 -d)"
+          BW_EMAIL="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_EMAIL}' | base64 -d)"
+          BW_PASSWORD="$(kubectl get secret vaultwarden-bridge-bw -n "${BRIDGE_NS}" -o jsonpath='{.data.BW_PASSWORD}' | base64 -d)"
+          KEYCLOAK_ADMIN_PASSWORD="$(kubectl get secret keycloak-admin -n auth -o jsonpath='{.data.KEYCLOAK_ADMIN_PASSWORD}' | base64 -d)"
+          POCKETID_CLIENT_ID="$(kubectl get secret pocket-id-oidc -n auth -o jsonpath='{.data.POCKETID_CLIENT_ID}' | base64 -d)"
+          POCKETID_CLIENT_SECRET="$(kubectl get secret pocket-id-oidc -n auth -o jsonpath='{.data.POCKETID_CLIENT_SECRET}' | base64 -d)"
+
+          for v in BW_SERVER BW_EMAIL BW_PASSWORD ORG_NAME COLLECTION_NAME KEYCLOAK_ADMIN_PASSWORD POCKETID_CLIENT_ID POCKETID_CLIENT_SECRET; do
+            eval "val=\${$v:-}"
+            if [ -z "${val}" ]; then
+              echo "Missing required Vaultwarden input ${v}."
+              exit 1
+            fi
+          done
+
+          echo "::add-mask::$BW_SERVER"
+          echo "::add-mask::$BW_EMAIL"
+          echo "::add-mask::$BW_PASSWORD"
+          echo "::add-mask::$KEYCLOAK_ADMIN_PASSWORD"
+          echo "::add-mask::$POCKETID_CLIENT_ID"
+          echo "::add-mask::$POCKETID_CLIENT_SECRET"
+
+          export BITWARDENCLI_APPDATA_DIR="$(mktemp -d)"
+          export BW_NOINTERACTION=true
+          bw config server "${BW_SERVER}"
+          bw logout >/dev/null 2>&1 || true
+          BW_SESSION="$(bw login "${BW_EMAIL}" "${BW_PASSWORD}" --raw)"
+          if [ -z "${BW_SESSION}" ]; then
+            echo "Bitwarden CLI login did not return a session."
+            exit 1
+          fi
+          echo "::add-mask::$BW_SESSION"
+          bw sync --session "${BW_SESSION}"
+          ORG_ID="$(bw list organizations --session "${BW_SESSION}" | jq -r --arg name "${ORG_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${ORG_ID}" ]; then
+            echo "Bitwarden CLI did not expose organization ${ORG_NAME}."
+            exit 1
+          fi
+          COLLECTION_ID="$(bw list org-collections --organizationid "${ORG_ID}" --session "${BW_SESSION}" | jq -r --arg name "${COLLECTION_NAME}" '.[] | select(.name==$name) | .id' | head -n1)"
+          if [ -z "${COLLECTION_ID}" ]; then
+            echo "Bitwarden CLI did not expose collection ${COLLECTION_NAME} in organization ${ORG_NAME}."
+            exit 1
+          fi
+
+          echo "TF_VAR_bw_server_url=${BW_SERVER}" >> "$GITHUB_ENV"
+          echo "TF_VAR_bw_email=${BW_EMAIL}" >> "$GITHUB_ENV"
+          echo "TF_VAR_bw_master_password=${BW_PASSWORD}" >> "$GITHUB_ENV"
+          echo "TF_VAR_homelab_organization_id=${ORG_ID}" >> "$GITHUB_ENV"
+          echo "TF_VAR_k3s_secrets_collection_id=${COLLECTION_ID}" >> "$GITHUB_ENV"
+          echo "TF_VAR_keycloak_admin_password=${KEYCLOAK_ADMIN_PASSWORD}" >> "$GITHUB_ENV"
+          echo "TF_VAR_pocketid_client_id=${POCKETID_CLIENT_ID}" >> "$GITHUB_ENV"
+          echo "TF_VAR_pocketid_client_secret=${POCKETID_CLIENT_SECRET}" >> "$GITHUB_ENV"
+
+      - name: OpenTofu init
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: vaultwarden/terraform.tfstate
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu validate
+        run: tofu validate
+
+      - name: OpenTofu plan
+        run: |
+          set -euo pipefail
+          PLAN_LOG="/tmp/tofu-vaultwarden-plan.log"
+          LOCK_TIMEOUT="15m"
+
+          set +e
+          tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ] && bash ../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying Vaultwarden plan after stale lock cleanup..."
+            set +e
+            tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && grep -q "Error acquiring the state lock" "${PLAN_LOG}"; then
+            echo "State lock is still active; waiting 90s before final retry..."
+            sleep 90
+            set +e
+            tofu plan -input=false -detailed-exitcode -lock-timeout="${LOCK_TIMEOUT}" 2>&1 | tee "${PLAN_LOG}"
+            PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && [ "${PLAN_EXIT}" -ne 2 ]; then
+            echo "Vaultwarden OpenTofu plan failed with exit ${PLAN_EXIT}."
+            exit "${PLAN_EXIT}"
+          fi
+
+          echo "Vaultwarden OpenTofu plan completed (exit ${PLAN_EXIT})."
+
+  # Layer 0.5: Build changed images
+  prepare-build-image-matrix:
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    needs: changes
+    outputs:
+      matrix: ${{ steps.prepare.outputs.matrix }}
+      has_images: ${{ steps.prepare.outputs.has_images }}
+    steps:
+      - name: Prepare changed image matrix
+        id: prepare
+        shell: bash
+        env:
+          CONSOLIDATED_ALERTS_CHANGED: ${{ needs.changes.outputs.consolidated_alerts }}
+          GAMDL_AUTOMATOR_CHANGED: ${{ needs.changes.outputs.gamdl_automator }}
+          POSTGRES_BACKUP_CHANGED: ${{ needs.changes.outputs.postgres_backup }}
+        run: |
+          set -euo pipefail
+
+          include_entries=()
+
+          if [ "${CONSOLIDATED_ALERTS_CHANGED}" = "true" ]; then
+            # The consolidated-alerts Dockerfile expects scripts/ under its own image directory.
+            include_entries+=("{\"name\":\"consolidated_alerts\",\"image\":\"ghcr.io/josh-archer/consolidated-alerts\",\"context\":\"grok-servaar/monitoring/consolidated-alerts\",\"file\":\"grok-servaar/monitoring/consolidated-alerts/Dockerfile\"}")
+          fi
+
+          if [ "${GAMDL_AUTOMATOR_CHANGED}" = "true" ]; then
+            include_entries+=("{\"name\":\"gamdl_automator\",\"image\":\"ghcr.io/josh-archer/gamdl-automator\",\"context\":\"grok-servaar/images/gamdl-automator\",\"file\":\"grok-servaar/images/gamdl-automator/Dockerfile\"}")
+          fi
+
+          if [ "${POSTGRES_BACKUP_CHANGED}" = "true" ]; then
+            include_entries+=("{\"name\":\"postgres_backup\",\"image\":\"ghcr.io/josh-archer/postgres-backup-s3-test\",\"context\":\"grok-servaar/images/postgres-backup\",\"file\":\"grok-servaar/images/postgres-backup/Dockerfile\"}")
+          fi
+
+          if [ "${#include_entries[@]}" -eq 0 ]; then
+            matrix_json='{"include":[]}'
+            has_images='false'
+          else
+            joined_entries=$(IFS=,; echo "${include_entries[*]}")
+            matrix_json="{\"include\":[${joined_entries}]}"
+            has_images='true'
+          fi
+
+          echo "matrix=${matrix_json}" >> "$GITHUB_OUTPUT"
+          echo "has_images=${has_images}" >> "$GITHUB_OUTPUT"
+
+  build-images:
+    name: Build ${{ matrix.image }}
+    needs: [resolve_build_runner, resolve_remote_build_provider, changes, prepare-build-image-matrix, codebuild-smoke]
+    runs-on: ${{ fromJSON(needs.resolve_remote_build_provider.outputs['selected-provider'] != '' && needs.resolve_remote_build_provider.outputs['dispatch-label'] || (needs.resolve_build_runner.outputs.build_runner_is_codebuild == 'true' && format('["{0}","job-{1}-{2}"]', needs.resolve_build_runner.outputs.build_runner_base, github.job, matrix.name) || format('["{0}"]', needs.resolve_build_runner.outputs.build_runner_base))) }}
+    if: ${{ always() && needs.changes.result == 'success' && needs.prepare-build-image-matrix.outputs.has_images == 'true' && (needs.codebuild-smoke.result == 'success' || needs.codebuild-smoke.result == 'skipped') }}
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare-build-image-matrix.outputs.matrix) }}
+
+    steps:
+      - name: Show resolved build provider
+        run: |
+          echo "Resolved build runner: ${{ needs.resolve_build_runner.outputs.build_runner_description }}"
+          echo "Remote build provider: ${{ needs.resolve_remote_build_provider.outputs['selected-provider'] || 'fallback-native' }}"
+          echo "Remote execution kind: ${{ needs.resolve_remote_build_provider.outputs['execution-kind'] || 'native-runner' }}"
+
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Log in to Docker Hub
+        if: needs.resolve_remote_build_provider.outputs['selected-provider'] == ''
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
+      - name: Set up Docker Buildx
+        if: needs.resolve_remote_build_provider.outputs['selected-provider'] == ''
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: |
+            image=moby/buildkit:master
+            network=host
+          buildkitd-config-inline: |
+            [registry."docker.io"]
+              mirrors = ["mirror.gcr.io"]
+
+      - name: Log in to GitHub Container Registry
+        if: needs.resolve_remote_build_provider.outputs['selected-provider'] == ''
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Dispatch remote image build
+        if: needs.resolve_remote_build_provider.outputs['selected-provider'] != ''
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number || '' }}
+          BUILD_IMAGE: ${{ matrix.image }}
+          BUILD_CONTEXT: ${{ matrix.context }}
+          BUILD_FILE: ${{ matrix.file }}
+          BUILD_TAG: ${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('manual-{0}', github.run_number) }}
+          BUILD_PLATFORMS: linux/amd64
+          BUILD_PUSH: 'true'
+          CLOUD_RUN_BUILD_DISPATCH_URL: ${{ vars.CLOUD_RUN_BUILD_DISPATCH_URL }}
+          CLOUD_RUN_BUILD_HEALTHCHECK_URL: ${{ vars.CLOUD_RUN_BUILD_HEALTHCHECK_URL }}
+          CLOUD_RUN_BUILD_DISPATCH_TOKEN: ${{ secrets.CLOUD_RUN_BUILD_DISPATCH_TOKEN }}
+          GCP_COMPUTE_BUILD_RUNNER_LABEL: ${{ vars.GCP_COMPUTE_BUILD_RUNNER_LABEL }}
+        run: |
+          chmod +x scripts/build-provider-dispatch.sh
+          selected_provider="${{ needs.resolve_remote_build_provider.outputs['selected-provider'] }}"
+
+          # Cloud Run currently builds successfully but its GHCR credentials do not
+          # have the scopes needed for push=true image builds. Fall back to the
+          # GCP compute dispatcher when it is available so PR image validation still
+          # exercises a real push-capable remote backend.
+          if [ "${selected_provider}" = "cloud-run" ] && [ "${BUILD_PUSH}" = "true" ]; then
+            if scripts/build-provider-dispatch.sh verify gcp-compute >/dev/null 2>&1; then
+              echo "Cloud Run selected for remote build, but GHCR push requires gcp-compute fallback."
+              selected_provider="gcp-compute"
+            fi
+          fi
+
+          scripts/build-provider-dispatch.sh dispatch "${selected_provider}"
+
+      - name: Build and push
+        if: needs.resolve_remote_build_provider.outputs['selected-provider'] == ''
+        uses: docker/build-push-action@v7
+        timeout-minutes: 45
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.file }}
+          platforms: linux/amd64
+          push: true
+          tags: ${{ matrix.image }}:${{ github.event.pull_request.number && format('pr-{0}', github.event.pull_request.number) || format('manual-{0}', github.run_number) }}
+          cache-from: |
+            type=gha
+            type=registry,ref=${{ matrix.image }}:latest
+          cache-to: type=gha,mode=max
+
+  # Layer 1: Fast static checks (10 seconds)
+  tests:
+    needs: changes
+    uses: ./.github/workflows/reusable-tests.yml
+    with:
+      run_contract_tests: ${{ needs.changes.outputs.contract_validation_required == 'true' }}
+      prefer_azure_vm_static_checks: true
+    secrets:
+      AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+      AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+
+  secrets-platform-tests:
+    needs: changes
+    if: needs.changes.outputs.secrets_platform == 'true'
+    uses: ./.github/workflows/reusable-secrets-platform-tests.yml
+    secrets: inherit
+
+  static-validation:
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    needs: changes
+    env:
+      KUSTOMIZE_LOAD_RESTRICTIONS: LoadRestrictionsNone
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Compute static-validation scope targets
+        id: scope_targets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          changed_files_path="${RUNNER_TEMP}/changed-files.txt"
+          changed_grok_yaml_path="${RUNNER_TEMP}/changed-grok-servaar-yaml.txt"
+          changed_kustomize_roots_path="${RUNNER_TEMP}/changed-kustomize-roots.txt"
+
+          : > "${changed_files_path}"
+          : > "${changed_grok_yaml_path}"
+          : > "${changed_kustomize_roots_path}"
+
+          can_scope="false"
+          scope_source="fallback-full"
+
+          count_non_empty_lines() {
+            awk 'NF { count++ } END { print count + 0 }' "$1"
+          }
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            base_sha="${{ github.event.pull_request.base.sha }}"
+            head_sha="${{ github.event.pull_request.head.sha }}"
+            if git cat-file -e "${base_sha}^{commit}" >/dev/null 2>&1 && git cat-file -e "${head_sha}^{commit}" >/dev/null 2>&1; then
+              git diff --name-only "${base_sha}" "${head_sha}" > "${changed_files_path}" || true
+              can_scope="true"
+              scope_source="pull_request"
+            else
+              echo "Unable to resolve PR commit range locally; using full validation fallback."
+            fi
+          elif git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+            git diff --name-only HEAD~1 HEAD > "${changed_files_path}" || true
+            can_scope="true"
+            scope_source="manual-head-range"
+          else
+            echo "Unable to determine previous commit; using full validation fallback."
+          fi
+
+          if [ "${can_scope}" = "true" ]; then
+            grep -E '^grok-servaar/.*\.yaml$' "${changed_files_path}" > "${changed_grok_yaml_path}" || true
+
+            declare -A root_set=()
+            while IFS= read -r changed_file; do
+              [ -z "${changed_file}" ] && continue
+              case "${changed_file}" in
+                grok-servaar/*) ;;
+                *) continue ;;
+              esac
+
+              search_dir="${changed_file}"
+              if [ ! -d "${search_dir}" ]; then
+                search_dir="$(dirname "${search_dir}")"
+              fi
+
+              while [ "${search_dir}" != "." ] && [ "${search_dir}" != "/" ]; do
+                if [ -f "${search_dir}/kustomization.yaml" ]; then
+                  root_set["${search_dir}"]=1
+                  break
+                fi
+                next_dir="$(dirname "${search_dir}")"
+                [ "${next_dir}" = "${search_dir}" ] && break
+                search_dir="${next_dir}"
+              done
+            done < "${changed_files_path}"
+
+            if [ "${#root_set[@]}" -gt 0 ]; then
+              printf '%s\n' "${!root_set[@]}" | sort > "${changed_kustomize_roots_path}"
+            fi
+          fi
+
+          changed_file_count="$(count_non_empty_lines "${changed_files_path}")"
+          changed_grok_yaml_count="$(count_non_empty_lines "${changed_grok_yaml_path}")"
+          changed_kustomize_root_count="$(count_non_empty_lines "${changed_kustomize_roots_path}")"
+
+          echo "can_scope=${can_scope}" >> "${GITHUB_OUTPUT}"
+          echo "scope_source=${scope_source}" >> "${GITHUB_OUTPUT}"
+          echo "changed_files_path=${changed_files_path}" >> "${GITHUB_OUTPUT}"
+          echo "changed_grok_yaml_path=${changed_grok_yaml_path}" >> "${GITHUB_OUTPUT}"
+          echo "changed_kustomize_roots_path=${changed_kustomize_roots_path}" >> "${GITHUB_OUTPUT}"
+          echo "changed_file_count=${changed_file_count}" >> "${GITHUB_OUTPUT}"
+          echo "changed_grok_yaml_count=${changed_grok_yaml_count}" >> "${GITHUB_OUTPUT}"
+          echo "changed_kustomize_root_count=${changed_kustomize_root_count}" >> "${GITHUB_OUTPUT}"
+
+          echo "Scope source: ${scope_source}"
+          echo "Scoped mode: ${can_scope}"
+          echo "Changed files: ${changed_file_count}"
+          echo "Changed grok-servaar YAML files: ${changed_grok_yaml_count}"
+          echo "Changed kustomize roots: ${changed_kustomize_root_count}"
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v5
+        with:
+          path: ~/.tools
+          key: tools-v2-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Setup Tools
+        run: |
+          bash scripts/setup-tools.sh
+          echo "$HOME/.tools" >> $GITHUB_PATH
+
+      - name: Authenticate Helm to GHCR for OCI chart pulls
+        shell: bash
+        env:
+          HELM_REGISTRY_CONFIG: ${{ runner.temp }}/helm-registry/config.json
+          GHCR_USERNAME: ${{ github.actor }}
+          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "${HELM_REGISTRY_CONFIG}")"
+          echo "${GHCR_TOKEN}" | helm registry login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+
+      - name: Validate kustomization files
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "???? Validating kustomization.yaml files..."
+
+          # Keep full kustomize-root validation to avoid missing downstream overlay
+          # impact from shared/base manifest edits.
+          kustomize_roots=()
+          kustomize_roots_file="$(mktemp)"
+          find grok-servaar -name 'kustomization.yaml' -type f | sort > "${kustomize_roots_file}"
+          while IFS= read -r kust; do
+            [ -z "${kust}" ] && continue
+            kustomize_roots+=("$(dirname "${kust}")")
+          done < "${kustomize_roots_file}"
+          rm -f "${kustomize_roots_file}"
+          echo "Using full validation for ${#kustomize_roots[@]} kustomize roots."
+
+          if [ "${#kustomize_roots[@]}" -eq 0 ]; then
+            echo "No kustomize roots selected; skipping."
+            exit 0
+          fi
+
+          for root in "${kustomize_roots[@]}"; do
+            if [ "${{ needs.changes.outputs.secrets_platform }}" != "true" ] && [[ "${root}" == grok-servaar/infra/secrets-platform* ]]; then
+              echo "  Skipping ${root}/kustomization.yaml (secrets-platform unchanged in this PR)"
+              continue
+            fi
+            echo "  Checking ${root}/kustomization.yaml..."
+            if ! kubectl kustomize "${root}" --enable-helm --load-restrictor=LoadRestrictionsNone > /dev/null 2>&1; then
+              echo "??? Failed to build: ${root}/kustomization.yaml"
+              kubectl kustomize "${root}" --enable-helm --load-restrictor=LoadRestrictionsNone 2>&1 | head -20 || true
+              exit 1
+            fi
+          done
+          echo "??? All selected kustomization files are valid"
+
+      - name: Set up Python for YamlLint
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+          cache: 'pip'
+          cache-dependency-path: .github/workflows/deps/static-validation-pip.txt
+
+      - name: Install YamlLint
+        run: pip install -r .github/workflows/deps/static-validation-pip.txt
+
+      - name: YAML lint
+        shell: bash
+        env:
+          CAN_SCOPE: ${{ steps.scope_targets.outputs.can_scope }}
+          CHANGED_GROK_YAML_PATH: ${{ steps.scope_targets.outputs.changed_grok_yaml_path }}
+        run: |
+          set -euo pipefail
+          echo "???? Linting YAML files..."
+
+          yaml_targets=()
+          if [ "${CAN_SCOPE}" = "true" ]; then
+            while IFS= read -r yaml_file; do
+              [ -z "${yaml_file}" ] && continue
+              [ -f "${yaml_file}" ] || continue
+              yaml_targets+=("${yaml_file}")
+            done < "${CHANGED_GROK_YAML_PATH}"
+
+            if [ "${#yaml_targets[@]}" -eq 0 ]; then
+              echo "No changed grok-servaar YAML files detected; skipping YAML lint."
+              exit 0
+            fi
+            echo "Using scoped YAML lint on ${#yaml_targets[@]} changed files."
+          else
+            yaml_targets_file="$(mktemp)"
+            find grok-servaar -name '*.yaml' -type f | sort > "${yaml_targets_file}"
+            while IFS= read -r yaml_file; do
+              [ -z "${yaml_file}" ] && continue
+              yaml_targets+=("${yaml_file}")
+            done < "${yaml_targets_file}"
+            rm -f "${yaml_targets_file}"
+            echo "Using full YAML lint on ${#yaml_targets[@]} files."
+          fi
+
+          if [ "${#yaml_targets[@]}" -eq 0 ]; then
+            echo "No YAML files to lint."
+            exit 0
+          fi
+
+          # Use relaxed mode and don't fail on warnings (non-blocking for now).
+          printf '%s\0' "${yaml_targets[@]}" | xargs -0 yamllint -d relaxed || echo "??????  YAML lint found issues (not blocking)"
+
+      - name: Validate Kubernetes schemas
+        shell: bash
+        env:
+          CAN_SCOPE: ${{ steps.scope_targets.outputs.can_scope }}
+          CHANGED_GROK_YAML_PATH: ${{ steps.scope_targets.outputs.changed_grok_yaml_path }}
+        run: |
+          set -euo pipefail
+          echo "???? Validating Kubernetes schemas..."
+
+          yaml_targets=()
+          if [ "${CAN_SCOPE}" = "true" ]; then
+            while IFS= read -r yaml_file; do
+              [ -z "${yaml_file}" ] && continue
+              [ -f "${yaml_file}" ] || continue
+              yaml_targets+=("${yaml_file}")
+            done < "${CHANGED_GROK_YAML_PATH}"
+
+            if [ "${#yaml_targets[@]}" -eq 0 ]; then
+              echo "No changed grok-servaar YAML files detected; skipping schema validation."
+              exit 0
+            fi
+            echo "Using scoped schema validation on ${#yaml_targets[@]} changed files."
+          else
+            yaml_targets_file="$(mktemp)"
+            find grok-servaar -name '*.yaml' -type f | sort > "${yaml_targets_file}"
+            while IFS= read -r yaml_file; do
+              [ -z "${yaml_file}" ] && continue
+              yaml_targets+=("${yaml_file}")
+            done < "${yaml_targets_file}"
+            rm -f "${yaml_targets_file}"
+            echo "Using full schema validation on ${#yaml_targets[@]} files."
+          fi
+
+          if [ "${#yaml_targets[@]}" -eq 0 ]; then
+            echo "No YAML files to validate."
+            exit 0
+          fi
+
+          # Skip CRDs and non-K8s files, don't fail on validation errors for now.
+          printf '%s\0' "${yaml_targets[@]}" | \
+            xargs -0 kubeconform -summary -kubernetes-version 1.31.0 \
+            -skip CustomResourceDefinition,MutatingWebhookConfiguration,TLSStore,ClusterIssuer,IngressRoute,Middleware,Certificate \
+            -ignore-missing-schemas || echo "??????  Schema validation found issues (not blocking)"
+
+      - name: Test manifest generation
+        run: |
+          echo "???? Testing manifest generation..."
+
+          # Try kustomize if kustomization.yaml exists
+          if [ -f "kustomization.yaml" ]; then
+            echo "Using kustomize..."
+            kubectl kustomize . --load-restrictor=LoadRestrictionsNone > /tmp/rendered.yaml
+          elif [ -f "homelab/kustomization.yaml" ]; then
+            echo "Using homelab kustomization..."
+            kubectl kustomize homelab/ --load-restrictor=LoadRestrictionsNone > /tmp/rendered.yaml
+          else
+            echo "No kustomization.yaml, collecting YAML files..."
+            find grok-servaar -name '*.yaml' -type f | xargs cat > /tmp/rendered.yaml
+            find ops -name '*.yaml' -type f 2>/dev/null | xargs cat >> /tmp/rendered.yaml || true
+          fi
+
+          echo "??? Manifest generation successful"
+          echo "???? Generated $(wc -l < /tmp/rendered.yaml) lines of manifests"
+
+      - name: Custom validations
+        run: |
+          echo "???? Running custom validations..."
+          bash scripts/validate-manifests.sh
+          echo "Repository contract checks run via reusable-tests.yml when relevant."
+          echo "Secrets-platform contract checks run via reusable-secrets-platform-tests.yml when relevant."
+
+  # Layer 2: Cluster dry-run (30 seconds)
+  cluster-dry-run:
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || ((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    needs: [select-runner, changes, static-validation, build-images]
+    if: needs.select-runner.outputs.provider-mode != 'azure-pipelines' && always() && needs.changes.outputs.runtime_k8s_changed == 'true' && needs.static-validation.result == 'success' && (needs.build-images.result == 'success' || needs.build-images.result == 'skipped')
+    env:
+      KUSTOMIZE_LOAD_RESTRICTIONS: LoadRestrictionsNone
+    steps:
+      - name: Free Disk Space
+        run: |
+          echo "???? Cleaning up runner..."
+          docker system prune -af --volumes 2>/dev/null || true
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Cache Tools
+        id: cache-tools
+        uses: actions/cache@v5
+        with:
+          path: ~/.tools
+          key: tools-v2-${{ runner.os }}-${{ runner.arch }}
+
+      - name: Setup Tools
+        run: |
+          bash scripts/setup-tools.sh
+          echo "$HOME/.tools" >> $GITHUB_PATH
+
+      - name: Update manifests with PR images
+        env:
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "???? Updating manifests to use PR tag: pr-${PR_NUMBER}"
+
+          # Check which images were built and update them
+          if [ "${{ needs.changes.outputs.consolidated_alerts }}" == "true" ]; then
+             python3 scripts/update_image.py "ghcr.io/josh-archer/consolidated-alerts" "pr-${PR_NUMBER}"
+          fi
+          if [ "${{ needs.changes.outputs.gamdl_automator }}" == "true" ]; then
+             python3 scripts/update_image.py "ghcr.io/josh-archer/gamdl-automator" "pr-${PR_NUMBER}"
+          fi
+          if [ "${{ needs.changes.outputs.postgres_backup }}" == "true" ]; then
+             python3 scripts/update_image.py "ghcr.io/josh-archer/postgres-backup-s3-test" "pr-${PR_NUMBER}"
+          fi
+
+
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Server-side dry run
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          set -o pipefail
+          echo "???? Running server-side dry run..."
+
+          # Use helper script for flexible manifest application
+          chmod +x scripts/apply-manifests.sh
+          bash scripts/apply-manifests.sh "" "dry-run" 2>&1 | tee /tmp/dryrun.log
+
+          echo "??? Server-side dry run passed"
+
+
+      - name: Show what would change
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          echo "???? Changes that would be applied:"
+
+          # Try diff with kustomize if available, otherwise skip
+          if [ -f "kustomization.yaml" ]; then
+            kubectl diff -k . || echo "No changes or new resources"
+          elif [ -f "homelab/kustomization.yaml" ]; then
+            kubectl diff -k homelab/ || echo "No changes or new resources"
+          else
+            echo "??????  Cannot show diff without kustomization.yaml (would need to diff each file)"
+          fi
+
+      - name: Check Plex impact
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          echo "???? Analyzing Plex impact..."
+
+          DIFF_OUTPUT=$(kubectl diff -k . 2>&1 || true)
+
+          if echo "$DIFF_OUTPUT" | grep -q "namespace: media\|longhorn"; then
+            echo "??????  WARNING: Changes affect Plex or dependencies:"
+            echo "$DIFF_OUTPUT" | grep -A 5 -B 5 "namespace: media\|longhorn" || true
+            echo ""
+            echo "Please review these changes carefully!"
+          else
+            echo "??? No direct impact on Plex detected"
+          fi
+
+
+
+  # Layer 3: Ephemeral namespace testing (2-5 minutes)
+  ephemeral-test:
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    needs: cluster-dry-run
+    if: false
+    steps:
+      - name: Free Disk Space
+        run: |
+          echo "???? Cleaning up runner..."
+          docker system prune -af --volumes 2>/dev/null || true
+          sudo rm -rf /tmp/* 2>/dev/null || true
+
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Create test namespace
+        id: setup
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TEST_NS="test-pr-${{ github.event.pull_request.number }}"
+          else
+            TEST_NS="test-manual-$(date +%s)"
+          fi
+
+          echo "TEST_NS=${TEST_NS}" >> $GITHUB_ENV
+          echo "test_ns=${TEST_NS}" >> $GITHUB_OUTPUT
+
+          echo "???? Creating test namespace: ${TEST_NS}"
+          kubectl create namespace ${TEST_NS} || true
+          kubectl label namespace ${TEST_NS} test=true ephemeral=true
+
+      - name: Deploy to test namespace
+        run: |
+          echo "???? Deploying to test namespace..."
+          bash scripts/deploy-to-test-namespace.sh $TEST_NS
+
+      - name: Wait for pods
+        timeout-minutes: 3
+        run: |
+          echo "??? Waiting for pods to be ready..."
+          bash scripts/wait-for-test-pods.sh $TEST_NS
+
+      - name: Run smoke tests
+        run: |
+          echo "???? Running smoke tests..."
+          bash scripts/test-deployment.sh $TEST_NS
+
+      - name: Check for common issues
+        if: always()
+        run: |
+          echo "???? Checking for common failure patterns..."
+
+          # Check for CrashLoopBackOff
+          CRASHLOOP=$(kubectl get pods -n $TEST_NS -o json | \
+            jq -r '.items[] | select(.status.containerStatuses[]?.state.waiting.reason == "CrashLoopBackOff") | .metadata.name')
+
+          if [ -n "$CRASHLOOP" ]; then
+            echo "??? Pods in CrashLoopBackOff: $CRASHLOOP"
+            kubectl logs -n $TEST_NS $CRASHLOOP --tail=50 || true
+            exit 1
+          fi
+
+          # Check for ImagePullBackOff
+          IMAGEPULL=$(kubectl get pods -n $TEST_NS -o json | \
+            jq -r '.items[] | select(.status.containerStatuses[]?.state.waiting.reason == "ImagePullBackOff") | .metadata.name')
+
+          if [ -n "$IMAGEPULL" ]; then
+            echo "??? Pods with ImagePullBackOff: $IMAGEPULL"
+            kubectl describe pod -n $TEST_NS $IMAGEPULL | grep -A 5 "Events:" || true
+            exit 1
+          fi
+
+          # Check for OOMKilled
+          OOM=$(kubectl get pods -n $TEST_NS -o json | \
+            jq -r '.items[] | select(.status.containerStatuses[]?.lastState.terminated.reason == "OOMKilled") | .metadata.name')
+
+          if [ -n "$OOM" ]; then
+            echo "??? Pods OOMKilled: $OOM"
+            exit 1
+          fi
+
+          echo "??? No common issues detected"
+
+      - name: Cleanup test namespace
+        if: always()
+        run: |
+          echo "???? Cleaning up test namespace..."
+          kubectl delete namespace $TEST_NS --wait=false || true
+
+  # Layer 3.5: ArgoCD test application sync/health
+  argocd-test:
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    needs: [changes, cluster-dry-run]
+    if: false
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Select ArgoCD test path
+        id: select_path
+        if: steps.cluster_access.outputs.configured == 'true'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          TEST_PATH=""
+
+          if [ -n "${BASE_SHA:-}" ] && [ -n "${HEAD_SHA:-}" ]; then
+            mapfile -t CHANGED_DIRS < <(git diff --name-only "$BASE_SHA" "$HEAD_SHA" \
+              | awk -F/ '/^grok-servaar\/[^\/]+\// {print $2}' \
+              | sort -u)
+
+            for dir in "${CHANGED_DIRS[@]}"; do
+              # Skip directories that contain ArgoCD manifests, not deployable workloads
+              if [ "$dir" = "argocd" ] || [ "$dir" = "images" ]; then
+                echo "?????? Skipping ${dir} (not a deployable workload)"
+                continue
+              fi
+              if [ -f "grok-servaar/${dir}/ci-test/kustomization.yaml" ]; then
+                echo "?????? Found CI-specific test configuration for ${dir}"
+                TEST_PATH="grok-servaar/${dir}/ci-test"
+                break
+              elif [ -f "grok-servaar/${dir}/kustomization.yaml" ]; then
+                TEST_PATH="grok-servaar/${dir}"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "$TEST_PATH" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            echo "No kustomize path detected for ArgoCD test."
+            exit 0
+          fi
+
+          echo "Using ArgoCD test path: ${TEST_PATH}"
+          echo "skip=false" >> "$GITHUB_OUTPUT"
+          echo "test_path=${TEST_PATH}" >> "$GITHUB_OUTPUT"
+
+      - name: Cleanup stale resources
+        if: steps.select_path.outputs.skip == 'false' && steps.cluster_access.outputs.configured == 'true'
+        env:
+          APP_NAME: test-pr-${{ github.event.pull_request.number }}
+          DEST_NAMESPACE: test-pr-${{ github.event.pull_request.number }}
+        run: |
+          echo "???? Cleaning up stale resources from previous runs..."
+          kubectl -n argocd delete application "${APP_NAME}" --wait=true --timeout=60s 2>/dev/null || true
+          kubectl delete namespace "${DEST_NAMESPACE}" --wait=true --timeout=120s 2>/dev/null || true
+          echo "??? Cleanup complete"
+
+      - name: Create ArgoCD test application
+        if: steps.select_path.outputs.skip == 'false' && steps.cluster_access.outputs.configured == 'true'
+        env:
+          APP_NAME: test-pr-${{ github.event.pull_request.number }}
+          DEST_NAMESPACE: test-pr-${{ github.event.pull_request.number }}
+          SOURCE_PATH: ${{ steps.select_path.outputs.test_path }}
+          TARGET_REVISION: ${{ github.event.pull_request.head.sha }}
+        run: |
+          set -euo pipefail
+          sed \
+            -e "s/__APP_NAME__/${APP_NAME}/g" \
+            -e "s|__TARGET_REVISION__|${TARGET_REVISION}|g" \
+            -e "s|__SOURCE_PATH__|${SOURCE_PATH}|g" \
+            -e "s|__DEST_NAMESPACE__|${DEST_NAMESPACE}|g" \
+            grok-servaar/argocd/test-pr-template.yaml > /tmp/argocd-test-app.yaml
+
+          kubectl apply -f /tmp/argocd-test-app.yaml
+
+      - name: Wait for ArgoCD sync/health
+        if: steps.select_path.outputs.skip == 'false' && steps.cluster_access.outputs.configured == 'true'
+        env:
+          APP_NAME: test-pr-${{ github.event.pull_request.number }}
+          DEST_NAMESPACE: test-pr-${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          echo "??? Waiting for ArgoCD app ${APP_NAME} to be Healthy and Synced..."
+          for _ in $(seq 1 60); do
+            HEALTH=$(kubectl -n argocd get application "${APP_NAME}" -o jsonpath='{.status.health.status}' 2>/dev/null || true)
+            SYNC=$(kubectl -n argocd get application "${APP_NAME}" -o jsonpath='{.status.sync.status}' 2>/dev/null || true)
+            echo "Health=${HEALTH:-unknown} Sync=${SYNC:-unknown}"
+
+            if [ "$HEALTH" = "Healthy" ] && [ "$SYNC" = "Synced" ]; then
+              echo "??? ArgoCD app is Healthy and Synced"
+              exit 0
+            fi
+            sleep 10
+          done
+
+          echo "??? ArgoCD app did not reach Healthy/Synced state in time"
+          echo "???? Application details:"
+          kubectl -n argocd describe application "${APP_NAME}" || true
+          echo "???? Pod status in namespace ${DEST_NAMESPACE}:"
+          kubectl -n "${DEST_NAMESPACE}" get pods || true
+          echo "???? Pod details:"
+          kubectl -n "${DEST_NAMESPACE}" describe pods || true
+          echo "???? Recent events:"
+          kubectl -n "${DEST_NAMESPACE}" get events --sort-by='.lastTimestamp' || true
+          exit 1
+
+      - name: Cleanup ArgoCD test application
+        if: always() && steps.select_path.outputs.skip == 'false' && steps.cluster_access.outputs.configured == 'true'
+        env:
+          APP_NAME: test-pr-${{ github.event.pull_request.number }}
+          DEST_NAMESPACE: test-pr-${{ github.event.pull_request.number }}
+        run: |
+          kubectl -n argocd delete application "${APP_NAME}" --wait=false || true
+          kubectl delete namespace "${DEST_NAMESPACE}" --wait=false || true
+
+  # Layer 0.1: Pre-check Plex health (runs in parallel with static validation)
+  verify-plex-pre:
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || ((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    needs: changes
+    if: needs.changes.outputs.runtime_k8s_changed == 'true'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Start Plex port-forward
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          set -euo pipefail
+          nohup kubectl -n media port-forward svc/plex-service 32400:32400 >/tmp/plex-port-forward.log 2>&1 &
+          echo $! >/tmp/plex-port-forward.pid
+          sleep 3
+          if ! kill -0 "$(cat /tmp/plex-port-forward.pid)" >/dev/null 2>&1; then
+            echo "Plex port-forward failed to start."
+            cat /tmp/plex-port-forward.log || true
+            exit 1
+          fi
+
+      - name: Check Plex health (before changes)
+        env:
+          PLEX_URL: ${{ steps.cluster_access.outputs.configured == 'true' && 'http://127.0.0.1:32400' || (secrets.PLEX_URL != '' && secrets.PLEX_URL || 'https://plex.archer.casa') }}
+          PLEX_TOKEN: ${{ secrets.PLEX_TOKEN }}
+        run: |
+          echo "???? [PRE-CHECK] Verifying Plex health before testing..."
+          npm run test:plex
+
+      - name: Stop Plex port-forward
+        if: always()
+        run: |
+          if [ -f /tmp/plex-port-forward.pid ]; then
+            kill "$(cat /tmp/plex-port-forward.pid)" >/dev/null 2>&1 || true
+          fi
+
+  integration-health:
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || ((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt)) || '["ubuntu-latest"]') }}
+    timeout-minutes: 10
+    needs: [changes, static-validation]
+    if: always() && needs.static-validation.result == 'success' && needs.changes.outputs.runtime_k8s_changed == 'true'
+    env:
+      ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+      NODE_TLS_REJECT_UNAUTHORIZED: "0"
+    steps:
+      - name: Check ArgoCD credentials
+        run: |
+          if [ -z "${ARGOCD_AUTH_TOKEN}" ]; then
+            echo "Skipping tests/health integration checks: ARGOCD_AUTH_TOKEN not configured."
+            echo "SKIP_UI=true" >> "$GITHUB_ENV"
+          fi
+
+      - name: Checkout
+        if: env.SKIP_UI != 'true'
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        if: env.SKIP_UI != 'true'
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+
+      - name: Install dependencies (Runner)
+        if: env.SKIP_UI != 'true'
+        run: |
+          npm ci --prefer-offline --no-audit
+
+      - name: Install kubectl
+        if: env.SKIP_UI != 'true'
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access
+        if: env.SKIP_UI != 'true'
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Run tests/health checks
+        if: env.SKIP_UI != 'true'
+        env:
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+          HEALTH_RUNNER_PROFILE: ${{ (secrets.INTERNAL_BASE_URL != '' || secrets.INTERNAL_HOST_MAP_JSON != '' || secrets.INTERNAL_HOST_SUFFIX != '') && 'hybrid' || 'external' }}
+          ZERO_TRUST_HEADERS_JSON: ${{ secrets.ZERO_TRUST_HEADERS_JSON }}
+          ZERO_TRUST_COOKIES_JSON: ${{ secrets.ZERO_TRUST_COOKIES_JSON }}
+          EXTERNAL_BASE_URL: ${{ secrets.EXTERNAL_BASE_URL }}
+          INTERNAL_BASE_URL: ${{ secrets.INTERNAL_BASE_URL }}
+          EXTERNAL_HOST_SUFFIX: ${{ secrets.EXTERNAL_HOST_SUFFIX }}
+          INTERNAL_HOST_SUFFIX: ${{ secrets.INTERNAL_HOST_SUFFIX }}
+          INTERNAL_HOST_MAP_JSON: ${{ secrets.INTERNAL_HOST_MAP_JSON }}
+          REQUIRED_APP_HINTS: ${{ secrets.REQUIRED_APP_HINTS || 'sonarr,radarr,plex' }}
+          PLEX_TOKEN: ${{ secrets.PLEX_TOKEN }}
+          PLEX_URL: ${{ secrets.PLEX_URL != '' && secrets.PLEX_URL || 'https://plex.archer.casa' }}
+          CLEANARR_WEBHOOK_URL: ${{ secrets.CLEANARR_WEBHOOK_URL }}
+          CLEANARR_WEBHOOK_SECRET: ${{ secrets.CLEANARR_WEBHOOK_SECRET }}
+          NEXTCLOUD_BASE_URL: ${{ secrets.NEXTCLOUD_BASE_URL }}
+          # The harness now classifies internal and direct routes itself; keep explicit excludes only for out-of-scope proxies.
+          TARGET_HOST_EXCLUDE_REGEX: '(^jarvis-search\.192\.168\.68\.94\.nip\.io$)'
+        run: |
+          npm run test:health
+
+  litellm-integration-test:
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || ((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt)) || '["ubuntu-latest"]') }}
+    needs: [changes, static-validation]
+    if: always() && (needs.changes.outputs.ai_changed == 'true' || github.event_name == 'workflow_dispatch') && needs.static-validation.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Install dependencies
+        run: |
+          npm install -g tsx
+          python3 -m pip install PyYAML --quiet
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Create Test Namespace
+        id: setup_ns
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            TEST_NS="test-pr-ai-${{ github.event.pull_request.number }}-${{ github.run_id }}"
+          else
+            TEST_NS="test-manual-ai-${{ github.run_id }}"
+          fi
+          echo "TEST_NS=${TEST_NS}" >> $GITHUB_ENV
+          
+          echo "???? Creating test namespace: ${TEST_NS}"
+          kubectl create namespace ${TEST_NS}
+          kubectl label namespace ${TEST_NS} test=true ephemeral=true
+
+      - name: Deploy test configuration
+        env:
+          TEST_NS: ${{ env.TEST_NS }}
+        run: |
+          echo "???? Deploying AI test configuration to ${TEST_NS}..."
+          # Install PyYAML for the filter script
+          python3 -m pip install PyYAML --quiet
+          # Render manifests using the dedicated test kustomization so PR validation stays mock-only.
+          AI_TEST_RENDER_DIR="$(mktemp -d)"
+          cp -R grok-servaar/ai/. "${AI_TEST_RENDER_DIR}/"
+          cp "${AI_TEST_RENDER_DIR}/kustomization_test.yaml" "${AI_TEST_RENDER_DIR}/kustomization.yaml"
+          kubectl kustomize "${AI_TEST_RENDER_DIR}" > /tmp/rendered-ai.yaml
+          if ! grep -q 'name: litellm-mock-openai' /tmp/rendered-ai.yaml; then
+            echo "??? Rendered AI test manifests are missing the mock LiteLLM backend."
+            exit 1
+          fi
+          if ! grep -q 'name: openai-oauth-1' /tmp/rendered-ai.yaml || ! grep -q 'name: openai-oauth-2' /tmp/rendered-ai.yaml; then
+            echo "??? Rendered AI test manifests are missing the mock OpenAI OAuth service aliases."
+            exit 1
+          fi
+          if grep -q 'name: openai-oauth-secrets' /tmp/rendered-ai.yaml; then
+            echo "??? Rendered AI test manifests still include the real OpenAI OAuth secrets."
+            exit 1
+          fi
+          if grep -q '/var/lib/openai-oauth' /tmp/rendered-ai.yaml || grep -q 'openai-oauth-data' /tmp/rendered-ai.yaml; then
+            echo "??? Rendered AI test manifests still include the real OpenAI OAuth proxy runtime."
+            exit 1
+          fi
+          # Use existing filter script to transform namespace and handle PVCs
+          python3 scripts/filter_manifests.py /tmp/rendered-ai.yaml "${TEST_NS}" > /tmp/final-ai.yaml
+          # Apply to test namespace
+          kubectl apply -f /tmp/final-ai.yaml -n ${TEST_NS}
+
+      - name: Wait for pods
+        timeout-minutes: 5
+        run: |
+          echo "??? Waiting for LiteLLM deployment to be ready..."
+          kubectl wait --for=condition=available deployment/litellm -n ${TEST_NS} --timeout=4m
+          kubectl get pods -n ${TEST_NS}
+
+      - name: Run LiteLLM Integration Tests
+        run: |
+          echo "???? Running tests via robust port-forward..."
+          
+          LITELLM_POD=$(kubectl get pods -n ${TEST_NS} -l app=litellm -o jsonpath="{.items[0].metadata.name}")
+          if [ -z "$LITELLM_POD" ]; then
+            echo "??? Could not find litellm pod!"
+            exit 1
+          fi
+          
+          # Start port-forward in a background loop to make it resilient to temporary drops
+          (
+            while true; do
+              kubectl port-forward pod/$LITELLM_POD 4000:4000 -n ${TEST_NS}
+              sleep 1
+            done
+          ) &
+          PF_PID=$!
+          
+          # Wait for port-forward to be ready with a timeout
+          echo "??? Waiting for port-forward to establish..."
+          MAX_RETRIES=30
+          COUNT=0
+          until curl -s http://localhost:4000/v1/models > /dev/null; do
+            COUNT=$((COUNT+1))
+            if [ $COUNT -ge $MAX_RETRIES ]; then
+              echo "??? Port-forward failed to establish after 30 seconds"
+              kill $PF_PID
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "??? Port-forward established"
+          
+          # Run tests
+          LITELLM_URL="http://localhost:4000" npx tsx tests/litellm/test_proxy_endpoints.ts
+          TEST_EXIT=$?
+          
+          # Cleanup
+          kill $PF_PID || true
+          exit $TEST_EXIT
+
+      - name: Cleanup test namespace
+        if: always()
+        run: |
+          echo "???? Cleaning up test namespace..."
+          kubectl delete namespace ${TEST_NS} --wait=false || true
+
+  # Summary job
+  test-summary:
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]' || '["ubuntu-latest"]')) }}
+    needs: [changes, static-validation, tests, secrets-platform-tests, tofu-plan, vaultwarden-plan, cluster-dry-run, verify-plex-pre, integration-health, litellm-integration-test]
+    if: always() && needs.changes.outputs.runtime_k8s_changed == 'true'
+    steps:
+      - name: Generate Summary
+        run: |
+          # Generate GitHub Actions Job Summary for better visibility
+          echo "## ???? PR Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Test | Result |" >> $GITHUB_STEP_SUMMARY
+          echo "|------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Helper function to add result row with emoji
+          add_result() {
+            local name="$1"
+            local result="$2"
+            case "$result" in
+              success) echo "| $name | ??? Passed |" >> $GITHUB_STEP_SUMMARY ;;
+              failure) echo "| $name | ??? **Failed** |" >> $GITHUB_STEP_SUMMARY ;;
+              skipped) echo "| $name | ?????? Skipped |" >> $GITHUB_STEP_SUMMARY ;;
+              cancelled) echo "| $name | ???? Cancelled |" >> $GITHUB_STEP_SUMMARY ;;
+              *) echo "| $name | ??? $result |" >> $GITHUB_STEP_SUMMARY ;;
+            esac
+          }
+          
+          add_result "Plex Pre-Check" "${{ needs.verify-plex-pre.result }}"
+          add_result "Tests (Unit/Shellcheck)" "${{ needs.tests.result }}"
+          add_result "Static Validation" "${{ needs.static-validation.result }}"
+          add_result "Secrets Platform Tests" "${{ needs.secrets-platform-tests.result }}"
+          add_result "Opentofu Plan -input=false" "${{ needs.tofu-plan.result }}"
+          if [ "${{ needs.changes.outputs.vaultwarden_changed }}" = "true" ]; then
+            add_result "OpenTofu Plan (Vaultwarden)" "${{ needs.vaultwarden-plan.result }}"
+          fi
+          add_result "Cluster Dry-Run" "${{ needs.cluster-dry-run.result }}"
+          add_result "Integration Health Checks" "${{ needs.integration-health.result }}"
+          if [ "${{ needs.changes.outputs.ai_changed }}" = "true" ]; then
+            add_result "LiteLLM Integration Test" "${{ needs.litellm-integration-test.result }}"
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check results
+        run: |
+          echo "???? Test Summary"
+          echo "==============="
+          echo "Plex Pre-Check: ${{ needs.verify-plex-pre.result }}"
+          echo "Tests: ${{ needs.tests.result }}"
+          echo "Static Validation: ${{ needs.static-validation.result }}"
+          echo "Secrets Platform Tests: ${{ needs.secrets-platform-tests.result }}"
+          echo "Opentofu Plan -input=false: ${{ needs.tofu-plan.result }}"
+          if [ "${{ needs.changes.outputs.vaultwarden_changed }}" = "true" ]; then
+            echo "OpenTofu Plan (Vaultwarden): ${{ needs.vaultwarden-plan.result }}"
+          fi
+          echo "Cluster Dry-Run: ${{ needs.cluster-dry-run.result }}"
+          echo "Integration Health Checks: ${{ needs.integration-health.result }}"
+          if [ "${{ needs.changes.outputs.ai_changed }}" = "true" ]; then
+            echo "LiteLLM Integration Test: ${{ needs.litellm-integration-test.result }}"
+          fi
+          
+          FAILED=0
+          
+          # Plex pre-check MUST pass if it ran
+          if [ "${{ needs.verify-plex-pre.result }}" != "success" ] && [ "${{ needs.verify-plex-pre.result }}" != "skipped" ]; then
+            echo "??? Plex was not healthy before testing - cannot proceed"
+            echo "   ???? Tip: Check if Plex pod is running in the media namespace"
+            FAILED=1
+          fi
+
+          # Unit tests must pass
+          if [ "${{ needs.tests.result }}" != "success" ] && [ "${{ needs.tests.result }}" != "skipped" ]; then
+            echo "??? Unit tests failed - PR cannot be merged"
+            FAILED=1
+          fi
+
+          # Static validation must pass
+          if [ "${{ needs.static-validation.result }}" != "success" ] && [ "${{ needs.static-validation.result }}" != "skipped" ]; then
+            echo "??? Static validation failed - PR cannot be merged"
+            echo "Tip: Check YAML lint errors or kustomize build failures in static-validation logs"
+            FAILED=1
+          fi
+
+          # Secrets platform checks are required when secrets-platform files change
+          if [ "${{ needs.changes.outputs.secrets_platform }}" = "true" ]; then
+            if [ "${{ needs.secrets-platform-tests.result }}" != "success" ] && [ "${{ needs.secrets-platform-tests.result }}" != "skipped" ]; then
+              echo "ERROR: Secrets platform tests failed - PR cannot be merged"
+              FAILED=1
+            fi
+          fi
+
+          # Opentofu plan -input=false must pass if it ran
+          if [ "${{ needs.tofu-plan.result }}" = "failure" ]; then
+            echo "??? Opentofu plan -input=false failed - PR cannot be merged"
+            FAILED=1
+          fi
+
+          if [ "${{ needs.changes.outputs.vaultwarden_changed }}" = "true" ] && [ "${{ needs.vaultwarden-plan.result }}" = "failure" ]; then
+            echo "??? OpenTofu plan (Vaultwarden) failed - PR cannot be merged"
+            FAILED=1
+          fi
+
+          # Cluster dry-run must pass (or be skipped if runner unavailable)
+          if [ "${{ needs.cluster-dry-run.result }}" != "success" ] && [ "${{ needs.cluster-dry-run.result }}" != "skipped" ]; then
+            echo "??? Cluster dry-run failed - PR cannot be merged"
+            echo "   ???? Tip: Check if kubectl can connect to the cluster or if there are manifest errors"
+            FAILED=1
+          fi
+
+          # Integration health checks must pass (or be skipped if ArgoCD test skipped)
+          if [ "${{ needs.integration-health.result }}" = "failure" ]; then
+            echo "??? Integration health checks failed - PR cannot be merged"
+            FAILED=1
+          fi
+          
+          if [ "${{ needs.changes.outputs.ai_changed }}" = "true" ] && [ "${{ needs.litellm-integration-test.result }}" = "failure" ]; then
+            echo "??? LiteLLM integration test failed - PR cannot be merged"
+            FAILED=1
+          fi
+          
+          # Final verdict
+          if [ "$FAILED" = "1" ]; then
+            echo ""
+            echo "??? PR cannot be merged - see failures above"
+            echo "### ??? PR Tests Failed" >> $GITHUB_STEP_SUMMARY
+            echo "Please review the failed jobs above and fix the issues before merging." >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+
+          echo ""
+          echo "??? All required tests passed - PR is safe to merge"
+          echo "### ??? All Tests Passed" >> $GITHUB_STEP_SUMMARY
+          echo "This PR is safe to merge." >> $GITHUB_STEP_SUMMARY
+
+  # Layer 5: Final Cleanup (Always run, even if cancelled)
+  cleanup-stale-namespaces:
+    runs-on: ${{ fromJSON(((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || ((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }} # Force execution in-cluster when available; otherwise it safely no-ops
+    if: always() && needs.changes.outputs.runtime_k8s_changed == 'true'
+    needs: [changes, test-summary] # Ensures it runs after everything else tries to finish and can read change classification
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Run Cleanup
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          chmod +x scripts/cleanup-test-namespaces.sh
+          bash scripts/cleanup-test-namespaces.sh

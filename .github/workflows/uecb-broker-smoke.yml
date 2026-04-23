@@ -1,0 +1,269 @@
+name: UECB Broker Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      run_azure_functions:
+        description: Include Azure Functions backend smoke jobs
+        required: true
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  cloud_run_allocate:
+    name: UECB Smoke Allocate (cloud-run)
+    runs-on: home-gh-runner
+    outputs:
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      selected_backend: ${{ steps.allocate.outputs.selected_backend }}
+    env:
+      UECB_BROKER_URL: http://unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+    steps:
+      - name: Allocate runner
+        id: allocate
+        shell: bash
+        env:
+          REQUESTED_BACKEND: cloud-run
+        run: |
+          set -euo pipefail
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=uecb-broker")"
+          id_token="$(printf '%s' "${oidc_response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          request_body="$(python3 -c 'import json,os; print(json.dumps({"pool":"lite","backend":os.environ["REQUESTED_BACKEND"],"labels":["uecb-smoke"]}))')"
+          response_file="$(mktemp)"
+          http_status="$(curl -sS -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${id_token}" -H "Content-Type: application/json" -d "${request_body}" "${UECB_BROKER_URL}/v1/allocations")"
+          if [ "${http_status}" -lt 200 ] || [ "${http_status}" -ge 300 ]; then
+            echo "Broker allocation failed with HTTP ${http_status}" >&2
+            cat "${response_file}" >&2 || true
+            exit 1
+          fi
+          response="$(cat "${response_file}")"
+
+          echo "allocation_id=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+          echo "runner_label=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+          echo "selected_backend=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+
+  cloud_run_smoke:
+    name: UECB Smoke Run (cloud-run)
+    needs: [cloud_run_allocate]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ needs.cloud_run_allocate.outputs.runner_label }}
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "allocation_id=${{ needs.cloud_run_allocate.outputs.allocation_id }}"
+          echo "selected_backend=${{ needs.cloud_run_allocate.outputs.selected_backend }}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "CLOUD_RUN_JOB=${CLOUD_RUN_JOB:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "cloud-run" ]; then
+            echo "Expected UECB_PROVIDER=cloud-run, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${CLOUD_RUN_JOB:-}" ]; then
+            echo "Expected CLOUD_RUN_JOB on cloud-run-backed runner." >&2
+            exit 1
+          fi
+
+  codebuild_allocate:
+    name: UECB Smoke Allocate (codebuild)
+    runs-on: home-gh-runner
+    outputs:
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      selected_backend: ${{ steps.allocate.outputs.selected_backend }}
+    env:
+      UECB_BROKER_URL: http://unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+    steps:
+      - name: Allocate runner
+        id: allocate
+        shell: bash
+        env:
+          REQUESTED_BACKEND: codebuild
+        run: |
+          set -euo pipefail
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=uecb-broker")"
+          id_token="$(printf '%s' "${oidc_response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          request_body="$(python3 -c 'import json,os; print(json.dumps({"pool":"lite","backend":os.environ["REQUESTED_BACKEND"],"labels":["uecb-smoke"]}))')"
+          response_file="$(mktemp)"
+          http_status="$(curl -sS -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${id_token}" -H "Content-Type: application/json" -d "${request_body}" "${UECB_BROKER_URL}/v1/allocations")"
+          if [ "${http_status}" -lt 200 ] || [ "${http_status}" -ge 300 ]; then
+            echo "Broker allocation failed with HTTP ${http_status}" >&2
+            cat "${response_file}" >&2 || true
+            exit 1
+          fi
+          response="$(cat "${response_file}")"
+
+          echo "allocation_id=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+          echo "runner_label=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+          echo "selected_backend=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+
+  codebuild_smoke:
+    name: UECB Smoke Run (codebuild)
+    needs: [codebuild_allocate]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ needs.codebuild_allocate.outputs.runner_label }}
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "allocation_id=${{ needs.codebuild_allocate.outputs.allocation_id }}"
+          echo "selected_backend=${{ needs.codebuild_allocate.outputs.selected_backend }}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "CODEBUILD_BUILD_ID=${CODEBUILD_BUILD_ID:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "codebuild" ]; then
+            echo "Expected UECB_PROVIDER=codebuild, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${CODEBUILD_BUILD_ID:-}" ]; then
+            echo "Expected CODEBUILD_BUILD_ID on codebuild-backed runner." >&2
+            exit 1
+          fi
+
+  lambda_allocate:
+    name: UECB Smoke Allocate (lambda)
+    runs-on: home-gh-runner
+    outputs:
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      selected_backend: ${{ steps.allocate.outputs.selected_backend }}
+    env:
+      UECB_BROKER_URL: http://unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+    steps:
+      - name: Allocate runner
+        id: allocate
+        shell: bash
+        env:
+          REQUESTED_BACKEND: lambda
+        run: |
+          set -euo pipefail
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=uecb-broker")"
+          id_token="$(printf '%s' "${oidc_response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          request_body="$(python3 -c 'import json,os; print(json.dumps({"pool":"lite","backend":os.environ["REQUESTED_BACKEND"],"labels":["uecb-smoke"]}))')"
+          response_file="$(mktemp)"
+          http_status="$(curl -sS -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${id_token}" -H "Content-Type: application/json" -d "${request_body}" "${UECB_BROKER_URL}/v1/allocations")"
+          if [ "${http_status}" -lt 200 ] || [ "${http_status}" -ge 300 ]; then
+            echo "Broker allocation failed with HTTP ${http_status}" >&2
+            cat "${response_file}" >&2 || true
+            exit 1
+          fi
+          response="$(cat "${response_file}")"
+
+          echo "allocation_id=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+          echo "runner_label=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+          echo "selected_backend=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+
+  lambda_smoke:
+    name: UECB Smoke Run (lambda)
+    needs: [lambda_allocate]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ needs.lambda_allocate.outputs.runner_label }}
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "allocation_id=${{ needs.lambda_allocate.outputs.allocation_id }}"
+          echo "selected_backend=${{ needs.lambda_allocate.outputs.selected_backend }}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "AWS_LAMBDA_FUNCTION_NAME=${AWS_LAMBDA_FUNCTION_NAME:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "lambda" ]; then
+            echo "Expected UECB_PROVIDER=lambda, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${AWS_LAMBDA_FUNCTION_NAME:-}" ]; then
+            echo "Expected AWS_LAMBDA_FUNCTION_NAME on lambda-backed runner." >&2
+            exit 1
+          fi
+
+  azure_functions_allocate:
+    name: UECB Smoke Allocate (azure-functions)
+    if: ${{ inputs.run_azure_functions && ((vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true') == 'true') && (secrets.GITOPS_PAT != '' || secrets.GH_ADMIN_TOKEN != '') }}
+    runs-on: home-gh-runner
+    outputs:
+      allocation_id: ${{ steps.allocate.outputs.allocation_id }}
+      runner_label: ${{ steps.allocate.outputs.runner_label }}
+      selected_backend: ${{ steps.allocate.outputs.selected_backend }}
+    env:
+      UECB_BROKER_URL: http://unified-ephemeral-runner-broker.arc-systems.svc.cluster.local:8080
+    steps:
+      - name: Allocate runner
+        id: allocate
+        shell: bash
+        env:
+          REQUESTED_BACKEND: azure-functions
+        run: |
+          set -euo pipefail
+
+          oidc_response="$(curl -fsSL -H "Authorization: bearer ${ACTIONS_ID_TOKEN_REQUEST_TOKEN}" "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=uecb-broker")"
+          id_token="$(printf '%s' "${oidc_response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['value'])")"
+          request_body="$(python3 -c 'import json,os; print(json.dumps({"pool":"lite","backend":os.environ["REQUESTED_BACKEND"],"labels":["uecb-smoke"]}))')"
+          response_file="$(mktemp)"
+          http_status="$(curl -sS -o "${response_file}" -w '%{http_code}' -H "Authorization: Bearer ${id_token}" -H "Content-Type: application/json" -d "${request_body}" "${UECB_BROKER_URL}/v1/allocations")"
+          if [ "${http_status}" -lt 200 ] || [ "${http_status}" -ge 300 ]; then
+            echo "Broker allocation failed with HTTP ${http_status}" >&2
+            cat "${response_file}" >&2 || true
+            exit 1
+          fi
+          response="$(cat "${response_file}")"
+
+          echo "allocation_id=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['allocation_id'])")" >> "${GITHUB_OUTPUT}"
+          echo "runner_label=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['runner_label'])")" >> "${GITHUB_OUTPUT}"
+          echo "selected_backend=$(printf '%s' "${response}" | python3 -c "import json,sys; print(json.load(sys.stdin)['selected_backend'])")" >> "${GITHUB_OUTPUT}"
+
+  azure_functions_smoke:
+    name: UECB Smoke Run (azure-functions)
+    if: ${{ inputs.run_azure_functions && ((vars.ENABLE_AZURE_VM_RUNNERS != '' && vars.ENABLE_AZURE_VM_RUNNERS || 'true') == 'true') && (secrets.GITOPS_PAT != '' || secrets.GH_ADMIN_TOKEN != '') }}
+    needs: [azure_functions_allocate]
+    runs-on:
+      - self-hosted
+      - linux
+      - x64
+      - ${{ needs.azure_functions_allocate.outputs.runner_label }}
+    steps:
+      - name: Assert provider identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "allocation_id=${{ needs.azure_functions_allocate.outputs.allocation_id }}"
+          echo "selected_backend=${{ needs.azure_functions_allocate.outputs.selected_backend }}"
+          echo "runner_name=${RUNNER_NAME:-unknown}"
+          echo "UECB_PROVIDER=${UECB_PROVIDER:-unset}"
+          echo "WEBSITE_SITE_NAME=${WEBSITE_SITE_NAME:-unset}"
+
+          if [ "${UECB_PROVIDER:-}" != "azure-functions" ]; then
+            echo "Expected UECB_PROVIDER=azure-functions, got ${UECB_PROVIDER:-unset}" >&2
+            exit 1
+          fi
+
+          if [ -z "${WEBSITE_SITE_NAME:-}" ]; then
+            echo "Expected WEBSITE_SITE_NAME on azure-functions-backed runner." >&2
+            exit 1
+          fi

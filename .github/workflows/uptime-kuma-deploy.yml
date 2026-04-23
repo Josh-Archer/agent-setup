@@ -1,0 +1,347 @@
+name: Deploy Uptime Kuma (App Engine)
+
+# Deploys Uptime Kuma 2.x to GCP App Engine Standard (Node.js 24, F1 free tier).
+# Runtime data plane: sqlite recovery mode on /tmp with a Secret Manager-backed
+# bootstrap admin password plus generated monitor seeds from the repo's health
+# target inventory.
+#
+# Legacy credential lifecycle â€” still managed by OpenTofu for manual recovery
+# experiments, but not consumed by the sqlite recovery runtime:
+#   random_password  â†’  GCP Secret Manager (DATABASE_URL)
+#                    â†’  optional infra job output consumed by provision-db
+#
+# End-to-end flow:
+#   1. tofu apply â†’ App Engine infra + bootstrap secrets
+#   2. optional provision-db: psql against Azure Postgres for manual testing only
+#   3. deploy: clone Uptime Kuma 2.x â†’ build â†’ generate monitor seeds â†’ gcloud app deploy
+#
+# Shared Cloudflare edge resources for status.archer.casa are currently owned by
+# the broader main deploy path (deploy.yml -> terraform/homelab against the
+# shared Cloudflare state). This workflow intentionally avoids applying that
+# shared state directly because it includes unrelated providers/resources.
+#
+# Required GitHub secrets (pre-existing â€” not managed here):
+#   GOOGLE_CREDENTIALS            â€” GCP service account JSON
+#   AZURE_POSTGRES_PASSWORD       â€” homelabdb admin password (only needed if the
+#                                   legacy PostgreSQL provisioning job is enabled)
+#   R2_ACCESS_KEY_ID / R2_SECRET_ACCESS_KEY
+#   TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE
+#
+# Required GitHub vars:
+#   GCP_PROJECT_ID
+#
+# Note: UPTIME_KUMA_DB_PASSWORD is only used by the optional legacy PostgreSQL
+# provisioning job.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'apps/uptime-kuma/**'
+      - 'terraform/uptime-kuma-app-engine/**'
+      - '.github/workflows/uptime-kuma-deploy.yml'
+  workflow_dispatch:
+    inputs:
+      uptime_kuma_version:
+        description: 'Uptime Kuma 2.x git tag to deploy (e.g. 2.0.2)'
+        required: false
+        default: '2.0.2'
+      skip_infra:
+        description: 'Skip OpenTofu infra step (app code deploy only)'
+        type: boolean
+        required: false
+        default: false
+      skip_db_provision:
+        description: 'Skip Azure Postgres provisioning (DB already exists)'
+        type: boolean
+        required: false
+        default: false
+      enable_legacy_postgres:
+        description: 'Run the legacy Azure Postgres provisioning path for manual recovery testing'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  UPTIME_KUMA_VERSION: ${{ inputs.uptime_kuma_version || '2.0.2' }}
+  AZURE_POSTGRES_HOST: homelabdb.postgres.database.azure.com
+  AZURE_POSTGRES_ADMIN_USER: homelabdbadmin
+  UPTIME_KUMA_DB_NAME: uptime_kuma
+  UPTIME_KUMA_DB_USER: uptime_kuma
+
+concurrency:
+  group: uptime-kuma-deploy
+  cancel-in-progress: false
+
+jobs:
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # Job 1: Apply OpenTofu infrastructure
+  #   - App Engine + Secret Manager bootstrap secrets
+  #   - Still emits the legacy UPTIME_KUMA_DB_PASSWORD output for the optional
+  #     manual PostgreSQL provisioning job below
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  infra:
+    name: OpenTofu Apply (Uptime Kuma Infra)
+    if: inputs.skip_infra != true
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || '["ubuntu-latest"]') }}
+    environment:
+      name: production
+    outputs:
+      db_password: ${{ steps.export_db_password.outputs.db_password }}
+    concurrency:
+      group: tofu-uptime-kuma
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_enable_github_actions_secrets_sync: 'false'
+      TF_VAR_github_repository: ${{ github.event.repository.name }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+      # --- uptime-kuma-app-engine module ---
+
+      - name: Inject encryption passphrase
+        working-directory: terraform/uptime-kuma-app-engine
+        run: |
+          sed -i 's/# Passphrase to be provided via TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE/passphrase = "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}"/g' backend.tf
+
+      - name: OpenTofu init (uptime-kuma-app-engine)
+        working-directory: terraform/uptime-kuma-app-engine
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: uptime-kuma-app-engine/terraform.tfstate
+        run: bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu apply (uptime-kuma-app-engine)
+        working-directory: terraform/uptime-kuma-app-engine
+        # This apply creates App Engine infra plus the Secret Manager-backed
+        # DATABASE_URL. The generated DB password is exported in the next step.
+        run: timeout 15m tofu apply -input=false -auto-approve -lock-timeout=60s
+
+      - name: Export generated DB password
+        id: export_db_password
+        working-directory: terraform/uptime-kuma-app-engine
+        shell: bash
+        run: |
+          DB_PASSWORD_FILE="$RUNNER_TEMP/db_password.txt"
+          tofu output -raw db_password > "$DB_PASSWORD_FILE"
+
+          IFS= read -r DB_PASSWORD < "$DB_PASSWORD_FILE" || [ -n "$DB_PASSWORD" ]
+          DB_PASSWORD="${DB_PASSWORD%$'\r'}"
+
+          echo "::add-mask::${DB_PASSWORD}"
+          printf 'db_password=%s\n' "${DB_PASSWORD}" >> "$GITHUB_OUTPUT"
+
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # Job 2: Provision Azure Postgres role + database
+  #   This is legacy/manual only. The App Engine sqlite recovery runtime does
+  #   not consume Azure Postgres for live monitor state.
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  provision-db:
+    name: Provision Azure Postgres DB
+    needs: infra
+    if: |
+      always() &&
+      (needs.infra.result == 'success' || needs.infra.result == 'skipped') &&
+      github.event_name == 'workflow_dispatch' &&
+      inputs.enable_legacy_postgres == true &&
+      inputs.skip_db_provision != true
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || '["ubuntu-latest"]') }}
+    environment:
+      name: production
+
+    steps:
+      - name: Install psql client
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq postgresql-client
+
+      - name: Provision uptime_kuma role + database (idempotent)
+        env:
+          PGPASSWORD: ${{ secrets.AZURE_POSTGRES_PASSWORD }}
+          UK_DB_PASSWORD: ${{ needs.infra.outputs.db_password }}
+        run: |
+          set -euo pipefail
+
+          PSQL="psql -h ${AZURE_POSTGRES_HOST} -U ${AZURE_POSTGRES_ADMIN_USER} -p 5432 --set=sslmode=require"
+
+          echo "Ensuring role '${UPTIME_KUMA_DB_USER}' exists..."
+          $PSQL -d postgres -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = '${UPTIME_KUMA_DB_USER}') THEN
+                CREATE ROLE ${UPTIME_KUMA_DB_USER} WITH LOGIN PASSWORD '${UK_DB_PASSWORD}';
+                RAISE NOTICE 'Created role ${UPTIME_KUMA_DB_USER}.';
+              ELSE
+                ALTER ROLE ${UPTIME_KUMA_DB_USER} WITH PASSWORD '${UK_DB_PASSWORD}';
+                RAISE NOTICE 'Role ${UPTIME_KUMA_DB_USER} already exists â€” password synced.';
+              END IF;
+            END
+            \$\$;
+          "
+
+          echo "Ensuring database '${UPTIME_KUMA_DB_NAME}' exists..."
+          DB_EXISTS=$($PSQL -d postgres -tAc "SELECT 1 FROM pg_database WHERE datname='${UPTIME_KUMA_DB_NAME}'")
+          if [ "${DB_EXISTS}" != "1" ]; then
+            $PSQL -d postgres -c "CREATE DATABASE ${UPTIME_KUMA_DB_NAME} OWNER ${UPTIME_KUMA_DB_USER};"
+            echo "Database '${UPTIME_KUMA_DB_NAME}' created."
+          else
+            echo "Database '${UPTIME_KUMA_DB_NAME}' already exists â€” skipping."
+          fi
+
+          echo "Granting privileges..."
+          $PSQL -d "${UPTIME_KUMA_DB_NAME}" -c "
+            GRANT ALL PRIVILEGES ON DATABASE ${UPTIME_KUMA_DB_NAME} TO ${UPTIME_KUMA_DB_USER};
+            ALTER DATABASE ${UPTIME_KUMA_DB_NAME} OWNER TO ${UPTIME_KUMA_DB_USER};
+          "
+
+          echo "Azure Postgres provisioning complete."
+
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  # Job 3: Build Uptime Kuma 2.x + deploy to App Engine
+  # â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+  deploy:
+    name: Build + Deploy (gcloud app deploy)
+    needs: [infra, provision-db]
+    if: |
+      always() &&
+      (needs.infra.result == 'success' || needs.infra.result == 'skipped') &&
+      (needs.provision-db.result == 'success' || needs.provision-db.result == 'skipped')
+    runs-on: ${{ fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || ((vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && '["home-gh-runner"]') || '["ubuntu-latest"]') }}
+    environment:
+      name: production
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Node.js 24
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+
+      - name: Install repo dependencies for monitor seed generation
+        run: npm ci
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+      - name: Clone Uptime Kuma ${{ env.UPTIME_KUMA_VERSION }}
+        run: |
+          git clone --depth 1 --branch "${{ env.UPTIME_KUMA_VERSION }}" \
+            https://github.com/louislam/uptime-kuma.git /tmp/uk-build
+
+      - name: Install all dependencies (dev included for build step)
+        working-directory: /tmp/uk-build
+        run: npm ci
+
+      - name: Add @google-cloud/secret-manager runtime dependency
+        working-directory: /tmp/uk-build
+        run: npm install --save @google-cloud/secret-manager
+
+      - name: Build Uptime Kuma (frontend + backend)
+        working-directory: /tmp/uk-build
+        run: npm run build
+
+      - name: Remove dev dependencies (keep only production)
+        working-directory: /tmp/uk-build
+        run: npm prune --production
+
+      - name: Resolve actual server start command from package.json
+        id: entry
+        working-directory: /tmp/uk-build
+        run: |
+          ENTRY=$(node "${GITHUB_WORKSPACE}/apps/uptime-kuma/start-command.js" ./package.json 2>/dev/null || echo "dist/main.js")
+          echo "path=${ENTRY}" >> "$GITHUB_OUTPUT"
+          echo "Resolved start command: ${ENTRY}"
+
+      - name: Generate bootstrap monitor seeds from health inventory
+        env:
+          ZERO_TRUST_HEADERS_JSON: ${{ secrets.ZERO_TRUST_HEADERS_JSON }}
+          ZERO_TRUST_COOKIES_JSON: ${{ secrets.ZERO_TRUST_COOKIES_JSON }}
+        run: |
+          node --import tsx "${GITHUB_WORKSPACE}/scripts/build-uptime-kuma-monitors.js" /tmp/uk-build/uptime-kuma-monitors.json
+
+      - name: Copy App Engine config and inject runtime values
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+        run: |
+          cp apps/uptime-kuma/app.yaml       /tmp/uk-build/app.yaml
+          cp apps/uptime-kuma/gae-server.js  /tmp/uk-build/gae-server.js
+          cp apps/uptime-kuma/bootstrap-monitor-contract.js /tmp/uk-build/bootstrap-monitor-contract.js
+          cp apps/uptime-kuma/sqlite-bootstrap.js /tmp/uk-build/sqlite-bootstrap.js
+          cp apps/uptime-kuma/start-command.js /tmp/uk-build/start-command.js
+          cp apps/uptime-kuma/.gcloudignore  /tmp/uk-build/.gcloudignore
+
+          sed -i "s/PLACEHOLDER_PROJECT/${GCP_PROJECT}/g" /tmp/uk-build/app.yaml
+          sed -i "s/PLACEHOLDER_NTFY_TOPIC/homelab-alerts/g" /tmp/uk-build/app.yaml
+          sed -i "s/PLACEHOLDER_NTFY_TOKEN/${{ secrets.NTFY_TOKEN }}/g" /tmp/uk-build/app.yaml
+          sed -i "s|UK_ENTRY_POINT: \"dist/main.js\"|UK_ENTRY_POINT: \"${{ steps.entry.outputs.path }}\"|g" \
+            /tmp/uk-build/app.yaml
+
+      - name: Deploy to App Engine Standard
+        working-directory: /tmp/uk-build
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+        run: |
+          gcloud app deploy app.yaml \
+            --project="${GCP_PROJECT}" \
+            --quiet \
+            --promote \
+            --stop-previous-version
+
+      - name: Verify deployment health
+        env:
+          GCP_PROJECT: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+        run: |
+          echo "Waiting 30s for App Engine to become ready..."
+          sleep 30
+          STATUS=$(gcloud app versions list \
+            --project="${GCP_PROJECT}" \
+            --service=default \
+            --format="value(SERVING_STATUS)" \
+            --sort-by="~LAST_DEPLOYED" \
+            --limit=1)
+          if [ "${STATUS}" != "SERVING" ]; then
+            echo "::error::App Engine version not SERVING (got: ${STATUS})"
+            exit 1
+          fi
+          echo "::notice::Uptime Kuma 2.x deployed â€” https://status.archer.casa"
+

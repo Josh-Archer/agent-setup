@@ -1,0 +1,118 @@
+name: Runner Selector
+
+on:
+  workflow_call:
+    outputs:
+      runner-label:
+        description: "JSON encoded runs-on labels"
+        value: ${{ jobs.select-runner.outputs.runner-label }}
+      dispatch-label:
+        description: "JSON encoded labels for dispatching/control tasks (prioritizes self-hosted)"
+        value: ${{ jobs.select-runner.outputs.dispatch-label }}
+      provider-mode:
+        description: "Resolved runner provider mode"
+        value: ${{ jobs.select-runner.outputs.provider-mode }}
+      runner-description:
+        description: "Human-readable description of resolved runner"
+        value: ${{ jobs.select-runner.outputs.runner-description }}
+
+jobs:
+  select-runner:
+    # Keep provider selection off GitHub-hosted minutes so the control plane
+    # still works when billing caps or free-tier exhaustion block hosted jobs.
+    runs-on: home-gh-runner
+    outputs:
+      runner-label: ${{ steps.set-runner.outputs.runner-label }}
+      dispatch-label: ${{ steps.set-runner.outputs.dispatch-label }}
+      provider-mode: ${{ steps.set-runner.outputs.provider-mode }}
+      runner-description: ${{ steps.set-runner.outputs.runner-description }}
+    steps:
+      - name: Determine Runner
+        id: set-runner
+        shell: bash
+        env:
+          RUNNER_PROVIDER_MODE: ${{ vars.RUNNER_PROVIDER_MODE }}
+          USE_SELF_HOSTED: ${{ vars.USE_SELF_HOSTED }}
+          USE_AWS_CODEBUILD_RUNNERS: ${{ vars.USE_AWS_CODEBUILD_RUNNERS }}
+          AWS_CODEBUILD_RUNNER_PROJECT: ${{ vars.AWS_CODEBUILD_RUNNER_PROJECT }}
+          USE_AZURE_PIPELINES: ${{ vars.USE_AZURE_PIPELINES }}
+          GITHUB_RUN_ID_VALUE: ${{ github.run_id }}
+          GITHUB_RUN_ATTEMPT_VALUE: ${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+
+          is_true() {
+            case "${1:-}" in
+              true|True|TRUE|1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          provider_mode="${RUNNER_PROVIDER_MODE:-}"
+
+          # Fallback logic if primary mode is not active or missing
+          if [ "${provider_mode}" = "azure-pipelines" ] && ! is_true "${USE_AZURE_PIPELINES:-false}"; then
+            echo "⚠️ Azure Pipelines is requested but USE_AZURE_PIPELINES is false. Falling back."
+            provider_mode=""
+          fi
+
+          if [ "${provider_mode}" = "codebuild" ] && ! is_true "${USE_AWS_CODEBUILD_RUNNERS:-false}"; then
+            echo "⚠️ CodeBuild is requested but USE_AWS_CODEBUILD_RUNNERS is false. Falling back."
+            provider_mode=""
+          fi
+
+          if [ -z "${provider_mode}" ]; then
+            if is_true "${USE_AWS_CODEBUILD_RUNNERS:-}" && [ -n "${AWS_CODEBUILD_RUNNER_PROJECT:-}" ]; then
+              provider_mode="codebuild"
+            elif is_true "${USE_AZURE_PIPELINES:-}"; then
+              provider_mode="azure-pipelines"
+            elif is_true "${USE_SELF_HOSTED:-}"; then
+              provider_mode="self-hosted"
+            else
+              provider_mode="github-hosted"
+            fi
+          fi
+
+          runner_label='["ubuntu-latest"]'
+          runner_description='github-hosted:ubuntu-latest'
+
+          case "${provider_mode}" in
+            codebuild)
+              if [ -n "${AWS_CODEBUILD_RUNNER_PROJECT:-}" ]; then
+                runner_label="[\"codebuild-${AWS_CODEBUILD_RUNNER_PROJECT}-${GITHUB_RUN_ID_VALUE}-${GITHUB_RUN_ATTEMPT_VALUE}\",\"job-select-runner\"]"
+                runner_description="aws-codebuild:${AWS_CODEBUILD_RUNNER_PROJECT}"
+              else
+                provider_mode="github-hosted"
+              fi
+              ;;
+            self-hosted)
+              runner_label='["home-gh-runner"]'
+              runner_description='self-hosted:home-gh-runner'
+              ;;
+            azure-pipelines)
+              # Azure mode keeps repo jobs on the normal labels, but controller/dispatch work
+              # is routed through dispatch-label so we can queue Azure without burning hosted minutes.
+              runner_label='["ubuntu-latest"]'
+              runner_description='azure-pipelines:controller'
+              ;;
+            github-hosted)
+              ;;
+            *)
+              provider_mode="github-hosted"
+              ;;
+          esac
+
+          # Resolve dispatch runner (prioritize self-hosted if available)
+          dispatch_label='["ubuntu-latest"]'
+          if [ "${provider_mode}" = "self-hosted" ] || [ "${provider_mode}" = "azure-pipelines" ] || is_true "${USE_SELF_HOSTED:-}"; then
+             dispatch_label='["home-gh-runner"]'
+          fi
+
+          echo "runner-label=${runner_label}" >> "$GITHUB_OUTPUT"
+          echo "dispatch-label=${dispatch_label}" >> "$GITHUB_OUTPUT"
+          echo "provider-mode=${provider_mode}" >> "$GITHUB_OUTPUT"
+          echo "runner-description=${runner_description}" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved provider mode: ${provider_mode}"
+          echo "Resolved runner labels: ${runner_label}"
+          echo "Resolved runner description: ${runner_description}"

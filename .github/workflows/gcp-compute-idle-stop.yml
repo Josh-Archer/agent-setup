@@ -1,0 +1,118 @@
+name: GCP Compute Idle Stop
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_stop:
+        description: Stop the VM immediately without checking the idle threshold
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gcp-compute-idle-stop
+  cancel-in-progress: false
+
+jobs:
+  stop-when-idle:
+    runs-on: home-gh-runner
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      INSTANCE_NAME: ${{ vars.GCP_COMPUTE_BUILD_INSTANCE_NAME != '' && vars.GCP_COMPUTE_BUILD_INSTANCE_NAME || 'home-gcp-build-runner' }}
+      INSTANCE_ZONE: ${{ vars.GCP_COMPUTE_BUILD_INSTANCE_ZONE != '' && vars.GCP_COMPUTE_BUILD_INSTANCE_ZONE || 'us-central1-a' }}
+      RUNNER_LABEL: ${{ vars.GCP_COMPUTE_BUILD_RUNNER_LABEL != '' && vars.GCP_COMPUTE_BUILD_RUNNER_LABEL || 'gcp-build-runner' }}
+      IDLE_MINUTES: ${{ vars.GCP_COMPUTE_IDLE_STOP_MINUTES != '' && vars.GCP_COMPUTE_IDLE_STOP_MINUTES || '30' }}
+      REPOSITORY: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Evaluate instance state
+        id: evaluate
+        shell: bash
+        env:
+          FORCE_STOP: ${{ inputs.force_stop && 'true' || 'false' }}
+        run: |
+          set -euo pipefail
+
+          instance_file="$(mktemp)"
+          runners_file="$(mktemp)"
+          runs_file="$(mktemp)"
+          trap 'rm -f "${instance_file}" "${runners_file}" "${runs_file}"' EXIT
+
+          gcloud compute instances describe "${INSTANCE_NAME}" \
+            --project "${PROJECT_ID}" \
+            --zone "${INSTANCE_ZONE}" \
+            --format=json > "${instance_file}"
+
+          instance_status="$(python3 -c 'import json, sys; payload = json.load(open(sys.argv[1], encoding="utf-8")); print(payload.get("status", ""))' "${instance_file}")"
+
+          if [ "${instance_status}" != "RUNNING" ]; then
+            echo "should_stop=false" >> "$GITHUB_OUTPUT"
+            echo "reason=instance-not-running" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh api "repos/${REPOSITORY}/actions/runners?per_page=100" > "${runners_file}"
+          runner_state="$(python3 -c 'import json, sys; payload = json.load(open(sys.argv[1], encoding="utf-8")); runner_label = sys.argv[2]; states = [("busy" if bool(runner.get("busy")) else "idle") for runner in payload.get("runners", []) if runner_label in {label.get("name") for label in runner.get("labels", [])} and str(runner.get("status", "")).lower() == "online"]; print(states[0] if states else "offline")' "${runners_file}" "${RUNNER_LABEL}")"
+
+          if [ "${runner_state}" = "busy" ]; then
+            echo "should_stop=false" >> "$GITHUB_OUTPUT"
+            echo "reason=runner-busy" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          gh api "repos/${REPOSITORY}/actions/workflows/gcp-compute-remote-build.yml/runs?event=workflow_dispatch&per_page=20" > "${runs_file}"
+          active_workflow_runs="$(python3 -c 'import json, sys; payload = json.load(open(sys.argv[1], encoding="utf-8")); print(sum(1 for workflow_run in payload.get("workflow_runs", []) if str(workflow_run.get("status", "")).lower() != "completed"))' "${runs_file}")"
+
+          if [ "${active_workflow_runs}" != "0" ]; then
+            echo "should_stop=false" >> "$GITHUB_OUTPUT"
+            echo "reason=workflow-run-active" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          last_build_at="$(python3 -c 'import json, sys; payload = json.load(open(sys.argv[1], encoding="utf-8")); metadata = payload.get("metadata", {}).get("items", []); print(next((item.get("value", "") for item in metadata if item.get("key") == "home-last-build-at"), payload.get("lastStartTimestamp", "")))' "${instance_file}")"
+
+          idle_minutes="$(python3 -c 'from datetime import datetime, timezone; import sys; value = sys.argv[1].strip(); print(999999 if not value else max(0, int((datetime.now(timezone.utc) - datetime.fromisoformat(value.replace("Z", "+00:00")).astimezone(timezone.utc)).total_seconds() // 60)))' "${last_build_at}" 2>/dev/null || echo 999999)"
+
+          if [ "${FORCE_STOP}" = "true" ] || [ "${idle_minutes}" -ge "${IDLE_MINUTES}" ]; then
+            echo "should_stop=true" >> "$GITHUB_OUTPUT"
+            echo "reason=idle-threshold-met" >> "$GITHUB_OUTPUT"
+            echo "idle_minutes=${idle_minutes}" >> "$GITHUB_OUTPUT"
+          else
+            echo "should_stop=false" >> "$GITHUB_OUTPUT"
+            echo "reason=idle-threshold-not-met" >> "$GITHUB_OUTPUT"
+            echo "idle_minutes=${idle_minutes}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Stop instance
+        if: steps.evaluate.outputs.should_stop == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gcloud compute instances stop "${INSTANCE_NAME}" \
+            --project "${PROJECT_ID}" \
+            --zone "${INSTANCE_ZONE}"
+
+      - name: Report outcome
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "should_stop=${{ steps.evaluate.outputs.should_stop }}"
+          echo "reason=${{ steps.evaluate.outputs.reason }}"
+          echo "idle_minutes=${{ steps.evaluate.outputs.idle_minutes }}"

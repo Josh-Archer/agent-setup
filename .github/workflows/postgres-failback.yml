@@ -1,0 +1,114 @@
+name: Postgres Failback — Azure → Cluster
+
+on:
+  workflow_dispatch:
+    inputs:
+      confirm:
+        description: 'Type FAILBACK to confirm'
+        required: true
+        default: ""
+
+jobs:
+  failback:
+    name: Azure → Cluster
+    runs-on: self-hosted
+    if: github.event.inputs.confirm == 'FAILBACK'
+    env:
+      AZURE_PG_HOST:   homelabdb.postgres.database.azure.com
+      CLUSTER_PG_HOST: consolidated-postgres.infra.svc.cluster.local
+      CLUSTER_PG_NS:   infra
+    steps:
+      - name: Checkout (with push credentials)
+        uses: actions/checkout@v6
+        with:
+          token: ${{ secrets.GITOPS_PAT }}
+          persist-credentials: true
+
+      - name: Ensure postgres-backup-pvc exists
+        run: |
+          if ! kubectl get pvc postgres-backup-pvc -n ${{ env.CLUSTER_PG_NS }} &>/dev/null; then
+            kubectl apply -f grok-servaar/infra/postgres-backup-pvc.yaml
+          fi
+
+      - name: Scale consolidated-postgres to 1 replica
+        run: |
+          kubectl scale deployment consolidated-postgres -n ${{ env.CLUSTER_PG_NS }} --replicas=1
+          kubectl rollout status deployment/consolidated-postgres -n ${{ env.CLUSTER_PG_NS }} --timeout=120s
+
+      - name: Restore all databases from Azure to cluster postgres
+        env:
+          AZURE_ADMIN_PASSWORD: ${{ secrets.AZURE_POSTGRES_PASSWORD }}
+          CLUSTER_PG_PASSWORD:  ${{ secrets.CONSOLIDATED_POSTGRES_PASSWORD }}
+        run: |
+          kubectl run postgres-failback-restore \
+            --rm -i --restart=Never \
+            --image=postgres:18-alpine \
+            --overrides='{"spec":{"nodeSelector":{"kubernetes.io/hostname":"mac-worker"}}}' \
+            --env="AZURE_HOST=${{ env.AZURE_PG_HOST }}" \
+            --env="AZURE_ADMIN_PASSWORD=${AZURE_ADMIN_PASSWORD}" \
+            --env="CLUSTER_HOST=${{ env.CLUSTER_PG_HOST }}" \
+            --env="CLUSTER_PG_PASSWORD=${CLUSTER_PG_PASSWORD}" \
+            -- sh -c '
+          set -euo pipefail
+          DATABASES="
+            immich:immich vaultwarden:vaultwarden nextcloud:nextcloud
+            paperless:paperless pocket_id:pocket_id grafana:grafana
+            keycloak:keycloak jellyseerr:jellyseerr
+            sonarr_main:sonarr sonarr_log:sonarr
+            radarr_main:radarr radarr_log:radarr
+            readarr_hardcover_main:readarr readarr_hardcover_log:readarr
+            prowlarr_main:prowlarr prowlarr_log:prowlarr
+          "
+          for pair in $DATABASES; do
+            db="${pair%%:*}"; role="${pair##*:}"
+            echo "=== ${db} ==="
+            PGPASSWORD="${AZURE_ADMIN_PASSWORD}" pg_dump \
+              -h "${AZURE_HOST}" -U homelabdbadmin --format=custom --no-owner --no-acl \
+              "${db}" > "/tmp/${db}.dump"
+            PGPASSWORD="${CLUSTER_PG_PASSWORD}" psql \
+              -h "${CLUSTER_HOST}" -U postgres -d postgres \
+              -c "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname='"'"'${db}'"'"' AND pid<>pg_backend_pid();" >/dev/null 2>&1 || true
+            PGPASSWORD="${CLUSTER_PG_PASSWORD}" pg_restore \
+              -h "${CLUSTER_HOST}" -U postgres -d "${db}" \
+              --no-owner --no-acl --no-privileges --clean --if-exists --single-transaction \
+              "/tmp/${db}.dump"
+            PGPASSWORD="${CLUSTER_PG_PASSWORD}" psql \
+              -h "${CLUSTER_HOST}" -U postgres -d "${db}" \
+              -c "REASSIGN OWNED BY postgres TO \"${role}\";" >/dev/null 2>&1 || true
+            rm -f "/tmp/${db}.dump"
+            echo "  ${db} OK"
+          done
+          '
+
+      - name: Flip postgres service → cluster
+        run: |
+          python3 scripts/postgres-flip.py azure-to-cluster
+          git config user.email "postgres-flip@homelab.local"
+          git config user.name  "Postgres Flip Bot"
+          git add grok-servaar/infra/postgres-service.yaml
+          git add grok-servaar/media/jellyseerr/jellyseerr.yaml
+          git add grok-servaar/nextcloud/nextcloud-app-secret-externalsecret.yaml
+          git commit -m "infra: failback — postgres service → cluster"
+          git push origin main
+
+      - name: Un-suspend maintenance CronJobs
+        run: |
+          for job in postgres-backup postgres-restore-test postgres-reconcile-ownership; do
+            kubectl patch cronjob "${job}" -n ${{ env.CLUSTER_PG_NS }} \
+              --type=merge -p '{"spec":{"suspend":false}}'
+          done
+
+      - name: Restart apps that hold DB connections
+        run: |
+          # Force immediate reconnect — ArgoCD won't do this since the Deployment specs didn't change
+          for ns_dep in "media/immich-server" "media/immich-microservices" "auth/vaultwarden" "auth/pocket-id"; do
+            ns="${ns_dep%%/*}"; dep="${ns_dep##*/}"
+            kubectl rollout restart deployment "${dep}" -n "${ns}" 2>/dev/null || true
+          done
+          kubectl rollout restart statefulset keycloak -n auth 2>/dev/null || true
+          echo "Restart triggers sent."
+
+      - name: Done
+        run: |
+          echo "✅ Cluster postgres is live. Service patched immediately; ArgoCD will confirm on next sync."
+          echo "To go back to Azure: run postgres-failover."

@@ -1,0 +1,22 @@
+name: Renovate Auto-Merge
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+jobs:
+  auto-merge:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    if: github.actor == 'renovate[bot]'
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GH_ADMIN_TOKEN }}
+
+      - name: Auto-approve and Auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          gh pr review --approve "$PR_URL" || true
+          gh pr merge --auto --merge "$PR_URL"

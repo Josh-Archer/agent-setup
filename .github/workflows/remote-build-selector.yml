@@ -1,0 +1,144 @@
+name: Remote Build Selector
+
+on:
+  workflow_call:
+    outputs:
+      selected-provider:
+        description: "Selected remote build provider"
+        value: ${{ jobs.select-provider.outputs.selected-provider }}
+      execution-kind:
+        description: "Execution kind for the selected remote build provider"
+        value: ${{ jobs.select-provider.outputs.execution-kind }}
+      dispatch-label:
+        description: "Runner labels used for controller work"
+        value: ${{ jobs.select-provider.outputs.dispatch-label }}
+      runner-description:
+        description: "Human-readable description of the selected build provider"
+        value: ${{ jobs.select-provider.outputs.runner-description }}
+
+permissions:
+  contents: read
+
+jobs:
+  select-provider:
+    runs-on: home-gh-runner
+    outputs:
+      selected-provider: ${{ steps.resolve.outputs.selected-provider }}
+      execution-kind: ${{ steps.resolve.outputs.execution-kind }}
+      dispatch-label: ${{ steps.resolve.outputs.dispatch-label }}
+      runner-description: ${{ steps.resolve.outputs.runner-description }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+
+      - name: Resolve remote build provider
+        id: resolve
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+          ENABLE_CLOUD_RUN_BUILD_PROVIDER: ${{ vars.ENABLE_CLOUD_RUN_BUILD_PROVIDER }}
+          CLOUD_RUN_BUILD_DISPATCH_URL: ${{ vars.CLOUD_RUN_BUILD_DISPATCH_URL }}
+          CLOUD_RUN_BUILD_HEALTHCHECK_URL: ${{ vars.CLOUD_RUN_BUILD_HEALTHCHECK_URL }}
+          CLOUD_RUN_BUILD_DISPATCH_TOKEN: ${{ secrets.CLOUD_RUN_BUILD_DISPATCH_TOKEN }}
+          ENABLE_GCP_COMPUTE_BUILD_PROVIDER: ${{ vars.ENABLE_GCP_COMPUTE_BUILD_PROVIDER }}
+          GCP_COMPUTE_BUILD_RUNNER_LABEL: ${{ vars.GCP_COMPUTE_BUILD_RUNNER_LABEL }}
+          REMOTE_BUILD_LAST_PROVIDER: ${{ vars.REMOTE_BUILD_LAST_PROVIDER }}
+        run: |
+          set -euo pipefail
+
+          chmod +x scripts/build-provider-dispatch.sh
+
+          is_true() {
+            case "${1:-}" in
+              true|True|TRUE|1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          provider_ready() {
+            local provider_name="$1"
+            case "$provider_name" in
+              cloud-run)
+                is_true "${ENABLE_CLOUD_RUN_BUILD_PROVIDER:-false}" || return 1
+                [ -n "${CLOUD_RUN_BUILD_DISPATCH_URL:-}" ] || return 1
+                scripts/build-provider-dispatch.sh verify cloud-run >/dev/null
+                ;;
+              gcp-compute)
+                is_true "${ENABLE_GCP_COMPUTE_BUILD_PROVIDER:-false}" || return 1
+                [ -n "${GCP_COMPUTE_BUILD_RUNNER_LABEL:-}" ] || return 1
+                scripts/build-provider-dispatch.sh verify gcp-compute >/dev/null
+                ;;
+              *)
+                return 1
+                ;;
+            esac
+          }
+
+          cloud_run_ready="false"
+          gcp_compute_ready="false"
+
+          if provider_ready cloud-run; then
+            cloud_run_ready="true"
+          fi
+
+          if provider_ready gcp-compute; then
+            gcp_compute_ready="true"
+          fi
+
+          selected_provider=""
+          runner_description="remote-build:fallback-native"
+
+          if [ "${cloud_run_ready}" = "true" ] && [ "${gcp_compute_ready}" = "true" ]; then
+            case "${REMOTE_BUILD_LAST_PROVIDER:-}" in
+              cloud-run)
+                selected_provider="gcp-compute"
+                ;;
+              gcp-compute)
+                selected_provider="cloud-run"
+                ;;
+              *)
+                selected_provider="cloud-run"
+                ;;
+            esac
+          elif [ "${cloud_run_ready}" = "true" ]; then
+            selected_provider="cloud-run"
+          elif [ "${gcp_compute_ready}" = "true" ]; then
+            selected_provider="gcp-compute"
+          fi
+
+          execution_kind=""
+          dispatch_label='["home-gh-runner"]'
+
+          case "${selected_provider}" in
+            cloud-run)
+              execution_kind="remote-dispatch"
+              runner_description="cloud-run:controller"
+              ;;
+            gcp-compute)
+              execution_kind="remote-dispatch"
+              runner_description="gcp-compute:controller"
+              ;;
+            "")
+              ;;
+            *)
+              echo "Unexpected remote build provider: ${selected_provider}" >&2
+              exit 1
+              ;;
+          esac
+
+          if [ -n "${selected_provider}" ]; then
+            gh variable set REMOTE_BUILD_LAST_PROVIDER --body "${selected_provider}" || true
+          fi
+
+          echo "selected-provider=${selected_provider}" >> "$GITHUB_OUTPUT"
+          echo "execution-kind=${execution_kind}" >> "$GITHUB_OUTPUT"
+          echo "dispatch-label=${dispatch_label}" >> "$GITHUB_OUTPUT"
+          echo "runner-description=${runner_description}" >> "$GITHUB_OUTPUT"
+
+          echo "Resolved remote build provider: ${selected_provider:-fallback-native}"
+          echo "Cloud Run ready: ${cloud_run_ready}"
+          echo "GCP Compute ready: ${gcp_compute_ready}"
+          echo "Last provider: ${REMOTE_BUILD_LAST_PROVIDER:-unset}"

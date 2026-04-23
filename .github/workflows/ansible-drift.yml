@@ -1,0 +1,358 @@
+name: Ansible Drift Correction
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      ansible_args:
+        description: 'Extra arguments for ansible-playbook'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  drift-correction:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    env:
+      ANSIBLE_HOST_KEY_CHECKING: "False"
+      MAC_WORKER_SSH_USER: ubuntu
+      # Default enforcement covers nodes known to expose fan/pwm via hwmon.
+      # Override in workflow env/repo variables when additional nodes gain support.
+      REQUIRED_FAN_PWM_NODES: homelabpi
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: latest
+
+      - name: Setup Network Access
+        id: network_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+
+      - name: Configure SSH key
+        if: steps.network_access.outputs.configured != 'false' || runner.os == 'Linux'
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.HOMELAB_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -z "${SSH_PRIVATE_KEY}" ]; then
+            echo "HOMELAB_SSH_PRIVATE_KEY is not set."
+            exit 1
+          fi
+          SSH_DIR="${GITHUB_WORKSPACE}/ci_ssh"
+          mkdir -p "$SSH_DIR"
+          chmod 700 "$SSH_DIR"
+          printf '%s\n' "$SSH_PRIVATE_KEY" > "$SSH_DIR/id_ed25519"
+          chmod 600 "$SSH_DIR/id_ed25519"
+          touch "$SSH_DIR/known_hosts"
+
+          # Keep public key in lockstep with the private key used by Ansible.
+          SSH_PUBLIC_KEY="$(ssh-keygen -y -f "$SSH_DIR/id_ed25519")"
+          if [ -z "${SSH_PUBLIC_KEY}" ]; then
+            echo "Failed to derive SSH public key from HOMELAB_SSH_PRIVATE_KEY."
+            exit 1
+          fi
+          echo "SSH_PUBLIC_KEY=${SSH_PUBLIC_KEY}" >> "$GITHUB_ENV"
+
+      - name: Preflight NAS SSH access
+        if: steps.network_access.outputs.configured != 'false' || runner.os == 'Linux'
+        run: |
+          set -euo pipefail
+
+          SSH_DIR="${GITHUB_WORKSPACE}/ci_ssh"
+          NAS_HOST="$(awk '
+            BEGIN { in_nas = 0; in_nas_vars = 0 }
+            /^\[nas\]$/ { in_nas = 1; in_nas_vars = 0; next }
+            /^\[nas:vars\]$/ { in_nas = 0; in_nas_vars = 1; next }
+            /^\[/ { in_nas = 0; in_nas_vars = 0 }
+            in_nas && $1 == "nas" {
+              for (i = 1; i <= NF; i++) {
+                if ($i ~ /^ansible_host=/) {
+                  split($i, kv, "=")
+                  print kv[2]
+                  exit
+                }
+              }
+            }
+          ' ansible/inventory.ini)"
+          NAS_USER="$(awk '
+            BEGIN { in_nas = 0; in_nas_vars = 0 }
+            /^\[nas\]$/ { in_nas = 1; in_nas_vars = 0; next }
+            /^\[nas:vars\]$/ { in_nas = 0; in_nas_vars = 1; next }
+            /^\[/ { in_nas = 0; in_nas_vars = 0 }
+            in_nas && $1 == "nas" {
+              for (i = 1; i <= NF; i++) {
+                if ($i ~ /^ansible_user=/) {
+                  split($i, kv, "=")
+                  print kv[2]
+                  exit
+                }
+              }
+            }
+            in_nas_vars && $1 ~ /^ansible_user=/ {
+              split($1, kv, "=")
+              print kv[2]
+              exit
+            }
+          ' ansible/inventory.ini)"
+          NAS_USER="${NAS_USER:-root}"
+
+          if [ -z "${NAS_HOST}" ]; then
+            echo "Unable to resolve the NAS host from ansible/inventory.ini."
+            exit 1
+          fi
+
+          if [ ! -f "${SSH_DIR}/id_ed25519" ]; then
+            echo "SSH key file is missing at ${SSH_DIR}/id_ed25519."
+            exit 1
+          fi
+
+          echo "Verifying SSH access to ${NAS_USER}@${NAS_HOST} before running Ansible..."
+          if ! ssh \
+            -i "${SSH_DIR}/id_ed25519" \
+            -o BatchMode=yes \
+            -o ConnectTimeout=10 \
+            -o StrictHostKeyChecking=no \
+            -o UserKnownHostsFile="${SSH_DIR}/known_hosts" \
+            "${NAS_USER}@${NAS_HOST}" \
+            'true'; then
+            echo "NAS SSH preflight failed for ${NAS_USER}@${NAS_HOST}."
+            echo "Fix HOMELAB_SSH_PRIVATE_KEY or NAS access before the full playbook runs."
+            exit 1
+          fi
+
+      - name: Ensure mac-worker accepts current CI SSH key
+        if: steps.network_access.outputs.configured != 'false' || runner.os == 'Linux'
+        run: |
+          if [ -z "${SSH_PUBLIC_KEY}" ]; then
+            echo "HOMELAB_SSH_PUBLIC_KEY is not set."
+            exit 1
+          fi
+
+          kubectl -n kube-system delete pod mac-worker-ssh-key-fix --ignore-not-found=true --wait=false
+
+          cat <<EOF > /tmp/mac-worker-ssh-key-fix.yaml
+          apiVersion: v1
+          kind: Pod
+          metadata:
+            name: mac-worker-ssh-key-fix
+            namespace: kube-system
+          spec:
+            restartPolicy: Never
+            nodeSelector:
+              kubernetes.io/hostname: mac-worker
+            tolerations:
+              - operator: Exists
+            containers:
+              - name: fixer
+                image: alpine:3.20
+                securityContext:
+                  privileged: true
+                env:
+                  - name: SSH_PUBLIC_KEY
+                    value: |-
+                      ${SSH_PUBLIC_KEY}
+                  - name: MAC_WORKER_SSH_USER
+                    value: "${MAC_WORKER_SSH_USER}"
+                command: ["/bin/sh", "-c"]
+                args:
+                  - |
+                    set -eu
+                    target_home=""
+                    if [ -d "/host-home/\${MAC_WORKER_SSH_USER}" ]; then
+                      target_home="/host-home/\${MAC_WORKER_SSH_USER}"
+                    elif [ -d "/host-home/gawly" ]; then
+                      target_home="/host-home/gawly"
+                    elif [ -d "/host-home/ubuntu" ]; then
+                      target_home="/host-home/ubuntu"
+                    else
+                      fallback_user="\$(ls -1 /host-home 2>/dev/null | head -n1 || true)"
+                      if [ -n "\${fallback_user}" ] && [ -d "/host-home/\${fallback_user}" ]; then
+                        target_home="/host-home/\${fallback_user}"
+                      fi
+                    fi
+
+                    if [ -z "\${target_home}" ]; then
+                      echo "Unable to determine target home under /host-home"
+                      ls -la /host-home || true
+                      exit 1
+                    fi
+
+                    mkdir -p "\${target_home}/.ssh"
+                    touch "\${target_home}/.ssh/authorized_keys"
+                    grep -qxF "\${SSH_PUBLIC_KEY}" "\${target_home}/.ssh/authorized_keys" || echo "\${SSH_PUBLIC_KEY}" >> "\${target_home}/.ssh/authorized_keys"
+                    chmod 700 "\${target_home}/.ssh"
+                    chmod 600 "\${target_home}/.ssh/authorized_keys"
+                    echo "mac-worker authorized_keys updated at \${target_home}/.ssh/authorized_keys"
+                    sleep 2
+                volumeMounts:
+                  - name: host-home
+                    mountPath: /host-home
+            volumes:
+              - name: host-home
+                hostPath:
+                  path: /home
+                  type: Directory
+          EOF
+
+          kubectl apply -f /tmp/mac-worker-ssh-key-fix.yaml
+
+          phase=""
+          for i in $(seq 1 75); do
+            phase="$(kubectl -n kube-system get pod mac-worker-ssh-key-fix -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+            if [ "$phase" = "Running" ] || [ "$phase" = "Succeeded" ]; then
+              break
+            fi
+            if [ "$phase" = "Failed" ]; then
+              echo "mac-worker-ssh-key-fix pod failed"
+              kubectl -n kube-system describe pod mac-worker-ssh-key-fix || true
+              kubectl -n kube-system logs mac-worker-ssh-key-fix || true
+              exit 1
+            fi
+            sleep 2
+          done
+
+          if [ "$phase" != "Running" ] && [ "$phase" != "Succeeded" ]; then
+            echo "Timed out waiting for mac-worker-ssh-key-fix pod phase. Last phase: ${phase}"
+            kubectl -n kube-system describe pod mac-worker-ssh-key-fix || true
+            kubectl -n kube-system logs mac-worker-ssh-key-fix || true
+            exit 1
+          fi
+
+          kubectl -n kube-system logs mac-worker-ssh-key-fix
+          kubectl -n kube-system delete pod mac-worker-ssh-key-fix --wait=false
+
+      - name: Validate K3s Token presence
+        id: token_check
+        run: |
+          if [ -z "${{ secrets.K3S_TOKEN }}" ]; then
+            echo "K3S_TOKEN secret is missing. Mac worker drift correction will be skipped."
+            echo "skip_mac_worker=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip_mac_worker=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Notify missing K3s Token
+        if: steps.token_check.outputs.skip_mac_worker == 'true'
+        env:
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          NTFY_TOPIC: gha
+          NTFY_TITLE: "Ansible Drift Warning"
+          NTFY_PRIORITY: high
+          NTFY_TAGS: warning,mac
+          NTFY_MESSAGE: "K3S_TOKEN secret is missing in GitHub Actions. Mac worker drift correction is being skipped to prevent node degradation."
+        run: bash scripts/notify_ntfy.sh
+
+      - name: Run drift correction
+        env:
+          K3S_TOKEN: ${{ secrets.K3S_TOKEN }}
+          TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+        run: |
+          if [ -z "${SSH_PUBLIC_KEY}" ]; then
+            echo "HOMELAB_SSH_PUBLIC_KEY is not set."
+            exit 1
+          fi
+          max_attempts=4
+          for attempt in $(seq 1 ${max_attempts}); do
+            set +e
+            docker run --rm \
+              -v "${GITHUB_WORKSPACE}":/work \
+              -v "${GITHUB_WORKSPACE}/ci_ssh":/root/.ssh \
+              -e ANSIBLE_HOST_KEY_CHECKING=False \
+              -e ANSIBLE_TIMEOUT=30 \
+              -e ANSIBLE_SSH_RETRIES=10 \
+              -e SSH_PUBLIC_KEY="${SSH_PUBLIC_KEY}" \
+              -e K3S_TOKEN="${K3S_TOKEN}" \
+              -e TAILSCALE_API_KEY="${TAILSCALE_API_KEY}" \
+              -e ANSIBLE_PRIVATE_KEY_FILE="/root/.ssh/id_ed25519" \
+              cytopia/ansible:latest \
+              /bin/sh -c "apk add --no-cache openssh-client >/dev/null && ansible-playbook -f 1 ${{ github.event.inputs.ansible_args }} -i /work/ansible/inventory.ini /work/ansible/site.yml"
+            rc=$?
+            set -e
+
+            if [ $rc -eq 0 ]; then
+              break
+            fi
+
+            if [ "$attempt" -lt "${max_attempts}" ]; then
+              echo "Ansible container run failed (attempt ${attempt}/${max_attempts}, rc=${rc}); retrying in 15s..."
+              sleep 15
+            else
+              echo "Ansible container run failed after ${max_attempts} attempts (last rc=${rc})."
+              exit $rc
+            fi
+          done
+
+      - name: Validate required fan and PWM metrics
+        if: steps.network_access.outputs.configured != 'false' || runner.os == 'Linux'
+        run: |
+          required_nodes_csv="${REQUIRED_FAN_PWM_NODES}"
+          if [ -z "${required_nodes_csv}" ]; then
+            echo "REQUIRED_FAN_PWM_NODES is empty, skipping metric enforcement."
+            exit 0
+          fi
+
+          query_metric() {
+            metric_query="$1"
+            pod_name="vmq-$(date +%s)-$RANDOM"
+            kubectl -n monitoring run "${pod_name}" \
+              --image=curlimages/curl:8.8.0 \
+              --restart=Never \
+              --rm -i \
+              --command -- \
+              curl -sG http://victoria-metrics:8428/api/v1/query \
+              --data-urlencode "query=count by (instance) (${metric_query})" \
+              | sed -n '/^{/p' | head -n1
+          }
+
+          export REQUIRED_NODES="${required_nodes_csv}"
+
+          max_attempts=20
+          sleep_seconds=15
+
+          for attempt in $(seq 1 ${max_attempts}); do
+            fan_json="$(query_metric 'node_hwmon_fan_rpm{job="node-exporter"}')"
+            pwm_json="$(query_metric 'node_hwmon_pwm{job="node-exporter"}')"
+
+            export FAN_JSON="${fan_json}"
+            export PWM_JSON="${pwm_json}"
+
+            set +e
+            python3 -c "import json, os, sys; normalize=lambda s: s[s.find('{'):s.rfind('}')+1] if ('{' in s and '}' in s and s.find('{') <= s.rfind('}')) else '{\"data\":{\"result\":[]}}'; required=[n.strip() for n in os.environ['REQUIRED_NODES'].split(',') if n.strip()]; fan=json.loads(normalize(os.environ['FAN_JSON'])); pwm=json.loads(normalize(os.environ['PWM_JSON'])); fan_present=sorted({r.get('metric', {}).get('instance', '') for r in fan.get('data', {}).get('result', []) if r.get('metric', {}).get('instance')}); pwm_present=sorted({r.get('metric', {}).get('instance', '') for r in pwm.get('data', {}).get('result', []) if r.get('metric', {}).get('instance')}); fan_missing=sorted(set(required)-set(fan_present)); pwm_missing=sorted(set(required)-set(pwm_present)); print(f'required nodes: {required}'); print(f'fan present: {fan_present}'); print(f'pwm present: {pwm_present}'); print(f'fan missing: {fan_missing}') if fan_missing else None; print(f'pwm missing: {pwm_missing}') if pwm_missing else None; sys.exit(42 if (fan_missing or pwm_missing) else 0)"
+
+            rc=$?
+            set -e
+            if [ $rc -eq 0 ]; then
+              exit 0
+            fi
+
+            if [ "$attempt" -lt "${max_attempts}" ]; then
+              echo "Attempt ${attempt}/${max_attempts} did not meet required metric coverage; retrying in ${sleep_seconds}s..."
+              sleep "${sleep_seconds}"
+            else
+              echo "Metric coverage check failed after ${max_attempts} attempts."
+              exit 1
+            fi
+          done
+
+      - name: Notify ntfy
+        if: always()
+        env:
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          NTFY_TOPIC: gha
+          NTFY_TITLE: "Ansible Drift Correction"
+          NTFY_PRIORITY: ${{ job.status == 'success' && 'default' || 'high' }}
+          NTFY_TAGS: ${{ job.status == 'success' && 'hammer,check' || 'warning,hammer' }}
+          NTFY_MESSAGE: |
+            ansible-drift: ${{ job.status }}
+            repo: ${{ github.repository }}
+            ref: ${{ github.ref_name }}
+            run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/notify_ntfy.sh

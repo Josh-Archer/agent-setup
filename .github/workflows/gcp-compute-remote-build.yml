@@ -1,0 +1,175 @@
+name: GCP Compute Remote Build
+run-name: GCP Compute Remote Build (${{ inputs.request_id }})
+
+on:
+  workflow_call:
+    inputs:
+      request_id:
+        required: true
+        type: string
+      source_sha:
+        required: false
+        type: string
+      source_ref:
+        required: false
+        type: string
+      build_image:
+        required: true
+        type: string
+      build_context:
+        required: true
+        type: string
+      build_file:
+        required: true
+        type: string
+      build_tag:
+        required: true
+        type: string
+      build_platforms:
+        required: false
+        default: linux/amd64
+        type: string
+      build_push:
+        required: false
+        default: "true"
+        type: string
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Correlation id used by the GCP Compute build controller
+        required: true
+        type: string
+      source_sha:
+        description: Exact source commit to build
+        required: false
+        type: string
+      source_ref:
+        description: Source ref fallback when source_sha is empty
+        required: false
+        type: string
+      build_image:
+        description: Fully qualified image repository
+        required: true
+        type: string
+      build_context:
+        description: Docker build context path
+        required: true
+        type: string
+      build_file:
+        description: Dockerfile path
+        required: true
+        type: string
+      build_tag:
+        description: Image tag to build
+        required: true
+        type: string
+      build_platforms:
+        description: Target platforms
+        required: false
+        default: linux/amd64
+        type: string
+      build_push:
+        description: Whether to push the image after build
+        required: false
+        default: "true"
+        type: string
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: gcp-compute-remote-build
+  cancel-in-progress: false
+
+jobs:
+  prepare-runner:
+    runs-on: home-gh-runner
+    timeout-minutes: 20
+    outputs:
+      runner_labels_json: ${{ steps.wait.outputs.runner_labels_json }}
+    env:
+      GH_TOKEN: ${{ secrets.GITOPS_PAT != '' && secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN != '' && secrets.GH_ADMIN_TOKEN || github.token }}
+      PROJECT_ID: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      INSTANCE_NAME: ${{ vars.GCP_COMPUTE_BUILD_INSTANCE_NAME != '' && vars.GCP_COMPUTE_BUILD_INSTANCE_NAME || 'home-gcp-build-runner' }}
+      INSTANCE_ZONE: ${{ vars.GCP_COMPUTE_BUILD_INSTANCE_ZONE != '' && vars.GCP_COMPUTE_BUILD_INSTANCE_ZONE || 'us-central1-a' }}
+      RUNNER_LABEL: ${{ vars.GCP_COMPUTE_BUILD_RUNNER_LABEL != '' && vars.GCP_COMPUTE_BUILD_RUNNER_LABEL || 'gcp-build-runner' }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ env.GH_TOKEN }}
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Validate GCP Compute runner inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${PROJECT_ID:?GCP project id is required}"
+          : "${INSTANCE_NAME:?GCP compute instance name is required}"
+          : "${INSTANCE_ZONE:?GCP compute instance zone is required}"
+          : "${RUNNER_LABEL:?GCP compute runner label is required}"
+
+      - name: Start GCP Compute build runner
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_status="$(gcloud compute instances describe "${INSTANCE_NAME}" --project "${PROJECT_ID}" --zone "${INSTANCE_ZONE}" --format='value(status)' || true)"
+          if [ "${current_status}" != "RUNNING" ]; then
+            gcloud compute instances start "${INSTANCE_NAME}" --project "${PROJECT_ID}" --zone "${INSTANCE_ZONE}"
+          fi
+
+          gcloud compute instances add-metadata "${INSTANCE_NAME}" \
+            --project "${PROJECT_ID}" \
+            --zone "${INSTANCE_ZONE}" \
+            --metadata=home-last-build-at="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+      - name: Wait for runner registration
+        id: wait
+        shell: bash
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          response_file="$(mktemp)"
+          deadline=$((SECONDS + 900))
+
+          while [ "${SECONDS}" -lt "${deadline}" ]; do
+            gh api "repos/${REPOSITORY}/actions/runners?per_page=100" > "${response_file}"
+            if python3 -c 'import json, sys; payload = json.load(open(sys.argv[1], encoding="utf-8")); runner_label = sys.argv[2]; raise SystemExit(0 if any(runner_label in {label.get("name") for label in runner.get("labels", [])} and str(runner.get("status", "")).lower() == "online" for runner in payload.get("runners", [])) else 1)' "${response_file}" "${RUNNER_LABEL}"
+            then
+              printf 'runner_labels_json=["self-hosted","linux","x64","%s"]\n' "${RUNNER_LABEL}" >> "$GITHUB_OUTPUT"
+              rm -f "${response_file}"
+              exit 0
+            fi
+
+            sleep 10
+          done
+
+          echo "Timed out waiting for the GCP Compute runner label ${RUNNER_LABEL} to come online." >&2
+          rm -f "${response_file}"
+          exit 1
+
+  build:
+    needs: prepare-runner
+    uses: ./.github/workflows/remote-self-hosted-build.yml
+    secrets: inherit
+    with:
+      source_sha: ${{ inputs.source_sha }}
+      source_ref: ${{ inputs.source_ref }}
+      build_image: ${{ inputs.build_image }}
+      build_context: ${{ inputs.build_context }}
+      build_file: ${{ inputs.build_file }}
+      build_tag: ${{ inputs.build_tag }}
+      build_platforms: ${{ inputs.build_platforms }}
+      build_push: ${{ inputs.build_push }}
+      runner_labels_json: ${{ needs.prepare-runner.outputs.runner_labels_json }}
+      cleanup_after_build: "true"

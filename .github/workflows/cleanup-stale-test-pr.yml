@@ -1,0 +1,128 @@
+name: Cleanup Stale PR Resources
+
+on:
+  schedule:
+    - cron: "0 4 * * *" # Daily at 04:00 UTC
+  workflow_dispatch:
+    inputs:
+      ttl_hours:
+        description: "Delete test-pr resources older than this many hours"
+        required: false
+        default: "24"
+
+concurrency:
+  group: cleanup-stale-pr-resources
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cleanup-stale-pr:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    env:
+      TTL_HOURS: ${{ inputs.ttl_hours || '24' }}
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Install kubectl
+        if: runner.os == 'Linux'
+        uses: azure/setup-kubectl@v5
+        with:
+          version: 'latest'
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Delete stale test namespaces
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timedelta, timezone
+
+          ttl_hours = int(os.environ.get("TTL_HOURS", "24"))
+          cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+
+          data = json.loads(subprocess.check_output(["kubectl", "get", "ns", "-o", "json"]))
+          to_delete = []
+
+          for item in data.get("items", []):
+            name = item.get("metadata", {}).get("name", "")
+            labels = item.get("metadata", {}).get("labels", {})
+            if not (name.startswith("test-pr-") or labels.get("ephemeral") == "true" or labels.get("test") == "true"):
+              continue
+            created_raw = item.get("metadata", {}).get("creationTimestamp")
+            if not created_raw:
+              continue
+            created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            if created < cutoff:
+              to_delete.append(name)
+
+          if not to_delete:
+            print("No stale namespaces to delete.")
+          else:
+            print("Deleting namespaces:", ", ".join(to_delete))
+            for name in to_delete:
+              subprocess.call(["kubectl", "delete", "namespace", name, "--wait=false"])
+          PY
+
+      - name: Delete stale ArgoCD test applications
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+          from datetime import datetime, timedelta, timezone
+
+          ttl_hours = int(os.environ.get("TTL_HOURS", "24"))
+          cutoff = datetime.now(timezone.utc) - timedelta(hours=ttl_hours)
+
+          data = json.loads(subprocess.check_output(["kubectl", "-n", "argocd", "get", "applications", "-o", "json"]))
+          to_delete = []
+
+          for item in data.get("items", []):
+            name = item.get("metadata", {}).get("name", "")
+            if not name.startswith("test-pr-"):
+              continue
+            created_raw = item.get("metadata", {}).get("creationTimestamp")
+            if not created_raw:
+              continue
+            created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            if created < cutoff:
+              to_delete.append(name)
+
+          if not to_delete:
+            print("No stale ArgoCD test applications to delete.")
+          else:
+            print("Deleting applications:", ", ".join(to_delete))
+            for name in to_delete:
+              subprocess.call(["kubectl", "-n", "argocd", "delete", "application", name, "--wait=false"])
+          PY
+
+      - name: Notify ntfy
+        if: always()
+        env:
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          NTFY_TOPIC: gha
+          NTFY_TITLE: "Cleanup Stale PR Resources"
+          NTFY_PRIORITY: ${{ job.status == 'success' && 'default' || 'high' }}
+          NTFY_TAGS: ${{ job.status == 'success' && 'broom,check' || 'warning,broom' }}
+          NTFY_MESSAGE: |
+            cleanup-stale-test-pr: ${{ job.status }}
+            ttl_hours: ${{ env.TTL_HOURS }}
+            repo: ${{ github.repository }}
+            run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/notify_ntfy.sh

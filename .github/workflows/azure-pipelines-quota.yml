@@ -1,0 +1,205 @@
+name: Azure Pipelines Quota Monitor
+
+on:
+  schedule:
+    - cron: '15 */6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  monitor-azure-usage:
+    runs-on: ${{ (vars.RUNNER_PROVIDER_MODE == 'self-hosted' || vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GH_ADMIN_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Resolve Azure usage percent
+        id: usage
+        shell: bash
+        env:
+          USE_AZURE_PIPELINES: ${{ vars.USE_AZURE_PIPELINES }}
+          RUNNER_PROVIDER_MODE: ${{ vars.RUNNER_PROVIDER_MODE }}
+          AZURE_PIPELINES_READY: ${{ vars.AZURE_PIPELINES_READY }}
+          MANUAL_USAGE_PERCENT: ${{ vars.AZURE_PIPELINES_USAGE_PERCENT }}
+          MONTHLY_LIMIT: ${{ vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT != '' && vars.AZURE_PIPELINES_MONTHLY_MINUTES_LIMIT || '1800' }}
+          AZURE_DEVOPS_ORG_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          AZURE_DEVOPS_PROJECT: ${{ vars.AZURE_DEVOPS_PROJECT }}
+          AZURE_DEVOPS_PIPELINE_ID: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+          AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+          TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT }}
+          TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+          TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          set -euo pipefail
+
+          is_true() {
+            case "${1:-}" in
+              true|True|TRUE|1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          is_int() {
+            [[ "${1:-}" =~ ^[0-9]+$ ]]
+          }
+
+          if ! is_true "${USE_AZURE_PIPELINES:-false}" && [ "${RUNNER_PROVIDER_MODE:-}" != "azure-pipelines" ]; then
+            echo "Azure Pipelines mode is not active. Skipping quota check."
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! is_true "${AZURE_PIPELINES_READY:-false}"; then
+            echo "Azure Pipelines readiness gate is off. Skipping quota check."
+            echo "active=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "active=true" >> "$GITHUB_OUTPUT"
+
+          eval "$(bash scripts/ci/resolve_azure_devops_context.sh)"
+
+          usage_percent=""
+          source=""
+
+          if is_int "${MANUAL_USAGE_PERCENT:-}"; then
+            usage_percent="${MANUAL_USAGE_PERCENT}"
+            source="github-variable"
+          fi
+
+          if [ -z "${usage_percent}" ] && [ -n "${azure_devops_org_url:-}" ] && [ "${azure_devops_auth_mode}" != "missing" ]; then
+            base_url="${azure_devops_org_url%/}"
+            endpoints=()
+            if [ -n "${azure_devops_project:-}" ]; then
+              endpoints+=("${base_url}/${azure_devops_project}/_apis/resourceUsage?api-version=7.1-preview.1")
+            fi
+            endpoints+=("${base_url}/_apis/resourceUsage?api-version=7.1-preview.1")
+
+            for endpoint in "${endpoints[@]}"; do
+              if [ "${azure_devops_auth_mode}" = "pat" ]; then
+                response="$(curl -sS -u ":${azure_devops_pat}" "${endpoint}" || true)"
+              else
+                response="$(curl -sS -H "Authorization: Bearer ${azure_devops_bearer_token}" "${endpoint}" || true)"
+              fi
+              if [ -z "${response}" ]; then
+                continue
+              fi
+
+              if ! echo "${response}" | jq -e . >/dev/null 2>&1; then
+                continue
+              fi
+
+              used_value="$(echo "${response}" | jq -r '[.. | objects | .usedValue?, .used?, .consumed?, .usedMinutes?, .current?, .currentValue? | numbers] | max // 0')"
+              limit_value="$(echo "${response}" | jq -r '[.. | objects | .limit?, .quota?, .included?, .maximum?, .max?, .total?, .totalMinutes? | numbers] | max // 0')"
+
+              if [ "$(awk -v n="${limit_value}" 'BEGIN { if (n > 0) print 1; else print 0 }')" = "1" ]; then
+                usage_percent="$(awk -v used="${used_value}" -v limit="${limit_value}" 'BEGIN { p = int((used * 100) / limit); if (p < 0) p = 0; if (p > 100) p = 100; print p }')"
+                source="azure-api"
+                break
+              fi
+            done
+          fi
+
+          if [ -z "${usage_percent}" ]; then
+            echo "Unable to resolve Azure usage percent from variables or API."
+            echo "usage_percent=" >> "$GITHUB_OUTPUT"
+            echo "usage_source=unresolved" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          threshold=0
+          if [ "${usage_percent}" -ge 80 ]; then
+            threshold=80
+          elif [ "${usage_percent}" -ge 75 ]; then
+            threshold=75
+          elif [ "${usage_percent}" -ge 50 ]; then
+            threshold=50
+          elif [ "${usage_percent}" -ge 25 ]; then
+            threshold=25
+          fi
+
+          echo "usage_percent=${usage_percent}" >> "$GITHUB_OUTPUT"
+          echo "usage_source=${source}" >> "$GITHUB_OUTPUT"
+          echo "threshold=${threshold}" >> "$GITHUB_OUTPUT"
+          echo "month_key=$(date -u +%Y-%m)" >> "$GITHUB_OUTPUT"
+
+      - name: Apply thresholds and fallback
+        if: steps.usage.outputs.active == 'true'
+        shell: bash
+        env:
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          NTFY_BASE_URL: https://ntfy.archer.casa
+          NTFY_TOPIC: gha
+          LAST_ALERT_LEVEL: ${{ vars.AZURE_PIPELINES_LAST_ALERT_LEVEL }}
+          LAST_ALERT_MONTH: ${{ vars.AZURE_PIPELINES_LAST_ALERT_MONTH }}
+          USAGE_PERCENT: ${{ steps.usage.outputs.usage_percent }}
+          THRESHOLD_LEVEL: ${{ steps.usage.outputs.threshold }}
+          USAGE_SOURCE: ${{ steps.usage.outputs.usage_source }}
+          MONTH_KEY: ${{ steps.usage.outputs.month_key }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${USAGE_PERCENT:-}" ]; then
+            echo "No resolved usage percent. Skipping threshold updates."
+            exit 0
+          fi
+
+          last_level="${LAST_ALERT_LEVEL:-0}"
+          if ! [[ "${last_level}" =~ ^[0-9]+$ ]]; then
+            last_level=0
+          fi
+
+          if [ "${LAST_ALERT_MONTH:-}" != "${MONTH_KEY:-}" ]; then
+            last_level=0
+          fi
+
+          gh variable set AZURE_PIPELINES_USAGE_PERCENT --body "${USAGE_PERCENT}"
+
+          if [ "${THRESHOLD_LEVEL:-0}" -le "${last_level}" ] || [ "${THRESHOLD_LEVEL:-0}" -eq 0 ]; then
+            gh variable set AZURE_PIPELINES_LAST_ALERT_MONTH --body "${MONTH_KEY}"
+            echo "No new threshold reached (current=${USAGE_PERCENT}%, threshold=${THRESHOLD_LEVEL}, last=${last_level})."
+            exit 0
+          fi
+
+          NTFY_TITLE="Azure Pipelines Usage ${USAGE_PERCENT}%"
+          NTFY_PRIORITY="default"
+          NTFY_TAGS="azure,warning"
+          if [ "${THRESHOLD_LEVEL}" -ge 75 ]; then
+            NTFY_PRIORITY="high"
+          fi
+          NTFY_MESSAGE="Azure hosted usage reached ${USAGE_PERCENT}% (${USAGE_SOURCE})."
+          export NTFY_TITLE NTFY_PRIORITY NTFY_TAGS NTFY_MESSAGE
+          bash scripts/notify_ntfy.sh
+
+          if [ "${THRESHOLD_LEVEL}" -ge 80 ]; then
+            echo "Azure hosted reserve threshold reached; forcing fallback to self-hosted mode."
+            gh variable set RUNNER_PROVIDER_MODE --body "self-hosted"
+            gh variable set USE_SELF_HOSTED --body "true"
+            gh variable set USE_AWS_CODEBUILD_RUNNERS --body "false"
+            gh variable set USE_AZURE_PIPELINES --body "false"
+            gh variable set AZURE_PIPELINES_AUTO_DISABLED_AT_LIMIT --body "true"
+
+            NTFY_TITLE="Azure Pipelines Fallback Activated"
+            NTFY_PRIORITY="high"
+            NTFY_TAGS="azure,warning"
+            NTFY_MESSAGE="Azure hosted usage reached the 80% reserve threshold; switched CI to self-hosted mode and disabled Azure provider mode until it is re-enabled."
+            export NTFY_TITLE NTFY_PRIORITY NTFY_TAGS NTFY_MESSAGE
+            bash scripts/notify_ntfy.sh
+          fi
+
+          gh variable set AZURE_PIPELINES_LAST_ALERT_LEVEL --body "${THRESHOLD_LEVEL}"
+          gh variable set AZURE_PIPELINES_LAST_ALERT_MONTH --body "${MONTH_KEY}"

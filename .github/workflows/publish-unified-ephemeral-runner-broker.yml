@@ -1,0 +1,176 @@
+name: Publish Unified Ephemeral Runner Broker
+
+on:
+  push:
+    branches:
+      - codex/**
+    paths:
+      - .github/workflows/publish-unified-ephemeral-runner-broker.yml
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Immutable source ref from the public repo, for example v0.1.0-test.1 or a full SHA
+        required: true
+        type: string
+      version:
+        description: Version to publish
+        required: true
+        type: string
+      push_artifacts:
+        description: Push images and chart package to GHCR
+        required: true
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+concurrency:
+  group: publish-unified-ephemeral-runner-broker
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  GHCR_OWNER: josh-archer
+
+jobs:
+  publish:
+    runs-on: home-gh-runner
+    env:
+      SOURCE_REF: ${{ github.event_name == 'workflow_dispatch' && inputs.source_ref || 'main' }}
+      VERSION: ${{ github.event_name == 'workflow_dispatch' && inputs.version || 'v0.0.0-validation' }}
+    steps:
+      - name: Checkout public source by immutable ref
+        uses: actions/checkout@v6
+        with:
+          repository: Josh-Archer/unified-ephemeral-runner-broker
+          ref: ${{ env.SOURCE_REF }}
+          path: source
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: source/go.mod
+
+      - name: Resolve source metadata
+        id: source
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd source
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version_no_v=${INPUT_VERSION#v}" >> "$GITHUB_OUTPUT"
+        env:
+          INPUT_VERSION: ${{ env.VERSION }}
+
+      - name: Test source
+        working-directory: source
+        run: go test ./...
+
+      - uses: docker/setup-qemu-action@v4
+
+      - uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.push_artifacts }}
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - name: Build and optionally push broker image
+        uses: docker/build-push-action@v7
+        with:
+          context: source
+          file: source/Dockerfile.broker
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.push_artifacts }}
+          tags: |
+            ghcr.io/${{ env.GHCR_OWNER }}/unified-ephemeral-runner-broker/broker:${{ env.VERSION }}
+            ghcr.io/${{ env.GHCR_OWNER }}/unified-ephemeral-runner-broker/broker:sha-${{ steps.source.outputs.short_sha }}
+          cache-from: type=gha,scope=uecb-broker
+          cache-to: type=gha,scope=uecb-broker,mode=max
+
+      - name: Build and optionally push launcher image
+        uses: docker/build-push-action@v7
+        with:
+          context: source
+          file: source/Dockerfile.launcher
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.push_artifacts }}
+          tags: |
+            ghcr.io/${{ env.GHCR_OWNER }}/unified-ephemeral-runner-broker/launcher:${{ env.VERSION }}
+            ghcr.io/${{ env.GHCR_OWNER }}/unified-ephemeral-runner-broker/launcher:sha-${{ steps.source.outputs.short_sha }}
+          cache-from: type=gha,scope=uecb-launcher
+          cache-to: type=gha,scope=uecb-launcher,mode=max
+
+      - name: Build and optionally push Azure Functions image
+        uses: docker/build-push-action@v7
+        with:
+          context: source
+          file: source/Dockerfile.azure-functions
+          platforms: linux/amd64
+          push: ${{ github.event_name == 'workflow_dispatch' && inputs.push_artifacts }}
+          tags: |
+            ghcr.io/${{ env.GHCR_OWNER }}/unified-ephemeral-runner-broker/azure-functions:${{ env.VERSION }}
+            ghcr.io/${{ env.GHCR_OWNER }}/unified-ephemeral-runner-broker/azure-functions:sha-${{ steps.source.outputs.short_sha }}
+          cache-from: type=gha,scope=uecb-azure-functions
+          cache-to: type=gha,scope=uecb-azure-functions,mode=max
+
+      - uses: azure/setup-helm@v5
+
+      - name: Package chart
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          helm package source/charts/unified-ephemeral-runner-broker \
+            --destination dist \
+            --version "${VERSION_NO_V}" \
+            --app-version "${VERSION_NO_V}"
+        env:
+          VERSION_NO_V: ${{ steps.source.outputs.version_no_v }}
+
+      - name: Push chart to GHCR
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.push_artifacts }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          echo "${GITHUB_TOKEN}" | helm registry login ghcr.io -u "${GITHUB_ACTOR}" --password-stdin
+          helm push "dist/unified-ephemeral-runner-broker-${VERSION_NO_V}.tgz" "oci://ghcr.io/${GHCR_OWNER}/charts"
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          VERSION_NO_V: ${{ steps.source.outputs.version_no_v }}
+
+      - name: Upload release artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: unified-ephemeral-runner-broker-${{ env.VERSION }}
+          path: dist/**
+
+      - name: Summarize
+        shell: bash
+        run: |
+          {
+            echo "## Unified Ephemeral Runner Broker Publish"
+            echo "- Source ref: \`${SOURCE_REF}\`"
+            echo "- Source SHA: \`${SOURCE_SHA}\`"
+            echo "- Version: \`${VERSION}\`"
+            echo "- Images:"
+            echo "  - \`ghcr.io/${GHCR_OWNER}/unified-ephemeral-runner-broker/broker:${VERSION}\`"
+            echo "  - \`ghcr.io/${GHCR_OWNER}/unified-ephemeral-runner-broker/launcher:${VERSION}\`"
+            echo "  - \`ghcr.io/${GHCR_OWNER}/unified-ephemeral-runner-broker/azure-functions:${VERSION}\`"
+            echo "- Chart: \`oci://ghcr.io/${GHCR_OWNER}/charts/unified-ephemeral-runner-broker:${VERSION_NO_V}\`"
+            echo "- Artifacts pushed: \`${PUSH_ARTIFACTS}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+        env:
+          SOURCE_REF: ${{ env.SOURCE_REF }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+          VERSION: ${{ env.VERSION }}
+          VERSION_NO_V: ${{ steps.source.outputs.version_no_v }}
+          PUSH_ARTIFACTS: ${{ github.event_name == 'workflow_dispatch' && inputs.push_artifacts }}

@@ -1,0 +1,53 @@
+name: GCP Compute Build Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit SHA or ref to build
+        required: false
+        default: main
+        type: string
+      image:
+        description: Fully qualified image repository
+        required: true
+        default: ghcr.io/josh-archer/postgres-backup-s3-test
+        type: string
+      context:
+        description: Docker build context path within the repo
+        required: true
+        default: grok-servaar/images/postgres-backup
+        type: string
+      dockerfile:
+        description: Dockerfile path within the repo
+        required: true
+        default: grok-servaar/images/postgres-backup/Dockerfile
+        type: string
+      tag:
+        description: Image tag
+        required: true
+        default: gcp-compute-smoke
+        type: string
+      push:
+        description: Push the built image to GHCR
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  smoke:
+    uses: ./.github/workflows/gcp-compute-remote-build.yml
+    secrets: inherit
+    with:
+      request_id: ${{ format('smoke-{0}', github.run_id) }}
+      source_ref: ${{ inputs.source_ref }}
+      build_image: ${{ inputs.image }}
+      build_context: ${{ inputs.context }}
+      build_file: ${{ inputs.dockerfile }}
+      build_tag: ${{ inputs.tag }}
+      build_platforms: linux/amd64
+      build_push: ${{ inputs.push && 'true' || 'false' }}

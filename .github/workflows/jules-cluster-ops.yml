@@ -1,0 +1,59 @@
+name: Jules Cluster Ops
+
+on:
+  workflow_dispatch:
+    inputs:
+      kubectl_command:
+        description: 'Kubectl command to run (e.g., get nodes, get pods -A)'
+        required: true
+        default: 'get nodes -o wide'
+      namespace:
+        description: 'Namespace (optional, for context)'
+        required: false
+        default: 'default'
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  cluster-ops:
+    # Using ARC runner to execute directly inside the cluster
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    steps:
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+
+      - name: Checkout Code
+        uses: actions/checkout@v6
+
+      - name: Setup Cluster Access
+        id: cluster_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+          kube_ca_cert: ${{ secrets.HOMELAB_CA_CERT }}
+          kube_token: ${{ secrets.HOMELAB_SYNC_TOKEN_B64 }}
+
+      - name: Execute Kubectl Command
+        if: steps.cluster_access.outputs.configured == 'true'
+        run: |
+          echo "--- Executing Command ---"
+          echo "Command: kubectl ${{ inputs.kubectl_command }}"
+          echo "Namespace: ${{ inputs.namespace }}"
+
+          # Run the command
+          # Note: The runner ServiceAccount must have RBAC permissions to perform the action.
+          kubectl ${{ inputs.kubectl_command }} -n ${{ inputs.namespace }} > command_output.txt 2>&1
+
+          echo "--- Output ---"
+          cat command_output.txt
+
+      - name: Upload Output
+        uses: actions/upload-artifact@v7
+        if: always()
+        with:
+          name: cluster-ops-output
+          path: command_output.txt

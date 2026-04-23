@@ -1,0 +1,152 @@
+name: Deploy Cleanarr Lambda Cleanup (AWS)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infrastructure/terraform/aws-lambda-cleanup/**'
+      - '.opentofu-version'
+      - 'scripts/tofu-init-with-retry.sh'
+  workflow_dispatch:
+    inputs:
+      lambda_version:
+        description: 'Specific cleanarr-lambda version to deploy (e.g., v0.2.9)'
+        required: false
+        default: 'v0.2.33'
+
+concurrency:
+  group: tofu-aws-lambda-cleanup
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    name: Deploy Lambda (OpenTofu)
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    if: vars.CLEANARR_WEBHOOK_MODE == 'k3s'
+    defaults:
+      run:
+        working-directory: infrastructure/terraform/aws-lambda-cleanup
+    env:
+      # AWS Credentials
+      AWS_DEFAULT_REGION: us-east-1
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+      # Lambda Config - using public Cloudflare URLs
+      TF_VAR_cleanarr_plex_baseurl: "https://plex.archer.casa"
+      TF_VAR_cleanarr_plex_token: ${{ secrets.PLEX_TOKEN }}
+      TF_VAR_cleanarr_sonarr_baseurl: "https://sonarr.archer.casa/api/v3/"
+      TF_VAR_cleanarr_sonarr_apikey: ${{ secrets.SONARR_APIKEY }}
+      TF_VAR_cleanarr_radarr_baseurl: "https://radarr.archer.casa/api/v3/"
+      TF_VAR_cleanarr_radarr_apikey: ${{ secrets.RADARR_APIKEY }}
+      TF_VAR_cleanarr_transmission_host: "torrent.archer.casa"
+      TF_VAR_cleanarr_transmission_port: "443"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+      - name: Install AWS CLI
+        uses: unfor19/install-aws-cli-action@v1
+      - uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Verify OpenTofu Encryption Secret
+        run: |
+          if [ -z "${TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE:-}" ]; then
+            echo "Error: TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE is missing or empty."
+            exit 1
+          fi
+
+      - name: Prepare Lambda Package
+        run: |
+          mkdir package
+          VERSION="${{ github.event.inputs.lambda_version || 'v0.2.9' }}"
+          IMAGE="ghcr.io/josh-archer/cleanarr-cronjob:${VERSION}"
+          echo "Building package from ${IMAGE}"
+
+          docker pull "$IMAGE"
+          CONTAINER_ID=$(docker create "$IMAGE")
+          trap 'docker rm -f "$CONTAINER_ID" >/dev/null 2>&1 || true' EXIT
+
+          # Reuse the published GHCR runtime instead of rebuilding from source.
+          docker cp "${CONTAINER_ID}:/usr/local/lib/python3.11/site-packages/." ./package/
+          
+          # Copy the diagnostic handler from the repo instead of creating it here
+          cp ../../../grok-servaar/aws-lambda-cleanup/lambda_function.py package/
+          
+          # Zip the package using Python
+          python -c "import shutil; shutil.make_archive('lambda_function', 'zip', 'package')"
+          
+          # Verification
+          ls -lh lambda_function.zip
+
+      - name: Fetch Cloudflare Access Tokens
+        run: |
+          cd ../../../terraform/cloudflare-access
+          TOFU_BACKEND_STATE_KEY=cloudflare-access/terraform.tfstate \
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+          
+          echo "TF_VAR_cf_access_client_id=$(tofu output -raw cleanarr_webhook_client_id)" >> "$GITHUB_ENV"
+          echo "TF_VAR_cf_access_client_secret=$(tofu output -raw cleanarr_webhook_client_secret)" >> "$GITHUB_ENV"
+
+      - name: OpenTofu Init
+        env:
+          TOFU_BACKEND_STATE_KEY: aws-lambda-cleanup/terraform.tfstate
+        run: |
+          bash ../../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Recover State
+        continue-on-error: true
+        run: |
+          # Remove problematic resources that we can't refresh due to permissions
+          tofu state rm aws_cloudwatch_event_rule.every_three_hours || true
+          tofu state rm aws_lambda_permission.allow_cloudwatch || true
+          
+          # Try to import core resources if they aren't in the state
+          tofu import aws_iam_role.lambda_role plex-media-cleanup-role || true
+
+      - name: OpenTofu Apply
+        run: |
+          APPLY_LOG="/tmp/tofu-aws-lambda-cleanup-apply.log"
+          set +e
+          tofu apply -input=false -auto-approve -lock-timeout=30s 2>&1 | tee "${APPLY_LOG}"
+          APPLY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${APPLY_EXIT}" -ne 0 ] && bash ../../../scripts/tofu-recover-stale-lock.sh "${APPLY_LOG}"; then
+            echo "Retrying OpenTofu Apply after stale lock cleanup..."
+            set +e
+            tofu apply -input=false -auto-approve -lock-timeout=30s 2>&1 | tee "${APPLY_LOG}"
+            APPLY_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${APPLY_EXIT}" -ne 0 ]; then
+            exit "${APPLY_EXIT}"
+          fi

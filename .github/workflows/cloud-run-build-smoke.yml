@@ -1,0 +1,72 @@
+name: Cloud Run Build Smoke
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_ref:
+        description: Commit SHA or ref to build
+        required: false
+        default: main
+        type: string
+      image:
+        description: Fully qualified image repository
+        required: true
+        default: ghcr.io/josh-archer/postgres-backup-s3-test
+        type: string
+      context:
+        description: Docker build context path within the repo
+        required: true
+        default: grok-servaar/images/postgres-backup
+        type: string
+      dockerfile:
+        description: Dockerfile path within the repo
+        required: true
+        default: grok-servaar/images/postgres-backup/Dockerfile
+        type: string
+      tag:
+        description: Image tag
+        required: true
+        default: cloud-run-smoke
+        type: string
+      push:
+        description: Push the built image to GHCR
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: home-gh-runner
+    timeout-minutes: 40
+    env:
+      BUILD_IMAGE: ${{ inputs.image }}
+      BUILD_CONTEXT: ${{ inputs.context }}
+      BUILD_FILE: ${{ inputs.dockerfile }}
+      BUILD_TAG: ${{ inputs.tag }}
+      BUILD_PLATFORMS: linux/amd64
+      BUILD_PUSH: ${{ inputs.push && 'true' || 'false' }}
+      CLOUD_RUN_BUILD_DISPATCH_URL: ${{ vars.CLOUD_RUN_BUILD_DISPATCH_URL }}
+      CLOUD_RUN_BUILD_HEALTHCHECK_URL: ${{ vars.CLOUD_RUN_BUILD_HEALTHCHECK_URL }}
+      CLOUD_RUN_BUILD_DISPATCH_TOKEN: ${{ secrets.CLOUD_RUN_BUILD_DISPATCH_TOKEN }}
+      GITHUB_REF: ${{ inputs.source_ref }}
+      GITHUB_SHA: ""
+      PR_NUMBER: ""
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Verify controller
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build-provider-dispatch.sh
+          scripts/build-provider-dispatch.sh verify cloud-run
+
+      - name: Dispatch Cloud Run smoke build
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/build-provider-dispatch.sh
+          scripts/build-provider-dispatch.sh dispatch cloud-run

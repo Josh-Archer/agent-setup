@@ -1,0 +1,295 @@
+name: Runner Switch
+
+on:
+  workflow_dispatch:
+    inputs:
+      runner_choice:
+        description: 'Select the default runner/provider mode'
+        required: true
+        default: 'self-hosted'
+        type: choice
+        options:
+          - github-hosted
+          - self-hosted
+          - codebuild
+          - azure-pipelines
+      use_azure_vm:
+        description: 'Enable Azure VM offload for supported jobs regardless of the selected runner provider'
+        required: true
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  validate-selection:
+    runs-on: home-gh-runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN || github.token }}
+
+      - name: Skip Azure preflight when Azure is not involved
+        if: ${{ inputs.runner_choice != 'azure-pipelines' && inputs.use_azure_vm != true }}
+        run: echo "Selected mode does not require Azure preflight."
+
+      - name: Verify Azure secondary lane readiness
+        if: ${{ inputs.runner_choice == 'azure-pipelines' || inputs.use_azure_vm == true }}
+        env:
+          AZURE_PIPELINES_READY: ${{ vars.AZURE_PIPELINES_READY }}
+          AZURE_DEVOPS_ORG_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          AZURE_DEVOPS_PROJECT: ${{ vars.AZURE_DEVOPS_PROJECT }}
+          AZURE_DEVOPS_PIPELINE_ID: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+          AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+          TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT }}
+          TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+          TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          set -euo pipefail
+
+          is_true() {
+            case "${1:-}" in
+              true|True|TRUE|1) return 0 ;;
+              *) return 1 ;;
+            esac
+          }
+
+          eval "$(bash scripts/ci/resolve_azure_devops_context.sh)"
+
+          if ! is_true "${AZURE_PIPELINES_READY:-false}"; then
+            echo "AZURE_PIPELINES_READY must be true before enabling Azure-backed workloads."
+            exit 1
+          fi
+
+          for required_var in azure_devops_org_url azure_devops_project azure_devops_pipeline_id; do
+            if [ -z "${!required_var:-}" ]; then
+              echo "Missing required Azure configuration: ${required_var}"
+              exit 1
+            fi
+          done
+
+          if [ "${azure_devops_auth_mode}" = "missing" ]; then
+            echo "Missing required Azure DevOps authentication."
+            exit 1
+          fi
+
+          pipeline_url="${azure_devops_org_url%/}/${azure_devops_project}/_apis/pipelines/${azure_devops_pipeline_id}?api-version=7.1"
+          if [ "${azure_devops_auth_mode}" = "pat" ]; then
+            curl -fsS -u ":${azure_devops_pat}" "${pipeline_url}" >/dev/null
+          else
+            curl -fsS -H "Authorization: Bearer ${azure_devops_bearer_token}" "${pipeline_url}" >/dev/null
+          fi
+
+          echo "Azure secondary lane preflight passed."
+
+  update-configuration:
+    needs: validate-selection
+    # Keep configuration flips on self-hosted so this workflow can toggle modes
+    # even when GitHub-hosted runners are unavailable (billing/plan issues).
+    runs-on: home-gh-runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN || github.token }}
+
+      - name: Update Variables
+        env:
+          CHOICE: ${{ inputs.runner_choice }}
+          USE_AZURE_VM_INPUT: ${{ inputs.use_azure_vm }}
+        run: |
+          set -euo pipefail
+
+          USE_SELF_HOSTED="false"
+          USE_AWS_CODEBUILD_RUNNERS="false"
+          USE_AZURE_PIPELINES="false"
+          USE_AZURE_VM="false"
+
+          if [ "$CHOICE" = "self-hosted" ]; then
+            USE_SELF_HOSTED="true"
+          elif [ "$CHOICE" = "codebuild" ]; then
+            # Keep self-hosted enabled so deploy/infrastructure jobs stay off
+            # GitHub-hosted runners when codebuild mode is active.
+            USE_SELF_HOSTED="true"
+            USE_AWS_CODEBUILD_RUNNERS="true"
+          elif [ "$CHOICE" = "azure-pipelines" ]; then
+            USE_AZURE_PIPELINES="true"
+          fi
+
+          if [ "${USE_AZURE_VM_INPUT}" = "true" ]; then
+            USE_AZURE_VM="true"
+          fi
+
+          gh variable set RUNNER_PROVIDER_MODE --body "$CHOICE" || true
+          gh variable set USE_SELF_HOSTED --body "$USE_SELF_HOSTED" || true
+          gh variable set USE_AWS_CODEBUILD_RUNNERS --body "$USE_AWS_CODEBUILD_RUNNERS" || true
+          gh variable set USE_AZURE_PIPELINES --body "$USE_AZURE_PIPELINES" || true
+          gh variable set USE_AZURE_VM --body "$USE_AZURE_VM" || true
+
+          echo "Variables updated to use $CHOICE (Azure VM offload: $USE_AZURE_VM)."
+
+  verify-runner:
+    needs: update-configuration
+    if: ${{ inputs.runner_choice != 'azure-pipelines' }}
+    timeout-minutes: 5
+    runs-on: ${{ (inputs.runner_choice == 'self-hosted') && 'home-gh-runner' || fromJSON(inputs.runner_choice == 'codebuild' && format('["codebuild-{0}-{1}-{2}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt) || '["ubuntu-latest"]') }}
+    steps:
+      - name: Verify Runner Execution
+        run: |
+          echo "Runner successfully picked up the job."
+          echo "Selected Runner Mode: ${{ inputs.runner_choice }}"
+
+  verify-azure-selection:
+    needs: update-configuration
+    if: ${{ inputs.runner_choice == 'azure-pipelines' || inputs.use_azure_vm == true }}
+    runs-on: home-gh-runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN || github.token }}
+
+      - name: Verify Azure provider configuration
+        env:
+          EXPECTED_USE_AZURE_VM: ${{ inputs.use_azure_vm }}
+          SELECTED_RUNNER: ${{ inputs.runner_choice }}
+          AZURE_DEVOPS_ORG_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          AZURE_DEVOPS_PROJECT: ${{ vars.AZURE_DEVOPS_PROJECT }}
+          AZURE_DEVOPS_PIPELINE_ID: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+          AZURE_DEVOPS_PAT: ${{ secrets.AZURE_DEVOPS_PAT }}
+          TF_VAR_azure_devops_org_url: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          TF_VAR_azure_devops_project: ${{ vars.AZURE_DEVOPS_PROJECT }}
+          TF_VAR_azure_devops_pipeline_id: ${{ vars.AZURE_DEVOPS_PIPELINE_ID }}
+          TF_VAR_azure_devops_pat: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZDO_ORG_SERVICE_URL: ${{ vars.AZURE_DEVOPS_ORG_URL }}
+          AZDO_PERSONAL_ACCESS_TOKEN: ${{ secrets.AZURE_DEVOPS_PAT }}
+          AZURE_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+          AZURE_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+          AZURE_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+        run: |
+          set -euo pipefail
+
+          current_mode="$(gh variable get RUNNER_PROVIDER_MODE --json value --jq '.value')"
+          use_azure="$(gh variable get USE_AZURE_PIPELINES --json value --jq '.value')"
+          use_azure_vm="$(gh variable get USE_AZURE_VM --json value --jq '.value')"
+          eval "$(bash scripts/ci/resolve_azure_devops_context.sh)"
+
+          if [ "${current_mode}" != "${SELECTED_RUNNER}" ]; then
+            echo "RUNNER_PROVIDER_MODE did not persist as ${SELECTED_RUNNER}."
+            exit 1
+          fi
+
+          if [ "${SELECTED_RUNNER}" = "azure-pipelines" ] && [ "${use_azure}" != "true" ]; then
+            echo "USE_AZURE_PIPELINES did not persist as true."
+            exit 1
+          fi
+
+          if [ "${SELECTED_RUNNER}" != "azure-pipelines" ] && [ "${use_azure}" = "true" ]; then
+            echo "USE_AZURE_PIPELINES should remain false when the provider mode is not azure-pipelines."
+            exit 1
+          fi
+
+          expected_vm="false"
+          if [ "${EXPECTED_USE_AZURE_VM}" = "true" ]; then
+            expected_vm="true"
+          fi
+
+          if [ "${use_azure_vm}" != "${expected_vm}" ]; then
+            echo "USE_AZURE_VM did not persist as ${expected_vm}."
+            exit 1
+          fi
+
+          if [ -z "${azure_devops_org_url:-}" ] || [ -z "${azure_devops_project:-}" ] || [ -z "${azure_devops_pipeline_id:-}" ]; then
+            echo "Resolved Azure DevOps context is incomplete."
+            exit 1
+          fi
+
+          if [ "${azure_devops_auth_mode}" = "missing" ]; then
+            echo "Azure DevOps authentication could not be resolved."
+            exit 1
+          fi
+
+          pipeline_url="${azure_devops_org_url%/}/${azure_devops_project}/_apis/pipelines/${azure_devops_pipeline_id}?api-version=7.1"
+          if [ "${azure_devops_auth_mode}" = "pat" ]; then
+            curl -fsS -u ":${azure_devops_pat}" "${pipeline_url}" >/dev/null
+          else
+            curl -fsS -H "Authorization: Bearer ${azure_devops_bearer_token}" "${pipeline_url}" >/dev/null
+          fi
+
+          echo "Azure-backed workload routing is configured and the Azure pipeline is reachable."
+
+  rollback-on-failure:
+    needs:
+      - update-configuration
+      - verify-runner
+      - verify-azure-selection
+    if: ${{ always() && (needs.update-configuration.result == 'failure' || needs.verify-runner.result == 'failure' || needs.verify-azure-selection.result == 'failure') }}
+    # Keep rollback on a self-hosted runner so we can still recover mode safely.
+    runs-on: home-gh-runner
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GITOPS_PAT || secrets.GH_ADMIN_TOKEN || github.token }}
+
+      - name: Rollback Variables
+        env:
+          FAILED_RUNNER: ${{ inputs.runner_choice }}
+        run: |
+          set -euo pipefail
+          echo "Verification failed. Rolling back to self-hosted..."
+          rollback_mode="self-hosted"
+          rollback_use_self_hosted="true"
+          rollback_use_codebuild="false"
+          rollback_use_azure_pipelines="false"
+
+          case "${FAILED_RUNNER}" in
+            github-hosted)
+              rollback_mode="github-hosted"
+              rollback_use_self_hosted="false"
+              ;;
+            codebuild)
+              rollback_mode="codebuild"
+              rollback_use_self_hosted="true"
+              rollback_use_codebuild="true"
+              ;;
+            self-hosted)
+              ;;
+            azure-pipelines)
+              ;;
+          esac
+
+          gh variable set RUNNER_PROVIDER_MODE --body "${rollback_mode}" || true
+          gh variable set USE_SELF_HOSTED --body "${rollback_use_self_hosted}" || true
+          gh variable set USE_AWS_CODEBUILD_RUNNERS --body "${rollback_use_codebuild}" || true
+          gh variable set USE_AZURE_PIPELINES --body "${rollback_use_azure_pipelines}" || true
+          gh variable set USE_AZURE_VM --body "false" || true
+
+      - name: Send Notification
+        env:
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          FAILED_RUNNER: ${{ inputs.runner_choice }}
+        run: |
+          curl -sS -X POST "https://ntfy.archer.casa/gha" \
+            -H "Authorization: Bearer ${NTFY_TOKEN:-}" \
+            -H "Title: Runner Switch Failed" \
+            -H "Priority: high" \
+            -H "Tags: warning,rotating_light" \
+            -d "Failed to switch to ${FAILED_RUNNER}. Provider verification did not complete successfully. Automatically rolled back to self-hosted runners."

@@ -1,0 +1,37 @@
+name: GCP Worker State Migration
+description: Moves worker lifecycle state out of cloudflare-access and into gcp-worker.
+
+inputs:
+  cloudflare_account_id:
+    description: Cloudflare account id for the R2 backend endpoint
+    required: true
+  r2_access_key_id:
+    description: R2 access key id for the Terraform backend
+    required: true
+  r2_secret_access_key:
+    description: R2 secret access key for the Terraform backend
+    required: true
+  encryption_passphrase:
+    description: State encryption passphrase
+    required: true
+
+outputs:
+  migration_status:
+    description: Migration outcome
+    value: ${{ steps.migrate.outputs.migration_status }}
+  mark_complete:
+    description: Whether the repository completion marker should be updated
+    value: ${{ steps.migrate.outputs.mark_complete }}
+
+runs:
+  using: composite
+  steps:
+    - name: Migrate GCP worker state
+      id: migrate
+      shell: bash
+      env:
+        CLOUDFLARE_ACCOUNT_ID: ${{ inputs.cloudflare_account_id }}
+        R2_ACCESS_KEY_ID: ${{ inputs.r2_access_key_id }}
+        R2_SECRET_ACCESS_KEY: ${{ inputs.r2_secret_access_key }}
+        TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ inputs.encryption_passphrase }}
+      run: bash "$GITHUB_ACTION_PATH/../../../scripts/migrate-gcp-worker-state.sh"

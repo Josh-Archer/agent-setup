@@ -1,0 +1,88 @@
+name: OpenTofu Force Unlock
+
+on:
+  workflow_dispatch:
+    inputs:
+      lock_id:
+        description: 'OpenTofu lock ID to force-unlock (optional - will attempt auto-discovery if blank)'
+        required: false
+        type: string
+      working_directory:
+        description: 'Working directory containing the OpenTofu code'
+        required: true
+        type: choice
+        default: 'infrastructure/terraform/aws-cleanarr'
+        options:
+          - infrastructure/terraform/aws-cleanarr
+          - infrastructure/terraform/aws-lambda-cleanup
+          - terraform/arr-config
+          - terraform/ci-runners
+          - terraform/homelab
+          - terraform/cloudflare-access
+          - terraform/gcp-worker
+          - terraform/unifi
+          - terraform/aws-backup
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  force-unlock:
+    name: Force unlock state
+    runs-on: home-gh-runner
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - name: Init backend
+        run: |
+          case "${{ inputs.working_directory }}" in
+            terraform/ci-runners)
+              STATE_KEY="ci-runners/terraform.tfstate"
+              ;;
+            terraform/homelab|terraform/cloudflare-access)
+              STATE_KEY="cloudflare-access/terraform.tfstate"
+              ;;
+            *)
+              STATE_KEY="$(basename "${{ inputs.working_directory }}")/terraform.tfstate"
+              ;;
+          esac
+          TOFU_BACKEND_STATE_KEY="${STATE_KEY}" bash ${GITHUB_WORKSPACE}/scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Force unlock state
+        run: |
+          LOCK_ID="${{ inputs.lock_id }}"
+          if [ -z "$LOCK_ID" ]; then
+            echo "No lock_id provided. Attempting to discover it automatically..."
+            tofu plan -input=false -lock-timeout=1s > /tmp/discover-lock.log 2>&1 || true
+            LOCK_ID=$(sed -n 's/.*ID:[[:space:]]*\(.*\)$/\1/p' /tmp/discover-lock.log | tail -n 1 | tr -d '\r' | xargs || true)
+            if [ -z "$LOCK_ID" ]; then
+              echo "Failed to discover lock ID. Check the logs below for clues:"
+              cat /tmp/discover-lock.log
+              exit 1
+            fi
+            echo "Discovered active lock ID: $LOCK_ID"
+          fi
+          
+          echo "Force unlocking $LOCK_ID..."
+          tofu force-unlock -force "$LOCK_ID"

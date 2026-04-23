@@ -1,0 +1,168 @@
+name: Reconcile GCP Spot Worker
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_deletions:
+        description: 'Allow OpenTofu to destroy resources'
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+  actions: write
+
+concurrency:
+  group: tofu-gcp-worker
+  cancel-in-progress: true
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  reconcile:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    defaults:
+      run:
+        working-directory: terraform/gcp-worker
+    env:
+      TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      GCP_CATALOG_API_KEY: ${{ secrets.GCP_CATALOG_API_KEY }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_ntfy_token: ${{ secrets.NTFY_TOKEN }}
+      TF_VAR_gcp_node_enabled: ${{ vars.GCP_NODE_ENABLED != '' && vars.GCP_NODE_ENABLED || 'false' }}
+      TF_VAR_k3s_token: ${{ secrets.K3S_TOKEN }}
+      TF_VAR_k3s_url: ${{ secrets.K3S_URL }}
+      TF_VAR_enable_gcp_reconcile_scheduler: ${{ (vars.GCP_RECONCILE_SCHEDULER_ENABLED == 'true' || vars.GCP_RECONCILE_SCHEDULER_ENABLED == true) && 'true' || 'false' }}
+      TF_VAR_gcp_reconcile_scheduler_job_name: ${{ vars.GCP_RECONCILE_SCHEDULER_JOB_NAME != '' && vars.GCP_RECONCILE_SCHEDULER_JOB_NAME || 'github-gcp-reconcile-hourly' }}
+      TF_VAR_gcp_reconcile_scheduler_schedule: ${{ vars.GCP_RECONCILE_SCHEDULER_SCHEDULE != '' && vars.GCP_RECONCILE_SCHEDULER_SCHEDULE || '0 * * * *' }}
+      TF_VAR_gcp_reconcile_scheduler_time_zone: ${{ vars.GCP_RECONCILE_SCHEDULER_TIME_ZONE != '' && vars.GCP_RECONCILE_SCHEDULER_TIME_ZONE || 'Etc/UTC' }}
+      TF_VAR_gcp_reconcile_scheduler_paused: ${{ (vars.GCP_RECONCILE_SCHEDULER_PAUSED == 'true' || vars.GCP_RECONCILE_SCHEDULER_PAUSED == true) && 'true' || 'false' }}
+      TF_VAR_gcp_reconcile_scheduler_allow_deletions: ${{ (vars.GCP_RECONCILE_SCHEDULER_ALLOW_DELETIONS == 'true' || vars.GCP_RECONCILE_SCHEDULER_ALLOW_DELETIONS == true) && 'true' || 'false' }}
+      TF_VAR_github_actions_dispatch_secret_name: ${{ vars.GCP_RECONCILE_DISPATCH_SECRET_NAME != '' && vars.GCP_RECONCILE_DISPATCH_SECRET_NAME || 'github-scheduler-token' }}
+      TF_VAR_github_actions_dispatch_secret_version: ${{ vars.GCP_RECONCILE_DISPATCH_SECRET_VERSION != '' && vars.GCP_RECONCILE_DISPATCH_SECRET_VERSION || 'latest' }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+      - name: Create variables file
+        run: |
+          echo 'allowed_emails = ${{ secrets.TF_VAR_ALLOWED_EMAILS }}' >> secrets.auto.tfvars
+
+      - name: Verify encryption secret
+        run: |
+          if [ -z "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}" ]; then
+            echo "ERROR: TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE secret is missing or empty."
+            exit 1
+          fi
+
+      - name: Check GCP node enabled flag
+        id: gcp_node_enabled
+        env:
+          GCP_NODE_ENABLED_VAR: ${{ vars.GCP_NODE_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GCP_NODE_ENABLED_VAR:-}" ]; then
+            echo "::error::Repository variable GCP_NODE_ENABLED is not defined; cannot proceed."
+            exit 1
+          fi
+          CURRENT_LOWER=$(printf '%s' "$GCP_NODE_ENABLED_VAR" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]')
+          echo "::notice::Current repository variable GCP_NODE_ENABLED=$CURRENT_LOWER"
+          echo "enabled=$CURRENT_LOWER" >> "$GITHUB_OUTPUT"
+
+      - name: Resolve provisioning vars
+        id: provisioning
+        if: steps.gcp_node_enabled.outputs.enabled == 'true'
+        run: |
+          set -euo pipefail
+          # Prefer the project ID from the gcloud environment configured by google-github-actions/auth.
+          # This avoids misconfiguration when a secret is accidentally set to the project *name*.
+          if [ -n "${CLOUDSDK_CORE_PROJECT:-}" ]; then
+            echo "TF_VAR_project_id=$CLOUDSDK_CORE_PROJECT" >> "$GITHUB_ENV"
+          else
+            echo "TF_VAR_project_id=${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}" >> "$GITHUB_ENV"
+          fi
+
+          # Priority: manually triggered input > repo variable > default
+          MACHINE_TYPE="e2-small"
+          PROVISIONING_MODEL="${{ vars.GCP_PROVISIONING_MODEL != '' && vars.GCP_PROVISIONING_MODEL || 'STANDARD' }}"
+          PREEMPTIBLE="${{ vars.GCP_PREEMPTIBLE != '' && vars.GCP_PREEMPTIBLE || 'false' }}"
+          AUTOMATIC_RESTART="${{ vars.GCP_AUTOMATIC_RESTART != '' && vars.GCP_AUTOMATIC_RESTART || 'true' }}"
+
+          echo "TF_VAR_machine_type=$MACHINE_TYPE" >> "$GITHUB_ENV"
+          echo "TF_VAR_gcp_provisioning_model=$PROVISIONING_MODEL" >> "$GITHUB_ENV"
+          echo "TF_VAR_gcp_preemptible=$PREEMPTIBLE" >> "$GITHUB_ENV"
+          echo "TF_VAR_gcp_automatic_restart=$AUTOMATIC_RESTART" >> "$GITHUB_ENV"
+          echo "machine_type=$MACHINE_TYPE" >> "$GITHUB_OUTPUT"
+          echo "provisioning_model=$PROVISIONING_MODEL" >> "$GITHUB_OUTPUT"
+
+      - name: OpenTofu Init
+        if: steps.gcp_node_enabled.outputs.enabled == 'true'
+        env:
+          TOFU_BACKEND_STATE_KEY: gcp-worker/terraform.tfstate
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/tofu-init-with-retry.sh" --reconfigure
+
+      - name: Clear drifted resources from state
+        if: steps.gcp_node_enabled.outputs.enabled == 'true'
+        run: |
+          tofu state rm "google_compute_instance.k3s_worker[0]" || true
+          tofu state rm "google_compute_router_nat.nat[0]" || true
+          tofu state rm "google_compute_router.router[0]" || true
+          tofu state rm "google_compute_subnetwork.k3s_worker_subnet[0]" || true
+
+      - name: Opentofu Apply -input=false (with zone fallback)
+        if: steps.gcp_node_enabled.outputs.enabled == 'true'
+        env:
+          ALLOW_DELETIONS: ${{ inputs.allow_deletions }}
+        run: |
+          PROJECT_ID="${CLOUDSDK_CORE_PROJECT:-}"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_ID="${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}"
+          fi
+
+          bash "$GITHUB_WORKSPACE/scripts/tofu-apply-with-zone-fallback.sh" \
+            --terraform-dir "$PWD" \
+            --project-id "$PROJECT_ID" \
+            --instance-name "homelabgcp" \
+            --machine-type "e2-small" \
+            --provisioning-model "${{ steps.provisioning.outputs.provisioning_model }}" \
+            --regions "${{ vars.GCP_SPOT_REGIONS }}" \
+            --top-zones 12
+
+      - name: Release State Lock on Cancel
+        if: cancelled() && steps.gcp_node_enabled.outputs.enabled == 'true'
+        run: |
+          echo "Job cancelled. Discovering and releasing state lock..."
+          tofu plan -input=false -lock-timeout=1s > /tmp/cancel-lock.log 2>&1 || true
+          LOCK_ID=$(sed -n 's/.*ID:[[:space:]]*\(.*\)$/\1/p' /tmp/cancel-lock.log | tail -n 1 | tr -d '\r' | xargs || true)
+          if [ -n "$LOCK_ID" ]; then
+            echo "Force unlocking $LOCK_ID..."
+            tofu force-unlock -force "$LOCK_ID"
+          else
+            echo "No active lock found."
+          fi

@@ -1,0 +1,125 @@
+name: Limit Handler
+
+on:
+  workflow_run:
+    workflows: ["Renovate", "Deploy from Main", "Test Pull Request"]
+    types:
+      - completed
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+  # Requires a PAT or repo configuration that allows GITHUB_TOKEN to manage variables
+  # Otherwise, we need to use a PAT secret: secrets.REPO_MANAGE_PAT
+
+jobs:
+  check-failure:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    if: ${{ github.event.workflow_run.conclusion == 'failure' || github.event_name == 'workflow_dispatch' }}
+    env:
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GITOPS_PAT || github.token }}
+
+      - name: Check if already ran today
+        id: dedup
+        run: |
+          TODAY=$(date -u +%Y-%m-%d)
+          LAST_RUN=$(gh variable list --json name,value | jq -r '.[] | select(.name=="LAST_LIMIT_CHECK") | .value' || echo "never")
+          
+          if [ "$LAST_RUN" == "$TODAY" ]; then
+            echo "✅ Limit handler already ran today ($TODAY). Skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "🔍 First run today. Proceeding..."
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+      - name: Free Disk Space
+        if: steps.dedup.outputs.skip != 'true'
+        run: |
+          echo "🧹 Cleaning up runner..."
+          docker system prune -af --volumes 2>/dev/null || true
+
+      - name: Check failure reason
+        if: steps.dedup.outputs.skip != 'true'
+        id: check
+        env:
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          CHECK_SUITE_ID: ${{ github.event.workflow_run.check_suite_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual trigger - forcing check (simulation)"
+            # Simulation mode or fetch specific failing run if checking manually
+            exit 0
+          fi
+
+          echo "Checking run $RUN_ID for limit errors..."
+
+          check_run_ids="$(gh api "repos/${REPO}/check-suites/${CHECK_SUITE_ID}/check-runs" --jq '.check_runs[] | select(.conclusion=="failure") | .id' || true)"
+
+          if [ -n "${check_run_ids:-}" ]; then
+            while IFS= read -r check_run_id; do
+              [ -n "$check_run_id" ] || continue
+              annotations="$(gh api "repos/${REPO}/check-runs/${check_run_id}/annotations" --paginate --jq '.[].message' || true)"
+              if printf '%s\n' "${annotations}" | grep -Fq "The job was not started because recent account payments have failed or your spending limit needs to be increased."; then
+                echo "match=true" >> "$GITHUB_OUTPUT"
+                echo "🚨 Detected Actions Limit from check-run annotation!"
+                exit 0
+              fi
+              if printf '%s\n' "${annotations}" | grep -Fq "recent account payments have failed or your spending limit needs to be increased"; then
+                echo "match=true" >> "$GITHUB_OUTPUT"
+                echo "🚨 Detected Actions Limit from check-run annotation!"
+                exit 0
+              fi
+            done <<< "${check_run_ids}"
+          fi
+
+          # Also check failed job payloads for billing-related strings when the run started far enough to create jobs.
+          jobs_payload="$(gh api repos/$REPO/actions/runs/$RUN_ID/jobs --jq '.jobs[] | select(.conclusion=="failure")' || true)"
+          if printf '%s\n' "${jobs_payload}" | grep -Eq "account payments have failed|spending limit needs to be increased"; then
+            echo "match=true" >> "$GITHUB_OUTPUT"
+            echo "🚨 Detected Actions Limit from job payload!"
+          else
+            echo "match=unknown" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Switch to Self-Hosted Fallback Mode
+        if: steps.dedup.outputs.skip != 'true' && steps.check.outputs.match == 'true'
+        run: |
+          echo "🔄 Switching CI provider mode to self-hosted fallback..."
+          gh variable set RUNNER_PROVIDER_MODE --body "self-hosted"
+          gh variable set USE_SELF_HOSTED --body "true"
+          gh variable set USE_AWS_CODEBUILD_RUNNERS --body "false"
+          gh variable set USE_AZURE_PIPELINES --body "false"
+          
+      - name: Record Last Check
+        if: steps.dedup.outputs.skip != 'true'
+        continue-on-error: true
+        run: |
+          # Record today's date
+          TODAY=$(date -u +%Y-%m-%d)
+          gh variable set LAST_LIMIT_CHECK --body "$TODAY"
+          
+      - name: Notify User
+        if: steps.dedup.outputs.skip != 'true' && steps.check.outputs.match == 'true'
+        run: |
+          if [ -z "${{ secrets.NTFY_TOKEN }}" ]; then
+            echo "NTFY_TOKEN not set; skipping notification."
+            exit 0
+          fi
+
+          curl -sS -X POST "https://ntfy.archer.casa/gha" \
+            -H "Authorization: Bearer ${{ secrets.NTFY_TOKEN }}" \
+            -H "Title: Actions Limit Hit" \
+            -H "Priority: high" \
+            -H "Tags: warning" \
+            -d "GitHub Actions limit detected. Forced CI fallback to self-hosted mode and disabled CodeBuild/Azure toggles." >/dev/null

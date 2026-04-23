@@ -1,0 +1,222 @@
+name: Sync Cleanarr to AWS ECR
+
+on:
+  schedule:
+    - cron: '0 2 * * *'
+  push:
+    branches:
+      - main
+    paths:
+      - '.github/workflows/sync-cleanarr-ecr.yml'
+  workflow_dispatch:
+    inputs:
+      version_tag:
+        description: 'The semver GHCR image tag to sync (e.g., v0.2.5)'
+        required: true
+
+env:
+  AWS_REGION: us-east-1
+  GHCR_OWNER: josh-archer
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  sync-images:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    steps:
+      - name: Install AWS CLI
+        uses: unfor19/install-aws-cli-action@v1
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v6
+        with:
+          role-to-assume: ${{ secrets.AWS_OIDC_ROLE_ARN }}
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GHCR_TOKEN }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+        with:
+          driver-opts: image=public.ecr.aws/vend/moby/buildkit:buildx-stable-1
+
+      - name: Ensure ECR Repositories Exist
+        run: |
+          aws ecr describe-repositories --repository-names cleanarr-webhook || aws ecr create-repository --repository-name cleanarr-webhook
+          aws ecr describe-repositories --repository-names cleanarr-job || aws ecr create-repository --repository-name cleanarr-job
+
+      - name: Determine Release
+        id: release
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            SYNC_TAG="${{ github.event.inputs.version_tag }}"
+          else
+            if ! SYNC_TAG="$(
+              git ls-remote --tags --refs --quiet "https://github.com/${{ env.GHCR_OWNER }}/cleanarr.git" 'refs/tags/v*' \
+                | awk '{print $2}' \
+                | sed 's#refs/tags/##' \
+                | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$' \
+                | sort -V \
+                | tail -n1
+            )"; then
+              echo "::error::Failed to resolve a semver tag from cleanarr git refs."
+              exit 1
+            fi
+          fi
+
+          if ! echo "${SYNC_TAG}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$'; then
+            echo "::error::Invalid release tag '${SYNC_TAG}'. Use a SemVer tag like v1.2.3."
+            exit 1
+          fi
+
+          if ! git ls-remote --exit-code --tags --quiet "https://github.com/${{ env.GHCR_OWNER }}/cleanarr.git" "refs/tags/${SYNC_TAG}" > /dev/null; then
+            echo "::error::Release tag '${SYNC_TAG}' does not exist in the cleanarr repository."
+            exit 1
+          fi
+
+          echo "sync_tag=${SYNC_TAG}" >> "$GITHUB_OUTPUT"
+          echo "cleanarr_ref=${SYNC_TAG}" >> "$GITHUB_OUTPUT"
+
+      - name: Pull and Verify Upstream Webhook Artifact
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+
+          SYNC_TAG="${{ steps.release.outputs.sync_tag }}"
+          SOURCE_IMAGE="ghcr.io/${{ env.GHCR_OWNER }}/cleanarr-webhook-app:${SYNC_TAG}"
+          ECR_IMAGE_TAG="${ECR_REGISTRY}/cleanarr-webhook:${SYNC_TAG}"
+
+          docker pull "${SOURCE_IMAGE}"
+          SOURCE_WEBHOOK_DIGEST="$(docker image inspect "${SOURCE_IMAGE}" --format '{{index .RepoDigests 0}}' | sed 's/^.*@//')"
+          if [ -z "${SOURCE_WEBHOOK_DIGEST}" ]; then
+            echo "::error::Unable to resolve immutable digest for ${SOURCE_IMAGE}."
+            exit 1
+          fi
+
+          # Fail fast if the release tag no longer maps to the same immutable digest.
+          SOURCE_WEBHOOK_REF="ghcr.io/${{ env.GHCR_OWNER }}/cleanarr-webhook-app@${SOURCE_WEBHOOK_DIGEST}"
+          docker pull "${SOURCE_WEBHOOK_REF}"
+          docker tag "${SOURCE_IMAGE}" "${ECR_IMAGE_TAG}"
+          docker push "${ECR_IMAGE_TAG}"
+
+          ECR_WEBHOOK_DIGEST="$(aws ecr describe-images \
+            --repository-name cleanarr-webhook \
+            --image-ids imageTag="${SYNC_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          if [ -z "${ECR_WEBHOOK_DIGEST}" ] || [ "${ECR_WEBHOOK_DIGEST}" = "None" ]; then
+            echo "::error::Failed to read pushed ECR digest for cleanarr-webhook:${SYNC_TAG}."
+            exit 1
+          fi
+
+          echo "SOURCE_WEBHOOK_DIGEST=${SOURCE_WEBHOOK_DIGEST}" >> "$GITHUB_ENV"
+          echo "ECR_WEBHOOK_DIGEST=${ECR_WEBHOOK_DIGEST}" >> "$GITHUB_ENV"
+
+          {
+            echo "## Cleanarr Sync Release Metadata"
+            echo "- Release tag: **${SYNC_TAG}**"
+            echo "- Upstream webhook image: \`${SOURCE_IMAGE}@${SOURCE_WEBHOOK_DIGEST}\`"
+            echo "- Promoted webhook image: \`${ECR_IMAGE_TAG}@${ECR_WEBHOOK_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build, Verify, and Push Consumer Lambda Image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+
+          SYNC_TAG="${{ steps.release.outputs.sync_tag }}"
+          CLEANARR_REF="${{ steps.release.outputs.cleanarr_ref }}"
+          WORKDIR="$(mktemp -d)"
+
+          if ! git ls-remote --exit-code --tags --quiet "https://github.com/${{ env.GHCR_OWNER }}/cleanarr.git" "refs/tags/${CLEANARR_REF}" > /dev/null; then
+            echo "::error::Tag '${CLEANARR_REF}' does not exist in https://github.com/${{ env.GHCR_OWNER }}/cleanarr.git."
+            exit 1
+          fi
+
+          git clone --depth 1 --branch "${CLEANARR_REF}" https://github.com/${{ env.GHCR_OWNER }}/cleanarr.git "${WORKDIR}/cleanarr-src"
+
+          if [ ! -f "${WORKDIR}/cleanarr-src/apps/lambda/Dockerfile" ]; then
+            echo "::error::apps/lambda/Dockerfile is missing at ref '${CLEANARR_REF}'."
+            exit 1
+          fi
+
+          SOURCE_GIT_COMMIT="$(git -C "${WORKDIR}/cleanarr-src" rev-parse HEAD)"
+          ECR_IMAGE_TAG="${ECR_REGISTRY}/cleanarr-job:${SYNC_TAG}"
+
+          docker buildx build \
+            --platform linux/amd64 \
+            --provenance=false \
+            --sbom=false \
+            -f "${WORKDIR}/cleanarr-src/apps/lambda/Dockerfile" \
+            -t "${ECR_IMAGE_TAG}" \
+            --push \
+            "${WORKDIR}/cleanarr-src"
+
+          ECR_JOB_DIGEST="$(aws ecr describe-images \
+            --repository-name cleanarr-job \
+            --image-ids imageTag="${SYNC_TAG}" \
+            --query 'imageDetails[0].imageDigest' \
+            --output text)"
+          if [ -z "${ECR_JOB_DIGEST}" ] || [ "${ECR_JOB_DIGEST}" = "None" ]; then
+            echo "::error::Failed to read pushed ECR digest for cleanarr-job:${SYNC_TAG}."
+            exit 1
+          fi
+
+          echo "SOURCE_GIT_COMMIT=${SOURCE_GIT_COMMIT}" >> "$GITHUB_ENV"
+          echo "ECR_JOB_DIGEST=${ECR_JOB_DIGEST}" >> "$GITHUB_ENV"
+          echo "SYNC_TAG=${SYNC_TAG}" >> "$GITHUB_ENV"
+
+          {
+            echo "- Job source ref: \`${CLEANARR_REF}\` @ \`${SOURCE_GIT_COMMIT}\`"
+            echo "- Promoted job image: \`${ECR_IMAGE_TAG}@${ECR_JOB_DIGEST}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Update Lambda Functions (Deploy new image)
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        run: |
+          set -euo pipefail
+
+          SYNC_TAG="${{ steps.release.outputs.sync_tag }}"
+          WEBHOOK_IMAGE_URI="${ECR_REGISTRY}/cleanarr-webhook@${ECR_WEBHOOK_DIGEST}"
+          JOB_IMAGE_URI="${ECR_REGISTRY}/cleanarr-job@${ECR_JOB_DIGEST}"
+
+          if aws lambda get-function --function-name cleanarr-webhook >/dev/null 2>&1; then
+            aws lambda update-function-code --function-name cleanarr-webhook --image-uri "${WEBHOOK_IMAGE_URI}"
+          else
+            echo "Lambda cleanarr-webhook not created yet, skipping update"
+          fi
+
+          if aws lambda get-function --function-name cleanarr-webhook-consumer >/dev/null 2>&1; then
+            aws lambda update-function-code --function-name cleanarr-webhook-consumer --image-uri "${JOB_IMAGE_URI}"
+          else
+            echo "Lambda cleanarr-webhook-consumer not created yet, skipping update"
+          fi
+
+          {
+            echo ""
+            echo "## Lambda Deployment"
+            echo "- cleanarr-webhook image URI: \`${WEBHOOK_IMAGE_URI}\`"
+            echo "- cleanarr-webhook-consumer image URI: \`${JOB_IMAGE_URI}\`"
+            echo ""
+            echo "## Rollback"
+            echo "- Re-run this workflow with a known-good tag in \`version_tag\`."
+            echo "- Known-good rollback tuple: \`${SYNC_TAG}\`, \`${SOURCE_GIT_COMMIT}\`"
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,292 @@
+name: Deploy Cleanarr to Cloud Run (GAR)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infrastructure/terraform/gcp-cleanarr/**'
+      - 'grok-servaar/media/cleanarr/**'
+      - 'grok-servaar/media/cleanarr/webhook/**'
+      - '.opentofu-version'
+      - 'scripts/tofu-init-with-retry.sh'
+  workflow_dispatch:
+    inputs:
+      allow_deletions:
+        description: 'Allow OpenTofu to destroy resources'
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: tofu-gcp-cleanarr
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  bootstrap:
+    name: Bootstrap GAR + APIs (OpenTofu)
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    if: vars.CLEANARR_WEBHOOK_MODE == 'cloudrun'
+    defaults:
+      run:
+        working-directory: infrastructure/terraform/gcp-cleanarr
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_plex_baseurl: "https://plex-api.archer.casa"
+      TF_VAR_plex_token: ${{ secrets.PLEX_TOKEN }}
+      TF_VAR_sonarr_baseurl: "https://sonarr-api.archer.casa/api/v3/"
+      TF_VAR_sonarr_apikey: ${{ secrets.SONARR_APIKEY }}
+      TF_VAR_radarr_baseurl: "https://radarr-api.archer.casa/api/v3/"
+      TF_VAR_radarr_apikey: ${{ secrets.RADARR_APIKEY }}
+      TF_VAR_cf_access_client_id: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_ID }}
+      TF_VAR_cf_access_client_secret: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_SECRET }}
+      TF_VAR_webhook_secret: ${{ secrets.CLEANARR_WEBHOOK_SECRET }}
+      TF_VAR_webhook_secret_previous: ${{ secrets.CLEANARR_WEBHOOK_SECRET_PREVIOUS }}
+      TF_VAR_public_invoker_enabled: "true"
+      # Optional. If unset, the app logs only to stdout (Cloud Logging) and won't try to push to Loki.
+      TF_VAR_loki_url: ${{ vars.LOKI_URL }}
+      # Dummy public image to satisfy variable evaluation during targeted apply/import.
+      TF_VAR_docker_image: "us-docker.pkg.dev/cloudrun/container/hello"
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Resolve Project ID
+        run: |
+          set -euo pipefail
+          PROJECT_ID="${CLOUDSDK_CORE_PROJECT:-}"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_ID="${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}"
+          fi
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::Unable to determine GCP project id (CLOUDSDK_CORE_PROJECT is empty and GCP_PROJECT_ID secret is missing)."
+            exit 1
+          fi
+          echo "TF_VAR_project_id=$PROJECT_ID" >> "$GITHUB_ENV"
+
+      - name: OpenTofu Init
+        env:
+          TOFU_BACKEND_STATE_KEY: gcp-cleanarr/terraform.tfstate
+        run: |
+          bash ../../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Import existing GAR repo into state (if it already exists)
+        env:
+          GAR_LOCATION: us-central1
+          GAR_REPOSITORY: cleanarr
+        run: |
+          set -euo pipefail
+          # If the repo exists but isn't in state, the first apply will hit a 409 already-exists.
+          if tofu state show -no-color google_artifact_registry_repository.cleanarr >/dev/null 2>&1; then
+            echo "GAR repo already in state; skipping import."
+          elif gcloud artifacts repositories describe "$GAR_REPOSITORY" --location "$GAR_LOCATION" --project "$TF_VAR_project_id" >/dev/null 2>&1; then
+            echo "GAR repo exists but is not in state; importing..."
+            timeout 120s tofu import -no-color -input=false -lock-timeout=30s \
+              google_artifact_registry_repository.cleanarr \
+              "projects/${TF_VAR_project_id}/locations/${GAR_LOCATION}/repositories/${GAR_REPOSITORY}"
+          else
+            echo "GAR repo does not exist yet; skipping import."
+          fi
+
+      - name: Migrate legacy state address for public invoker IAM member (pre-count)
+        run: |
+          set -euo pipefail
+          if tofu state show -no-color google_cloud_run_v2_service_iam_member.public_invoker >/dev/null 2>&1; then
+            echo "Found legacy public invoker state address; moving to counted instance..."
+            tofu state mv -no-color \
+              google_cloud_run_v2_service_iam_member.public_invoker \
+              'google_cloud_run_v2_service_iam_member.public_invoker[0]'
+          else
+            echo "No legacy public invoker state address found; skipping."
+          fi
+
+      - name: "OpenTofu Apply (targets: billing link, APIs, GAR repo, IAM)"
+        run: |
+          set -euo pipefail
+          tofu apply -input=false -auto-approve -lock-timeout=30s \
+            -target=google_project_service.serviceusage \
+            -target=google_project_service.iam \
+            -target=google_project_service.run \
+            -target=google_project_service.artifactregistry \
+            -target=google_project_service.cloudbuild \
+            -target=google_artifact_registry_repository.cleanarr \
+            -target=google_artifact_registry_repository_iam_member.cloud_run_agent_reader
+
+  build-and-push:
+    name: Build and Push (GAR)
+    needs: bootstrap
+    runs-on: home-gh-runner
+    if: vars.CLEANARR_WEBHOOK_MODE == 'cloudrun'
+    env:
+      GAR_LOCATION: us-central1
+      GAR_REPOSITORY: cleanarr
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Resolve Project ID
+        run: |
+          set -euo pipefail
+          PROJECT_ID="${CLOUDSDK_CORE_PROJECT:-}"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_ID="${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}"
+          fi
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::Unable to determine GCP project id (CLOUDSDK_CORE_PROJECT is empty and GCP_PROJECT_ID secret is missing)."
+            exit 1
+          fi
+          echo "PROJECT_ID=$PROJECT_ID" >> "$GITHUB_ENV"
+
+      - name: Configure Docker auth for GAR
+        run: |
+          set -euo pipefail
+          gcloud auth configure-docker "${GAR_LOCATION}-docker.pkg.dev" --quiet
+
+      - uses: docker/setup-qemu-action@v4
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build and push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: grok-servaar/media/cleanarr/webhook/Dockerfile
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: |
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/cleanarr-webhook:latest
+            ${{ env.GAR_LOCATION }}-docker.pkg.dev/${{ env.PROJECT_ID }}/${{ env.GAR_REPOSITORY }}/cleanarr-webhook:sha-${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    name: Deploy (OpenTofu)
+    needs: build-and-push
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    if: vars.CLEANARR_WEBHOOK_MODE == 'cloudrun'
+    defaults:
+      run:
+        working-directory: infrastructure/terraform/gcp-cleanarr
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      # Webhook Config
+      TF_VAR_plex_baseurl: "https://plex-api.archer.casa"
+      TF_VAR_plex_token: ${{ secrets.PLEX_TOKEN }}
+      TF_VAR_sonarr_baseurl: "https://sonarr-api.archer.casa/api/v3/"
+      TF_VAR_sonarr_apikey: ${{ secrets.SONARR_APIKEY }}
+      TF_VAR_radarr_baseurl: "https://radarr-api.archer.casa/api/v3/"
+      TF_VAR_radarr_apikey: ${{ secrets.RADARR_APIKEY }}
+
+      # Cloudflare Access Tokens
+      TF_VAR_cf_access_client_id: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_ID }}
+      TF_VAR_cf_access_client_secret: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_SECRET }}
+      TF_VAR_webhook_secret: ${{ secrets.CLEANARR_WEBHOOK_SECRET }}
+      TF_VAR_webhook_secret_previous: ${{ secrets.CLEANARR_WEBHOOK_SECRET_PREVIOUS }}
+      TF_VAR_public_invoker_enabled: "true"
+
+      # Logging
+      # Optional. If unset, the app logs only to stdout (Cloud Logging) and won't try to push to Loki.
+      TF_VAR_loki_url: ${{ vars.LOKI_URL }}
+    steps:
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Resolve Project ID + Image
+        env:
+          GAR_LOCATION: us-central1
+          GAR_REPOSITORY: cleanarr
+        run: |
+          set -euo pipefail
+          PROJECT_ID="${CLOUDSDK_CORE_PROJECT:-}"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_ID="${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}"
+          fi
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::Unable to determine GCP project id (CLOUDSDK_CORE_PROJECT is empty and GCP_PROJECT_ID secret is missing)."
+            exit 1
+          fi
+          echo "TF_VAR_project_id=$PROJECT_ID" >> "$GITHUB_ENV"
+          echo "TF_VAR_docker_image=${GAR_LOCATION}-docker.pkg.dev/${PROJECT_ID}/${GAR_REPOSITORY}/cleanarr-webhook:sha-${{ github.sha }}" >> "$GITHUB_ENV"
+
+      - name: OpenTofu Init
+        env:
+          TOFU_BACKEND_STATE_KEY: gcp-cleanarr/terraform.tfstate
+        run: |
+          bash ../../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Import existing GAR repo into state (if it already exists)
+        env:
+          GAR_LOCATION: us-central1
+          GAR_REPOSITORY: cleanarr
+        run: |
+          set -euo pipefail
+          if tofu state show -no-color google_artifact_registry_repository.cleanarr >/dev/null 2>&1; then
+            echo "GAR repo already in state; skipping import."
+          elif gcloud artifacts repositories describe "$GAR_REPOSITORY" --location "$GAR_LOCATION" --project "$TF_VAR_project_id" >/dev/null 2>&1; then
+            echo "GAR repo exists but is not in state; importing..."
+            timeout 120s tofu import -no-color -input=false -lock-timeout=30s \
+              google_artifact_registry_repository.cleanarr \
+              "projects/${TF_VAR_project_id}/locations/${GAR_LOCATION}/repositories/${GAR_REPOSITORY}"
+          else
+            echo "GAR repo does not exist yet; skipping import."
+          fi
+
+      - name: OpenTofu Apply
+        run: |
+          set -euo pipefail
+          tofu plan -input=false -out=tfplan > plan.log 2>&1 || true
+          cat plan.log
+          if grep -Eq '[1-9][0-9]* to destroy' plan.log; then
+            if [ "${{ inputs.allow_deletions }}" != "true" ]; then
+              echo "ERROR: Plan indicates resources will be destroyed!" >&2
+              echo "Manually trigger this workflow and check 'allow_deletions'." >&2
+              exit 1
+            else
+              echo "WARNING: Deletions detected, but allow_deletions is true." >&2
+            fi
+          fi
+          tofu apply -input=false -auto-approve -lock-timeout=30s tfplan

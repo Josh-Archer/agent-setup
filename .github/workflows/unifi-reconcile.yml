@@ -1,0 +1,228 @@
+name: Reconcile UniFi
+
+on:
+  workflow_dispatch:
+    inputs:
+      allow_deletions:
+        description: 'Allow OpenTofu to destroy resources'
+        type: boolean
+        required: false
+        default: false
+  push:
+    paths:
+      - 'terraform/unifi/**'
+      - 'scripts/unifi/**'
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  reconcile:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    env:
+      # UniFi Credentials
+      TF_VAR_api_url: "http://127.0.0.1:8787"
+      TF_VAR_username: ${{ secrets.UNIFI_USERNAME }}
+      TF_VAR_password: ${{ secrets.UNIFI_PASSWORD }}
+      TF_VAR_allow_insecure: true
+      TF_IN_AUTOMATION: true
+      # Cloudflare
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      # R2 State
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      # Zero Trust
+      UNIFI_ZERO_TRUST_HEADERS_JSON_RAW: ${{ secrets.UNIFI_ZERO_TRUST_HEADERS_JSON }}
+      ZERO_TRUST_HEADERS_JSON_FALLBACK: ${{ secrets.ZERO_TRUST_HEADERS_JSON }}
+      # State Encryption
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+      # UniFi Settings
+      UNIFI_LOGIN_STYLE: "legacy"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v5
+        with:
+          version: v1.34.1
+
+      - name: Setup Network Access
+        id: network_access
+        uses: ./.github/actions/setup-cluster-access
+        with:
+          tailscale_auth_key: ${{ secrets.GHA_RUNNER_TAILSCALE_AUTH_KEY }}
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.14'
+
+      - name: Refresh UniFi Access headers from Cloudflare state
+        working-directory: terraform/cloudflare-access
+        env:
+          TOFU_BACKEND_STATE_KEY: cloudflare-access/terraform.tfstate
+        run: |
+          set -euo pipefail
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+          UNIFI_CLIENT_ID=""
+          UNIFI_CLIENT_SECRET=""
+          if tofu -no-color output -raw unifi_terraform_client_id >/tmp/unifi_id.txt 2>/dev/null; then
+            UNIFI_CLIENT_ID="$(tail -n 1 /tmp/unifi_id.txt | tr -d '\r\n')"
+          fi
+          if tofu -no-color output -raw unifi_terraform_client_secret >/tmp/unifi_secret.txt 2>/dev/null; then
+            UNIFI_CLIENT_SECRET="$(tail -n 1 /tmp/unifi_secret.txt | tr -d '\r\n')"
+          fi
+
+          if [ -n "$UNIFI_CLIENT_ID" ] && [ -n "$UNIFI_CLIENT_SECRET" ]; then
+            UNIFI_JSON=$(UNIFI_CLIENT_ID="$UNIFI_CLIENT_ID" UNIFI_CLIENT_SECRET="$UNIFI_CLIENT_SECRET" python3 -c 'import json, os; print(json.dumps({"CF-Access-Client-Id": os.environ["UNIFI_CLIENT_ID"], "CF-Access-Client-Secret": os.environ["UNIFI_CLIENT_SECRET"]}))')
+            echo "::add-mask::$UNIFI_JSON"
+            echo "REFRESHED_ZERO_TRUST_HEADERS_JSON=$UNIFI_JSON" >> "$GITHUB_ENV"
+            echo "Refreshed ZERO_TRUST_HEADERS_JSON from Cloudflare state."
+          fi
+
+      - name: Normalize ZERO_TRUST_HEADERS_JSON
+        run: |
+          set -euo pipefail
+
+          normalize_json_object() {
+            local value="$1"
+            if [ -z "$value" ]; then
+              return 0
+            fi
+            printf '%s' "$value" | jq -ce 'if type == "object" then . else error("not object") end' 2>/dev/null || true
+          }
+
+          normalized="$(normalize_json_object "${REFRESHED_ZERO_TRUST_HEADERS_JSON:-}")"
+
+          if [ -z "$normalized" ]; then
+            normalized="$(normalize_json_object "${UNIFI_ZERO_TRUST_HEADERS_JSON_RAW:-}")"
+            if [ -n "$normalized" ]; then
+              echo "Using repository secret UNIFI_ZERO_TRUST_HEADERS_JSON."
+            fi
+          fi
+
+          if [ -z "$normalized" ]; then
+            normalized="$(normalize_json_object "${ZERO_TRUST_HEADERS_JSON_FALLBACK:-}")"
+            if [ -n "$normalized" ]; then
+              echo "Primary UniFi Zero Trust secret is invalid; using ZERO_TRUST_HEADERS_JSON fallback."
+            fi
+          fi
+
+          if [ -z "$normalized" ]; then
+            echo "Missing valid ZERO_TRUST_HEADERS_JSON for UniFi reconcile." >&2
+            exit 1
+          fi
+
+          echo "::add-mask::$normalized"
+          echo "NORMALIZED_ZERO_TRUST_HEADERS_JSON=$normalized" >> "$GITHUB_ENV"
+
+      - name: OpenTofu Init
+        working-directory: terraform/unifi
+        env:
+          TOFU_BACKEND_STATE_KEY: unifi/terraform.tfstate
+        run: |
+          # Copy generated resources to current directory so OpenTofu sees them
+          cp generated/*.tf . 2>/dev/null || true
+          
+          echo 'username = "${{ secrets.UNIFI_USERNAME }}"' >> secrets.auto.tfvars
+          echo 'password = "${{ secrets.UNIFI_PASSWORD }}"' >> secrets.auto.tfvars
+          echo 'api_url = "http://127.0.0.1:8787"' >> secrets.auto.tfvars
+          echo 'allow_insecure = true' >> secrets.auto.tfvars
+          
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: OpenTofu Apply
+        working-directory: terraform/unifi
+        env:
+          CLOUD_DNS_IPS_VAR: ${{ vars.CLOUD_DNS_IPS }}
+        run: |
+          set -euo pipefail
+
+          # Keep the UniFi Zero Trust proxy alive for the full plan/apply step.
+          PYTHON_BIN=python3
+          if ! command -v "$PYTHON_BIN" >/dev/null 2>&1; then
+            PYTHON_BIN=python
+          fi
+
+          PROXY_LOG=/tmp/unifi-zero-trust-proxy.log
+          "$PYTHON_BIN" ../../scripts/unifi/zero_trust_proxy.py --target-base-url https://192.168.1.150:8443 --headers-json "$NORMALIZED_ZERO_TRUST_HEADERS_JSON" --allow-insecure >"$PROXY_LOG" 2>&1 &
+          PROXY_PID=$!
+          cleanup() {
+            kill "$PROXY_PID" 2>/dev/null || true
+            wait "$PROXY_PID" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          for i in {1..10}; do
+            if curl -s http://127.0.0.1:8787 > /dev/null; then
+              echo "Proxy is up!"
+              break
+            fi
+            if ! kill -0 "$PROXY_PID" 2>/dev/null; then
+              echo "Zero Trust proxy exited before becoming ready." >&2
+              cat "$PROXY_LOG" >&2 || true
+              exit 1
+            fi
+            echo "Waiting for proxy..."
+            sleep 1
+          done
+
+          if ! curl -s http://127.0.0.1:8787 > /dev/null; then
+            echo "Zero Trust proxy did not become ready." >&2
+            cat "$PROXY_LOG" >&2 || true
+            exit 1
+          fi
+          
+          # Convert comma-separated IPs from variable to HCL list format
+          TF_VAR_cloud_dns_ips="[]"
+          if [ -n "${CLOUD_DNS_IPS_VAR:-}" ]; then
+            IPS_JSON="$(jq -Rnc --arg ips "$CLOUD_DNS_IPS_VAR" '$ips | split(",") | map(gsub("^\\s+|\\s+$"; "")) | map(select(length > 0))')"
+            echo "TF_VAR_cloud_dns_ips=$IPS_JSON" >> "$GITHUB_ENV"
+            export TF_VAR_cloud_dns_ips="$IPS_JSON"
+            echo "Using Cloud DNS IPs: $IPS_JSON"
+          else
+            echo "No Cloud DNS IPs configured in repository variable CLOUD_DNS_IPS."
+          fi
+
+          tofu plan -input=false -no-color -out=tfplan > plan.log 2>&1 || true
+          cat plan.log
+          if grep -Eq '[1-9][0-9]* to destroy' plan.log; then
+            if [ "${{ inputs.allow_deletions }}" != "true" ]; then
+              echo "ERROR: Plan indicates resources will be destroyed!" >&2
+              echo "Manually trigger this workflow and check 'allow_deletions'." >&2
+              exit 1
+            else
+              echo "WARNING: Deletions detected, but allow_deletions is true." >&2
+            fi
+          fi
+          tofu apply -input=false -no-color -auto-approve tfplan
+
+      - name: Notify ntfy
+        if: always()
+        env:
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          NTFY_TOPIC: gha
+          NTFY_TITLE: "UniFi Reconcile"
+          NTFY_PRIORITY: ${{ job.status == 'success' && 'default' || 'high' }}
+          NTFY_TAGS: ${{ job.status == 'success' && 'satellite,check' || 'warning,satellite' }}
+          NTFY_MESSAGE: |
+            unifi-reconcile: ${{ job.status }}
+            allow_deletions: ${{ inputs.allow_deletions }}
+            repo: ${{ github.repository }}
+            run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: bash scripts/notify_ntfy.sh

@@ -1,0 +1,1238 @@
+name: Azure Deploy
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'infrastructure/terraform/azure-**'
+  workflow_dispatch:
+    inputs:
+      location_override:
+        description: "Optional Azure region override for this manual run (for example westus3)"
+        required: false
+        type: string
+        default: ""
+      deployment_suffix:
+        description: "Deployment suffix for a parallel target (use 'prod' for the current stack)"
+        required: false
+        type: string
+        default: "prod"
+      postgres_server_name:
+        description: "Optional PostgreSQL Flexible Server name override"
+        required: false
+        type: string
+        default: ""
+      sync_consumer_secrets:
+        description: "Update live cluster DB secrets to point at this target"
+        required: false
+        type: boolean
+        default: false
+      trigger_restore:
+        description: "Run one-time data restore from consolidated Postgres to Azure replica"
+        required: false
+        type: boolean
+        default: false
+      restore_source_host:
+        description: "Optional source PostgreSQL host for the restore job"
+        required: false
+        type: string
+        default: "consolidated-postgres.infra.svc.cluster.local"
+      restore_node_selector_hostname:
+        description: "Optional node hostname for the restore job pod"
+        required: false
+        type: string
+        default: "mac-worker"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  deploy:
+    if: ${{ vars.ENABLE_AZURE_LIDARR_DEPLOY == 'true' || github.event_name == 'workflow_dispatch' }}
+    name: Tofu Apply (Azure)
+    runs-on: ${{ (vars.RUNNER_PROVIDER_MODE == 'self-hosted' || vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    env:
+      ARM_CLIENT_ID: ${{ secrets.AZURE_CLIENT_ID }}
+      ARM_CLIENT_SECRET: ${{ secrets.AZURE_CLIENT_SECRET }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      ARM_TENANT_ID: ${{ secrets.AZURE_TENANT_ID }}
+      AZURE_LOCATION_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.location_override || vars.AZURE_LOCATION }}
+      AZURE_POSTGRES_LOCATION_DENYLIST: ${{ vars.AZURE_POSTGRES_LOCATION_DENYLIST }}
+      AZURE_ALLOW_REGION_RECREATE: ${{ vars.AZURE_ALLOW_REGION_RECREATE }}
+      AZURE_DEPLOYMENT_SUFFIX_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deployment_suffix || vars.AZURE_DEPLOYMENT_SUFFIX }}
+      AZURE_POSTGRES_SERVER_NAME_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.postgres_server_name || vars.AZURE_POSTGRES_SERVER_NAME }}
+      AZURE_SYNC_CONSUMER_SECRETS_OVERRIDE: ${{ vars.AZURE_SYNC_CONSUMER_SECRETS }}
+      WORKFLOW_DISPATCH_SYNC_CONSUMER_SECRETS: ${{ github.event.inputs.sync_consumer_secrets }}
+      RESTORE_SOURCE_HOST_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.restore_source_host || vars.AZURE_RESTORE_SOURCE_HOST }}
+      RESTORE_NODE_SELECTOR_HOSTNAME_OVERRIDE: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.restore_node_selector_hostname || vars.AZURE_RESTORE_NODE_SELECTOR_HOSTNAME }}
+      TF_VAR_subscription_id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_VAR_postgres_admin_login: "homelabdbadmin"
+      TF_VAR_postgres_admin_password: ${{ secrets.AZURE_POSTGRES_PASSWORD }}
+      TF_VAR_ntfy_webhook_url: "https://ntfy.archer.casa/homelab-alerts"
+    
+    steps:
+      - uses: actions/checkout@v6
+      
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - name: Resolve deployment naming
+        id: resolve_deployment
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+
+          suffix_override = os.getenv("AZURE_DEPLOYMENT_SUFFIX_OVERRIDE", "").strip()
+          server_override = os.getenv("AZURE_POSTGRES_SERVER_NAME_OVERRIDE", "").strip().lower()
+          if os.getenv("GITHUB_EVENT_NAME") == "workflow_dispatch":
+              sync_override = os.getenv("WORKFLOW_DISPATCH_SYNC_CONSUMER_SECRETS", "").strip().lower()
+          else:
+              sync_override = os.getenv("AZURE_SYNC_CONSUMER_SECRETS_OVERRIDE", "").strip().lower()
+
+          def normalize_suffix(raw: str) -> str:
+              value = re.sub(r"[^a-z0-9-]", "", raw.lower().replace("_", "-"))
+              value = value.strip("-")
+              return value or "prod"
+
+          suffix = normalize_suffix(suffix_override or "prod")
+          storage_suffix = re.sub(r"[^a-z0-9]", "", suffix)
+
+          if suffix == "prod":
+              resource_group_name = "rg-lidarr-prod"
+              storage_account_name = "stlidarrprod"
+              monitor_action_group_name = "ag-lidarr-ntfy"
+              monitor_metric_alert_name = "alert-lidarr-egress"
+              postgres_server_name = server_override or "homelabdb"
+          else:
+              resource_group_name = f"rg-lidarr-{suffix}"
+              storage_account_name = f"stlidarr{storage_suffix}"[:24]
+              monitor_action_group_name = f"ag-lidarr-ntfy-{suffix}"
+              monitor_metric_alert_name = f"alert-lidarr-egress-{suffix}"
+              postgres_server_name = server_override or f"homelabdb-{suffix}"
+
+          sync_consumer_secrets = (
+              suffix == "prod"
+              and (sync_override in {"1", "true", "yes"} or postgres_server_name == "homelabdb")
+          )
+          target_postgres_fqdn = f"{postgres_server_name}.postgres.database.azure.com"
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"DEPLOYMENT_SUFFIX={suffix}\n")
+              env_file.write(f"TF_VAR_postgres_server_name={postgres_server_name}\n")
+              env_file.write(f"TF_VAR_resource_group_name={resource_group_name}\n")
+              env_file.write(f"TF_VAR_storage_account_name={storage_account_name}\n")
+              env_file.write(f"TF_VAR_monitor_action_group_name={monitor_action_group_name}\n")
+              env_file.write(f"TF_VAR_monitor_metric_alert_name={monitor_metric_alert_name}\n")
+              env_file.write(f"AZURE_TARGET_POSTGRES_FQDN={target_postgres_fqdn}\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out_file:
+              out_file.write(f"deployment_suffix={suffix}\n")
+              out_file.write(f"postgres_server_name={postgres_server_name}\n")
+              out_file.write(f"resource_group_name={resource_group_name}\n")
+              out_file.write(f"storage_account_name={storage_account_name}\n")
+              out_file.write(f"target_postgres_fqdn={target_postgres_fqdn}\n")
+              out_file.write(f"sync_consumer_secrets={'true' if sync_consumer_secrets else 'false'}\n")
+
+          print(f"Deployment suffix: {suffix}")
+          print(f"Postgres server: {postgres_server_name}")
+          print(f"Resource group: {resource_group_name}")
+          print(f"Storage account: {storage_account_name}")
+          print(f"Sync live consumer secrets: {sync_consumer_secrets}")
+          PY
+
+      - name: Validate Azure subscription access
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.parse
+          import urllib.request
+
+          tenant = os.environ["ARM_TENANT_ID"]
+          client_id = os.environ["ARM_CLIENT_ID"]
+          client_secret = os.environ["ARM_CLIENT_SECRET"]
+          subscription_id = os.environ["ARM_SUBSCRIPTION_ID"]
+
+          token_body = urllib.parse.urlencode(
+            {
+              "client_id": client_id,
+              "client_secret": client_secret,
+              "scope": "https://management.azure.com/.default",
+              "grant_type": "client_credentials",
+            }
+          ).encode("utf-8")
+
+          token_req = urllib.request.Request(
+            f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+            data=token_body,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+          )
+          with urllib.request.urlopen(token_req) as token_resp:
+            token = json.loads(token_resp.read().decode("utf-8"))["access_token"]
+
+          subs_req = urllib.request.Request(
+            "https://management.azure.com/subscriptions?api-version=2020-01-01",
+            headers={"Authorization": f"Bearer {token}"},
+          )
+          with urllib.request.urlopen(subs_req) as subs_resp:
+            payload = json.loads(subs_resp.read().decode("utf-8"))
+
+          visible = payload.get("value", [])
+          visible_ids = {item.get("subscriptionId") for item in visible}
+          if subscription_id not in visible_ids:
+            print(
+              f"::error::Service principal cannot access subscription {subscription_id}. "
+              f"Visible subscriptions: {len(visible)}"
+            )
+            sys.exit(1)
+
+          print(f"Azure subscription access verified for {subscription_id}.")
+          PY
+
+      - name: Ensure required Azure providers are registered
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.parse
+          import urllib.request
+
+          tenant = os.environ["ARM_TENANT_ID"]
+          client_id = os.environ["ARM_CLIENT_ID"]
+          client_secret = os.environ["ARM_CLIENT_SECRET"]
+          subscription_id = os.environ["ARM_SUBSCRIPTION_ID"]
+
+          providers = [
+              "Microsoft.App",
+              "Microsoft.DBforPostgreSQL",
+              "Microsoft.Storage",
+              "Microsoft.OperationalInsights",
+              "Microsoft.Insights",
+          ]
+
+          token_body = urllib.parse.urlencode(
+              {
+                  "client_id": client_id,
+                  "client_secret": client_secret,
+                  "scope": "https://management.azure.com/.default",
+                  "grant_type": "client_credentials",
+              }
+          ).encode("utf-8")
+
+          token_req = urllib.request.Request(
+              f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+              data=token_body,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+          )
+          with urllib.request.urlopen(token_req) as token_resp:
+              token = json.loads(token_resp.read().decode("utf-8"))["access_token"]
+
+          def arm_request(url: str, method: str = "GET") -> dict:
+              req = urllib.request.Request(
+                  url,
+                  headers={"Authorization": f"Bearer {token}"},
+                  method=method,
+              )
+              with urllib.request.urlopen(req) as resp:
+                  body = resp.read().decode("utf-8")
+                  return json.loads(body) if body else {}
+
+          for namespace in providers:
+              provider_url = (
+                  f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/providers/{namespace}?api-version=2021-04-01"
+              )
+              register_url = (
+                  f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/providers/{namespace}/register?api-version=2021-04-01"
+              )
+
+              current = arm_request(provider_url)
+              state = (current.get("registrationState") or "").lower()
+              if state == "registered":
+                  print(f"{namespace} already registered.")
+                  continue
+
+              print(f"Registering {namespace} (current state: {state or 'unknown'})...")
+              arm_request(register_url, method="POST")
+
+              for _ in range(60):
+                  polled = arm_request(provider_url)
+                  polled_state = (polled.get("registrationState") or "").lower()
+                  if polled_state == "registered":
+                      print(f"{namespace} registered.")
+                      break
+                  time.sleep(5)
+              else:
+                  print(f"::error::Timed out waiting for {namespace} to register.")
+                  sys.exit(1)
+          PY
+
+      - name: Resolve allowed Azure location
+        id: resolve_location
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.parse
+          import urllib.request
+          from urllib.error import HTTPError
+
+          tenant = os.environ["ARM_TENANT_ID"]
+          client_id = os.environ["ARM_CLIENT_ID"]
+          client_secret = os.environ["ARM_CLIENT_SECRET"]
+          subscription_id = os.environ["ARM_SUBSCRIPTION_ID"]
+          location_override = os.getenv("AZURE_LOCATION_OVERRIDE", "").strip()
+          denylist_raw = os.getenv("AZURE_POSTGRES_LOCATION_DENYLIST", "").strip()
+          if not denylist_raw:
+              # Verified on 2026-04-12 with actual create attempts: this subscription
+              # returns LocationIsOfferRestricted for PostgreSQL Flexible Server in
+              # eastus2 and southcentralus even though the policy allows them.
+              denylist_raw = "eastus2,southcentralus"
+
+          preferred = [
+              "canadacentral",
+              "westus3",
+              "mexicocentral",
+              "eastus2",
+              "southcentralus",
+              "eastus",
+              "centralus",
+              "westus",
+          ]
+
+          explicit_allowed = {
+              "eastus2",
+              "southcentralus",
+              "eastus",
+              "centralus",
+              "westus3",
+              "westus",
+              "canadacentral",
+              "mexicocentral",
+          }
+
+          def normalize(location: str) -> str:
+              return location.replace(" ", "").lower()
+
+          postgres_location_denylist = {
+              normalize(location)
+              for location in denylist_raw.split(",")
+              if location.strip()
+          }
+
+          token_body = urllib.parse.urlencode(
+              {
+                  "client_id": client_id,
+                  "client_secret": client_secret,
+                  "scope": "https://management.azure.com/.default",
+                  "grant_type": "client_credentials",
+              }
+          ).encode("utf-8")
+
+          token_req = urllib.request.Request(
+              f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+              data=token_body,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+          )
+          with urllib.request.urlopen(token_req) as token_resp:
+              token = json.loads(token_resp.read().decode("utf-8"))["access_token"]
+
+          def arm_get(url: str) -> dict:
+              req = urllib.request.Request(url, headers={"Authorization": f"Bearer {token}"})
+              with urllib.request.urlopen(req) as resp:
+                  return json.loads(resp.read().decode("utf-8"))
+
+          locations_payload = arm_get(
+              f"https://management.azure.com/subscriptions/{subscription_id}/locations?api-version=2022-12-01"
+          )
+
+          allowed = {}
+          for entry in locations_payload.get("value", []):
+              name = (entry.get("name") or "").strip()
+              if name:
+                  allowed[normalize(name)] = name
+
+          if not allowed:
+              print("::error::Could not discover any allowed Azure locations for this subscription.")
+              sys.exit(1)
+
+          def get_policy_allowed_locations() -> set:
+              payload = arm_get(
+                  f"https://management.azure.com/subscriptions/{subscription_id}/providers/Microsoft.Authorization/policyAssignments?api-version=2023-04-01"
+              )
+              result = set()
+              for assignment in payload.get("value", []):
+                  params = assignment.get("properties", {}).get("parameters", {})
+                  values = params.get("listOfAllowedLocations", {}).get("value")
+                  if isinstance(values, list):
+                      for loc in values:
+                          if loc:
+                              result.add(normalize(str(loc)))
+              return result
+
+          def get_provider_locations(namespace: str, resource_type: str) -> set:
+              payload = arm_get(
+                  f"https://management.azure.com/subscriptions/{subscription_id}/providers/{namespace}?api-version=2022-09-01"
+              )
+              resource_types = payload.get("resourceTypes", [])
+              matches = [
+                  rt
+                  for rt in resource_types
+                  if (rt.get("resourceType") or "").lower() == resource_type.lower()
+              ]
+              if not matches:
+                  return set()
+              result = set()
+              for match in matches:
+                  for loc in match.get("locations", []):
+                      result.add(normalize(loc))
+              return result
+
+          provider_constraints = [
+              ("Microsoft.DBforPostgreSQL", "flexibleServers"),
+              ("Microsoft.Storage", "storageAccounts"),
+              ("Microsoft.OperationalInsights", "workspaces"),
+              ("Microsoft.App", "managedEnvironments"),
+          ]
+
+          candidates = set(allowed.keys())
+          policy_allowed = get_policy_allowed_locations()
+          if policy_allowed:
+              print(
+                  f"Applying policy allowed locations: {', '.join(sorted(policy_allowed))}"
+              )
+              candidates &= policy_allowed
+          for namespace, resource_type in provider_constraints:
+              supported = get_provider_locations(namespace, resource_type)
+              if supported:
+                  candidates &= supported
+
+          candidates &= explicit_allowed
+
+          if postgres_location_denylist:
+              print(
+                  f"Applying PostgreSQL location denylist: {', '.join(sorted(postgres_location_denylist))}"
+              )
+
+          def postgres_offer_allows(location_key: str) -> bool:
+              probe_url = (
+                  f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/providers/Microsoft.DBforPostgreSQL/locations/{location_key}/capabilities"
+                  f"?api-version=2022-12-01"
+              )
+              req = urllib.request.Request(probe_url, headers={"Authorization": f"Bearer {token}"})
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      payload = json.loads(resp.read().decode("utf-8"))
+
+                  for feature in payload.get("supportedFeatures", []):
+                      name = (feature.get("name") or "").lower()
+                      status = (feature.get("status") or "").lower()
+                      if name == "offerrestricted" and status == "enabled":
+                          reason = payload.get("reason") or "PostgreSQL offer is restricted for this subscription."
+                          print(
+                              f"::warning::Skipping location '{allowed.get(location_key, location_key)}' because {reason}"
+                          )
+                          return False
+
+                  return True
+              except HTTPError as exc:
+                  body = exc.read().decode("utf-8", errors="ignore")
+                  details = body.lower()
+                  if (
+                      "locationisofferrestricted" in details
+                      or "restricted from provisioning" in details
+                  ):
+                      print(
+                          f"::warning::Skipping location '{allowed.get(location_key, location_key)}' because PostgreSQL offer is restricted for this subscription."
+                      )
+                      return False
+
+                  print(
+                      f"::warning::Could not verify PostgreSQL offer for location '{allowed.get(location_key, location_key)}' (HTTP {exc.code}). Keeping as fallback candidate."
+                  )
+                  return True
+
+          if candidates:
+              postgres_viable = set()
+
+              for location_key in candidates:
+                  if location_key in postgres_location_denylist:
+                      print(
+                          f"::warning::Skipping location '{allowed.get(location_key, location_key)}' because it is configured in AZURE_POSTGRES_LOCATION_DENYLIST."
+                      )
+                      continue
+
+                  if postgres_offer_allows(location_key):
+                      postgres_viable.add(location_key)
+
+              if postgres_viable:
+                  candidates = postgres_viable
+              else:
+                  print(
+                      "::error::All candidate locations are restricted for PostgreSQL provisioning under this subscription."
+                  )
+                  sys.exit(1)
+
+          if not candidates:
+              print(
+                  "::error::No common location found across subscription allowances and required Azure resource providers."
+              )
+              sys.exit(1)
+
+          selected = ""
+          if location_override:
+              requested = normalize(location_override)
+              if requested in candidates:
+                  selected = requested
+              else:
+                  print(
+                      f"::error::AZURE_LOCATION override '{location_override}' is not allowed/supported for this deployment."
+                  )
+                  sys.exit(1)
+
+          if not selected:
+              for preferred_location in preferred:
+                  if preferred_location in candidates:
+                      selected = preferred_location
+                      break
+
+          if not selected:
+              selected = sorted(candidates)[0]
+
+          selected_raw = allowed[selected]
+          print(f"Selected Azure location: {selected_raw} ({selected})")
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as env_file:
+              env_file.write(f"TF_VAR_location={selected_raw}\n")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as out_file:
+              out_file.write(f"location={selected_raw}\n")
+          PY
+
+      - name: Validate existing resource group location
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import urllib.parse
+          import urllib.request
+          from urllib.error import HTTPError
+
+          tenant = os.environ["ARM_TENANT_ID"]
+          client_id = os.environ["ARM_CLIENT_ID"]
+          client_secret = os.environ["ARM_CLIENT_SECRET"]
+          subscription_id = os.environ["ARM_SUBSCRIPTION_ID"]
+          desired_location = os.environ["TF_VAR_location"]
+          allow_region_recreate = os.getenv("AZURE_ALLOW_REGION_RECREATE", "").strip().lower() in {
+              "1",
+              "true",
+              "yes",
+          }
+          resource_group = os.environ["TF_VAR_resource_group_name"]
+
+          def normalize(location: str) -> str:
+              return location.replace(" ", "").lower()
+
+          token_body = urllib.parse.urlencode(
+              {
+                  "client_id": client_id,
+                  "client_secret": client_secret,
+                  "scope": "https://management.azure.com/.default",
+                  "grant_type": "client_credentials",
+              }
+          ).encode("utf-8")
+
+          token_req = urllib.request.Request(
+              f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+              data=token_body,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+          )
+          with urllib.request.urlopen(token_req) as token_resp:
+              token = json.loads(token_resp.read().decode("utf-8"))["access_token"]
+
+          rg_url = (
+              f"https://management.azure.com/subscriptions/{subscription_id}"
+              f"/resourcegroups/{resource_group}?api-version=2021-04-01"
+          )
+
+          get_req = urllib.request.Request(rg_url, headers={"Authorization": f"Bearer {token}"})
+
+          try:
+              with urllib.request.urlopen(get_req) as rg_resp:
+                  rg_payload = json.loads(rg_resp.read().decode("utf-8"))
+          except HTTPError as exc:
+              if exc.code == 404:
+                  print(f"No pre-existing resource group '{resource_group}' found.")
+                  sys.exit(0)
+              raise
+
+          existing_location = rg_payload.get("location", "")
+          if normalize(existing_location) == normalize(desired_location):
+              print(
+                  f"Resource group '{resource_group}' location '{existing_location}' already matches desired '{desired_location}'."
+              )
+              sys.exit(0)
+
+          if allow_region_recreate:
+              print(
+                  f"::warning::Resource group '{resource_group}' is in '{existing_location}' while the desired region is '{desired_location}'. "
+                  "AZURE_ALLOW_REGION_RECREATE is enabled, but this workflow intentionally refuses to delete the existing group because "
+                  "doing so would break current DB consumers. Perform a parallel migration and explicit cutover instead."
+              )
+          else:
+              print(
+                  f"::error::Resource group '{resource_group}' is in '{existing_location}' while the desired region is '{desired_location}'. "
+                  "This workflow will not delete or recreate the existing Azure DB because current workloads still point at it. "
+                  "Create a parallel server in the new region, seed it, verify clients, then cut over host references explicitly."
+              )
+          sys.exit(1)
+          PY
+
+      - name: OpenTofu Init
+        working-directory: infrastructure/terraform/azure-lidarr
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: azure-lidarr/terraform.tfstate
+        run: |
+          bash ../../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Import existing Azure resources into state (best effort)
+        working-directory: infrastructure/terraform/azure-lidarr
+        run: |
+          set +e
+
+          import_resource() {
+            local address="$1"
+            local resource_id="$2"
+
+            if tofu state list | grep -qx "$address"; then
+              echo "$address already tracked in state."
+              return 0
+            fi
+
+            echo "Attempting import for $address"
+            tofu import -input=false -lock-timeout=5m "$address" "$resource_id"
+            local code=$?
+            if [ "$code" -ne 0 ]; then
+              echo "No import performed for $address (resource may not exist yet)."
+            fi
+            return 0
+          }
+
+          rg_id="/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${TF_VAR_resource_group_name}"
+
+          import_resource "azurerm_resource_group.lidarr" "$rg_id"
+          import_resource "azurerm_postgresql_flexible_server.postgres" "$rg_id/providers/Microsoft.DBforPostgreSQL/flexibleServers/${TF_VAR_postgres_server_name}"
+          import_resource "azurerm_storage_account.storage" "$rg_id/providers/Microsoft.Storage/storageAccounts/${TF_VAR_storage_account_name}"
+          import_resource "azurerm_storage_share.config" "$rg_id/providers/Microsoft.Storage/storageAccounts/${TF_VAR_storage_account_name}/fileServices/default/shares/lidarr-config"
+          import_resource "azurerm_log_analytics_workspace.law" "$rg_id/providers/Microsoft.OperationalInsights/workspaces/law-lidarr-prod"
+          import_resource "azurerm_container_app_environment.env" "$rg_id/providers/Microsoft.App/managedEnvironments/cae-lidarr-prod"
+          import_resource "azurerm_container_app_environment_storage.storage" "$rg_id/providers/Microsoft.App/managedEnvironments/cae-lidarr-prod/storages/caes-lidarr-config"
+          import_resource "azurerm_container_app.lidarr" "$rg_id/providers/Microsoft.App/containerApps/ca-lidarr-prod"
+          import_resource "azurerm_monitor_action_group.ntfy" "$rg_id/providers/Microsoft.Insights/actionGroups/${TF_VAR_monitor_action_group_name}"
+          import_resource "azurerm_monitor_metric_alert.egress_alert" "$rg_id/providers/Microsoft.Insights/metricAlerts/${TF_VAR_monitor_metric_alert_name}"
+
+      - name: OpenTofu Plan
+        working-directory: infrastructure/terraform/azure-lidarr
+        run: |
+          PLAN_LOG="/tmp/tofu-azure-plan.log"
+          set +e
+          tofu plan -input=false -lock-timeout=5m -out=tfplan 2>&1 | tee "${PLAN_LOG}"
+          PLAN_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${PLAN_EXIT}" -ne 0 ] && bash ../../../scripts/tofu-recover-stale-lock.sh "${PLAN_LOG}"; then
+            echo "Retrying OpenTofu Plan after stale lock cleanup..."
+            tofu plan -input=false -lock-timeout=5m -out=tfplan
+            PLAN_EXIT=$?
+          fi
+
+          if [ "${PLAN_EXIT}" -ne 0 ]; then
+            exit "${PLAN_EXIT}"
+          fi
+
+      - name: OpenTofu Apply
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+        working-directory: infrastructure/terraform/azure-lidarr
+        run: |
+          APPLY_LOG="/tmp/tofu-azure-apply.log"
+          set +e
+          tofu apply -input=false -lock-timeout=5m -auto-approve tfplan 2>&1 | tee "${APPLY_LOG}"
+          APPLY_EXIT=${PIPESTATUS[0]}
+          set -e
+
+          if [ "${APPLY_EXIT}" -ne 0 ] && bash ../../../scripts/tofu-recover-stale-lock.sh "${APPLY_LOG}"; then
+            echo "Retrying OpenTofu Apply after stale lock cleanup..."
+            set +e
+            tofu apply -input=false -lock-timeout=5m -auto-approve tfplan 2>&1 | tee "${APPLY_LOG}"
+            APPLY_EXIT=${PIPESTATUS[0]}
+            set -e
+          fi
+
+          if [ "${APPLY_EXIT}" -ne 0 ] && grep -Eq "Provider produced inconsistent result after apply|listing Keys for Storage Account|ResourceNotFound" "${APPLY_LOG}"; then
+            echo "Detected transient Azure provider consistency error. Re-planning and retrying apply once..."
+            RETRY_PLAN_LOG="/tmp/tofu-azure-plan-retry.log"
+            set +e
+            tofu plan -input=false -lock-timeout=5m -out=tfplan 2>&1 | tee "${RETRY_PLAN_LOG}"
+            RETRY_PLAN_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "${RETRY_PLAN_EXIT}" -eq 0 ]; then
+              set +e
+              tofu apply -input=false -lock-timeout=5m -auto-approve tfplan 2>&1 | tee "${APPLY_LOG}"
+              APPLY_EXIT=${PIPESTATUS[0]}
+              set -e
+            else
+              APPLY_EXIT="${RETRY_PLAN_EXIT}"
+            fi
+          fi
+
+          if [ "${APPLY_EXIT}" -ne 0 ] && grep -Eq "azurerm_monitor_action_group\.ntfy|actionGroups/ag-lidarr-ntfy|already exists - to be managed via Terraform" "${APPLY_LOG}"; then
+            echo "Detected existing Azure monitor action group. Importing into state and retrying apply once..."
+            ACTION_GROUP_ID="/subscriptions/${ARM_SUBSCRIPTION_ID}/resourceGroups/${TF_VAR_resource_group_name}/providers/Microsoft.Insights/actionGroups/${TF_VAR_monitor_action_group_name}"
+            IMPORT_LOG="/tmp/tofu-azure-import-retry.log"
+
+            set +e
+            tofu import -input=false -lock-timeout=5m "azurerm_monitor_action_group.ntfy" "${ACTION_GROUP_ID}" 2>&1 | tee "${IMPORT_LOG}"
+            IMPORT_EXIT=${PIPESTATUS[0]}
+            set -e
+
+            if [ "${IMPORT_EXIT}" -ne 0 ] && ! grep -Eq "Resource already managed by OpenTofu|Cannot import non-existent remote object" "${IMPORT_LOG}"; then
+              APPLY_EXIT="${IMPORT_EXIT}"
+            else
+              RETRY_PLAN_LOG="/tmp/tofu-azure-plan-retry-import.log"
+              set +e
+              tofu plan -input=false -lock-timeout=5m -out=tfplan 2>&1 | tee "${RETRY_PLAN_LOG}"
+              RETRY_PLAN_EXIT=${PIPESTATUS[0]}
+              set -e
+
+              if [ "${RETRY_PLAN_EXIT}" -eq 0 ]; then
+                set +e
+                tofu apply -input=false -lock-timeout=5m -auto-approve tfplan 2>&1 | tee "${APPLY_LOG}"
+                APPLY_EXIT=${PIPESTATUS[0]}
+                set -e
+              else
+                APPLY_EXIT="${RETRY_PLAN_EXIT}"
+              fi
+            fi
+          fi
+
+          if [ "${APPLY_EXIT}" -ne 0 ]; then
+            exit "${APPLY_EXIT}"
+          fi
+
+      - uses: azure/setup-kubectl@v5
+        if: github.ref == 'refs/heads/main' || github.event_name == 'workflow_dispatch'
+
+      - name: Push DB connection secrets to cluster
+        if: github.ref == 'refs/heads/main' && steps.resolve_deployment.outputs.sync_consumer_secrets == 'true'
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64, json, os, subprocess
+
+          def secret_value(namespace: str, name: str, key: str) -> str:
+              raw = subprocess.run(
+                  ["kubectl", "-n", namespace, "get", "secret", name, "-o", "json"],
+                  check=True, capture_output=True, text=True,
+              )
+              encoded = json.loads(raw.stdout).get("data", {}).get(key)
+              if not encoded:
+                  raise SystemExit(f"::error::Secret {namespace}/{name} missing key {key}.")
+              return base64.b64decode(encoded).decode("utf-8")
+
+          def apply_secret(name: str, literals: dict, namespace: str = "media") -> None:
+              cmd = ["kubectl", "-n", namespace, "create", "secret", "generic", name]
+              for k, v in literals.items():
+                  cmd.append(f"--from-literal={k}={v}")
+              cmd.extend(["--dry-run=client", "-o", "yaml"])
+              rendered = subprocess.run(cmd, check=True, capture_output=True, text=True)
+              subprocess.run(["kubectl", "apply", "-f", "-"], input=rendered.stdout, text=True, check=True)
+              # Prevent ArgoCD from pruning imperatively-managed secrets on sync
+              subprocess.run(
+                  ["kubectl", "-n", namespace, "annotate", "secret", name,
+                   "argocd.argoproj.io/compare-options=IgnoreExtraneous",
+                   "--overwrite"],
+                  check=True, capture_output=True,
+              )
+
+          postgres_host = os.environ["AZURE_TARGET_POSTGRES_FQDN"]
+
+          # Immich DB URL (immich namespace)
+          immich_password = secret_value("immich", "immich-db-secret", "password")
+          apply_secret(
+              "immich-db-url",
+              {"url": f"postgresql://immich:{immich_password}@{postgres_host}:5432/immich?sslmode=require"},
+              namespace="immich",
+          )
+
+          # Pocket-ID DB connection string (auth namespace)
+          apply_secret(
+              "pocket-id-db-url",
+              {"DB_CONNECTION_STRING": f"postgresql://pocket_id:<REDACTED>@{postgres_host}:5432/pocket_id?sslmode=require"},
+              namespace="auth",
+          )
+
+          # Vaultwarden DB credentials (auth namespace)
+          vw_password = secret_value("media", "azure-postgres-role-credentials", "ROLE_VAULTWARDEN_PASSWORD")
+          apply_secret(
+              "vaultwarden-db",
+              {
+                  "DATABASE_URL": f"postgresql://vaultwarden:{vw_password}@{postgres_host}:5432/vaultwarden?sslmode=require",
+                  "POSTGRES_HOST": postgres_host,
+                  "POSTGRES_PORT": "5432",
+                  "POSTGRES_DB": "vaultwarden",
+                  "POSTGRES_USER": "vaultwarden",
+                  "POSTGRES_PASSWORD": vw_password,
+              },
+              namespace="auth",
+          )
+
+          # Grafana DB credentials (monitoring namespace)
+          grafana_password = secret_value("media", "azure-postgres-role-credentials", "ROLE_GRAFANA_PASSWORD")
+          apply_secret(
+              "grafana-db-secret",
+              {
+                  "password": grafana_password,
+              },
+              namespace="monitoring",
+          )
+          PY
+
+      - name: Trigger consolidated to Azure restore (optional)
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.trigger_restore == 'true'
+        run: |
+          set -euo pipefail
+
+          if ! command -v kubectl >/dev/null 2>&1; then
+            echo "::error::kubectl is required to trigger restore job but is not available on this runner."
+            exit 1
+          fi
+
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import subprocess
+          import time
+          import urllib.parse
+          import urllib.request
+
+          tenant = os.environ["ARM_TENANT_ID"]
+          client_id = os.environ["ARM_CLIENT_ID"]
+          client_secret = os.environ["ARM_CLIENT_SECRET"]
+          subscription_id = os.environ["ARM_SUBSCRIPTION_ID"]
+          postgres_password = os.environ["TF_VAR_postgres_admin_password"]
+          resource_group = os.environ["TF_VAR_resource_group_name"]
+          postgres_server = os.environ["TF_VAR_postgres_server_name"]
+          postgres_admin_login = os.environ["TF_VAR_postgres_admin_login"]
+          storage_account = os.environ["TF_VAR_storage_account_name"]
+          target_postgres_fqdn = os.environ["AZURE_TARGET_POSTGRES_FQDN"]
+
+          token_body = urllib.parse.urlencode(
+              {
+                  "client_id": client_id,
+                  "client_secret": client_secret,
+                  "scope": "https://management.azure.com/.default",
+                  "grant_type": "client_credentials",
+              }
+          ).encode("utf-8")
+
+          token_req = urllib.request.Request(
+              f"https://login.microsoftonline.com/{tenant}/oauth2/v2.0/token",
+              data=token_body,
+              headers={"Content-Type": "application/x-www-form-urlencoded"},
+          )
+          with urllib.request.urlopen(token_req) as token_resp:
+              token = json.loads(token_resp.read().decode("utf-8"))["access_token"]
+
+          with urllib.request.urlopen("https://api.ipify.org") as ip_resp:
+              public_ip = ip_resp.read().decode("utf-8").strip()
+
+          password_req = urllib.request.Request(
+              (
+                  f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/resourceGroups/{resource_group}/providers/Microsoft.DBforPostgreSQL/"
+                  f"flexibleServers/{postgres_server}?api-version=2022-12-01"
+              ),
+              data=json.dumps(
+                  {
+                      "properties": {
+                          "administratorLoginPassword": postgres_password,
+                      }
+                  }
+              ).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+              },
+              method="PATCH",
+          )
+          with urllib.request.urlopen(password_req) as password_resp:
+              password_resp.read()
+          time.sleep(60)
+
+          firewall_req = urllib.request.Request(
+              (
+                  f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/resourceGroups/{resource_group}/providers/Microsoft.DBforPostgreSQL/"
+                  f"flexibleServers/{postgres_server}/firewallRules/codex-home-access"
+                  f"?api-version=2022-12-01"
+              ),
+              data=json.dumps(
+                  {
+                      "properties": {
+                          "startIpAddress": public_ip,
+                          "endIpAddress": public_ip,
+                      }
+                  }
+              ).encode("utf-8"),
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+              },
+              method="PUT",
+          )
+          with urllib.request.urlopen(firewall_req) as firewall_resp:
+              firewall_resp.read()
+
+          keys_req = urllib.request.Request(
+              (
+                  f"https://management.azure.com/subscriptions/{subscription_id}"
+                  f"/resourceGroups/{resource_group}/providers/Microsoft.Storage/"
+                  f"storageAccounts/{storage_account}/listKeys?api-version=2023-05-01"
+              ),
+              data=b"{}",
+              headers={
+                  "Authorization": f"Bearer {token}",
+                  "Content-Type": "application/json",
+              },
+              method="POST",
+          )
+          with urllib.request.urlopen(keys_req) as keys_resp:
+              keys_payload = json.loads(keys_resp.read().decode("utf-8"))
+
+          storage_key = next(
+              (
+                  item.get("value")
+                  for item in keys_payload.get("keys", [])
+                  if item.get("value")
+              ),
+              None,
+          )
+          if not storage_key:
+              raise SystemExit("::error::Could not retrieve Azure storage account key.")
+
+          def secret_value(namespace: str, name: str, key: str) -> str:
+              raw = subprocess.run(
+                  ["kubectl", "-n", namespace, "get", "secret", name, "-o", "json"],
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              payload = json.loads(raw.stdout)
+              encoded = payload.get("data", {}).get(key)
+              if not encoded:
+                  raise SystemExit(
+                      f"::error::Secret {namespace}/{name} is missing key {key}."
+                  )
+              return base64.b64decode(encoded).decode("utf-8")
+
+          def apply_secret(name: str, literals: dict[str, str], namespace: str = "media") -> None:
+              cmd = [
+                  "kubectl",
+                  "-n",
+                  namespace,
+                  "create",
+                  "secret",
+                  "generic",
+                  name,
+              ]
+              for key, value in literals.items():
+                  cmd.append(f"--from-literal={key}={value}")
+              cmd.extend(["--dry-run=client", "-o", "yaml"])
+
+              rendered = subprocess.run(
+                  cmd,
+                  check=True,
+                  capture_output=True,
+                  text=True,
+              )
+              subprocess.run(
+                  ["kubectl", "apply", "-f", "-"],
+                  input=rendered.stdout,
+                  text=True,
+                  check=True,
+              )
+              # Prevent ArgoCD from pruning imperatively-managed secrets on sync
+              subprocess.run(
+                  ["kubectl", "-n", namespace, "annotate", "secret", name,
+                   "argocd.argoproj.io/compare-options=IgnoreExtraneous",
+                   "--overwrite"],
+                  check=True,
+                  capture_output=True,
+              )
+
+          apply_secret(
+              "azure-postgres-admin-credentials",
+              {"ADMIN_PASSWORD": postgres_password},
+          )
+          apply_secret(
+              "azure-storage-credentials",
+              {"STORAGE_KEY": storage_key},
+          )
+          apply_secret(
+              "local-postgres-credentials",
+              {
+                  "POSTGRES_USER": "postgres",
+                  "POSTGRES_PASSWORD": secret_value(
+                      "infra",
+                      "consolidated-postgres-secret",
+                      "POSTGRES_PASSWORD",
+                  ),
+              },
+          )
+          apply_secret(
+              "azure-postgres-role-credentials",
+              {
+                  "ROLE_POSTGRES_PASSWORD": secret_value(
+                      "infra",
+                      "consolidated-postgres-secret",
+                      "POSTGRES_PASSWORD",
+                  ),
+                  "ROLE_MAILU_PASSWORD": secret_value(
+                      "mailu",
+                      "mailu-postgresql",
+                      "password",
+                  ),
+                  "ROLE_NEXTCLOUD_PASSWORD": secret_value(
+                      "infra",
+                      "consolidated-postgres-secret",
+                      "NEXTCLOUD_PASSWORD",
+                  ),
+                  "ROLE_IMMICH_PASSWORD": secret_value(
+                      "immich",
+                      "immich-db-secret",
+                      "password",
+                  ),
+                  "ROLE_PLEX_PASSWORD": secret_value(
+                      "infra",
+                      "consolidated-postgres-secret",
+                      "PLEX_PASSWORD",
+                  ),
+                  "ROLE_BAZARR_PASSWORD": secret_value(
+                      "media",
+                      "servarr-postgres-credentials",
+                      "BAZARR_PASSWORD",
+                  ),
+                  "ROLE_LIDARR_PASSWORD": secret_value(
+                      "media",
+                      "servarr-postgres-credentials",
+                      "LIDARR_PASSWORD",
+                  ),
+                  "ROLE_PROWLARR_PASSWORD": secret_value(
+                      "media",
+                      "servarr-postgres-credentials",
+                      "PROWLARR_PASSWORD",
+                  ),
+                  "ROLE_RADARR_PASSWORD": secret_value(
+                      "media",
+                      "servarr-postgres-credentials",
+                      "RADARR_PASSWORD",
+                  ),
+                  "ROLE_READARR_PASSWORD": secret_value(
+                      "media",
+                      "servarr-postgres-credentials",
+                      "READARR_PASSWORD",
+                  ),
+                  "ROLE_SONARR_PASSWORD": secret_value(
+                      "media",
+                      "servarr-postgres-credentials",
+                      "SONARR_PASSWORD",
+                  ),
+                  "ROLE_GRAFANA_PASSWORD": secret_value(
+                      "monitoring",
+                      "grafana-db-secret",
+                      "password",
+                  ),
+                  "ROLE_KEYCLOAK_PASSWORD": secret_value(
+                      "auth",
+                      "keycloak-db",
+                      "POSTGRES_PASSWORD",
+                  ),
+                  "ROLE_PAPERLESS_PASSWORD": secret_value(
+                      "home",
+                      "paperless-secret",
+                      "PAPERLESS_DB_PASSWORD",
+                  ),
+                  "ROLE_VAULTWARDEN_PASSWORD": secret_value(
+                      "auth",
+                      "vaultwarden-db",
+                      "POSTGRES_PASSWORD",
+                  ),
+                  "ROLE_POCKET_ID_PASSWORD": "<REDACTED>",
+                  "ROLE_JELLYSEERR_PASSWORD": "<REDACTED>",
+              },
+          )
+
+          PY
+
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+
+          source = Path("infrastructure/kubernetes/azure-migration/migration-job.yaml")
+          rendered = Path("/tmp/consolidated-replica-seed-rendered.yaml")
+          text = source.read_text(encoding="utf-8")
+          source_host = os.environ.get(
+              "RESTORE_SOURCE_HOST_OVERRIDE",
+              "consolidated-postgres.infra.svc.cluster.local",
+          ).strip() or "consolidated-postgres.infra.svc.cluster.local"
+          restore_node = os.environ.get(
+              "RESTORE_NODE_SELECTOR_HOSTNAME_OVERRIDE",
+              "mac-worker",
+          ).strip() or "mac-worker"
+          text = text.replace(
+              'value: "consolidated-postgres.infra.svc.cluster.local"',
+              f'value: "{source_host}"',
+          )
+          text = text.replace(
+              'kubernetes.io/hostname: mac-worker',
+              f'kubernetes.io/hostname: {restore_node}',
+          )
+          text = text.replace(
+              'value: "homelabdb.postgres.database.azure.com"',
+              f'value: "{os.environ["AZURE_TARGET_POSTGRES_FQDN"]}"',
+          )
+          text = text.replace(
+              'value: "homelabdbadmin"',
+              f'value: "{os.environ["TF_VAR_postgres_admin_login"]}"',
+          )
+          text = text.replace(
+              'value: "stlidarrprod"',
+              f'value: "{os.environ["TF_VAR_storage_account_name"]}"',
+          )
+          rendered.write_text(text, encoding="utf-8")
+          print(
+              "Rendered restore manifest for "
+              f"{os.environ['AZURE_TARGET_POSTGRES_FQDN']} "
+              f"from source {source_host} on node {restore_node}."
+          )
+          PY
+
+          if [ "${RESTORE_SOURCE_HOST_OVERRIDE}" = "consolidated-postgres.infra.svc.cluster.local" ]; then
+            SOURCE_ENDPOINTS=$(kubectl -n infra get endpoints consolidated-postgres -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)
+            if [ -z "${SOURCE_ENDPOINTS}" ]; then
+              echo "::error::Restore source host consolidated-postgres.infra.svc.cluster.local has no ready endpoints in the infra namespace."
+              echo "Scale the source deployment back up or rerun this workflow with restore_source_host set to a reachable PostgreSQL source."
+              exit 1
+            fi
+          fi
+
+          echo "Applying restore job manifest..."
+          kubectl -n media delete job consolidated-replica-seed --ignore-not-found=true
+          kubectl apply -f /tmp/consolidated-replica-seed-rendered.yaml
+
+          echo "Waiting for restore job completion..."
+          python3 - <<'PY'
+          import json
+          import subprocess
+          import sys
+          import time
+
+          timeout_seconds = 45 * 60
+          started = time.time()
+          namespace = "media"
+          job_name = "consolidated-replica-seed"
+
+          def run(*args: str) -> subprocess.CompletedProcess[str]:
+              return subprocess.run(
+                  list(args),
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+
+          def print_result(result: subprocess.CompletedProcess[str]) -> None:
+              if result.stdout:
+                  print(result.stdout.rstrip())
+              if result.stderr:
+                  print(result.stderr.rstrip(), file=sys.stderr)
+
+          while True:
+              job = run("kubectl", "-n", namespace, "get", "job", job_name, "-o", "json")
+              if job.returncode != 0:
+                  print_result(job)
+                  sys.exit(job.returncode)
+
+              payload = json.loads(job.stdout)
+              status = payload.get("status", {})
+              if status.get("succeeded", 0):
+                  break
+
+              if status.get("failed", 0):
+                  print("::error::Restore job failed before completing.")
+                  describe = run("kubectl", "-n", namespace, "describe", "job", job_name)
+                  print_result(describe)
+                  pods = run(
+                      "kubectl",
+                      "-n",
+                      namespace,
+                      "get",
+                      "pods",
+                      "-l",
+                      f"job-name={job_name}",
+                      "-o",
+                      "json",
+                  )
+                  if pods.returncode == 0:
+                      pod_payload = json.loads(pods.stdout)
+                      for item in pod_payload.get("items", []):
+                          pod_name = item.get("metadata", {}).get("name")
+                          if not pod_name:
+                              continue
+                          pod_describe = run("kubectl", "-n", namespace, "describe", "pod", pod_name)
+                          print_result(pod_describe)
+                          for extra in ([], ["--previous"]):
+                              log_result = run(
+                                  "kubectl",
+                                  "-n",
+                                  namespace,
+                                  "logs",
+                                  pod_name,
+                                  "-c",
+                                  "db-migration",
+                                  *extra,
+                              )
+                              print_result(log_result)
+                  sys.exit(1)
+
+              if time.time() - started > timeout_seconds:
+                  print("::error::Timed out waiting for restore job completion.")
+                  describe = run("kubectl", "-n", namespace, "describe", "job", job_name)
+                  print_result(describe)
+                  sys.exit(1)
+
+              time.sleep(10)
+          PY
+
+          echo "Restore job logs (db-migration):"
+          kubectl -n media logs job/consolidated-replica-seed -c db-migration

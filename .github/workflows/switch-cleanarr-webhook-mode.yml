@@ -1,0 +1,213 @@
+name: Switch Cleanarr Webhook Mode (Cloud Run vs k3s)
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "Which webhook implementation should be active"
+        required: true
+        type: choice
+        options:
+          - cloudrun
+          - k3s
+        default: cloudrun
+
+permissions:
+  contents: write
+  actions: write
+  id-token: write
+
+concurrency:
+  group: switch-cleanarr-webhook-mode
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  switch:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || fromJSON(((vars.USE_AWS_CODEBUILD_RUNNERS == 'true' || vars.USE_AWS_CODEBUILD_RUNNERS == true) && vars.AWS_CODEBUILD_RUNNER_PROJECT != '' && format('["codebuild-{0}-{1}-{2}","job-{3}"]', vars.AWS_CODEBUILD_RUNNER_PROJECT, github.run_id, github.run_attempt, github.job)) || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: ./.github/actions/setup-gh-cli
+        with:
+          token: ${{ secrets.GH_ADMIN_TOKEN || github.token }}
+
+      - name: Set CLEANARR_WEBHOOK_MODE repo variable
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}"
+          echo "::notice::Setting CLEANARR_WEBHOOK_MODE=$MODE"
+          gh variable set CLEANARR_WEBHOOK_MODE -b "$MODE"
+
+      - name: Toggle k3s replicas (GitOps)
+        run: |
+          set -euo pipefail
+          MODE="${{ inputs.mode }}"
+
+          if [ "$MODE" = "cloudrun" ]; then
+            WEBHOOK_REPLICAS=0
+            PROXY_REPLICAS=1
+          else
+            WEBHOOK_REPLICAS=1
+            PROXY_REPLICAS=0
+          fi
+
+          export WEBHOOK_REPLICAS PROXY_REPLICAS
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+
+          webhook_replicas = int(os.environ["WEBHOOK_REPLICAS"])
+          proxy_replicas = int(os.environ["PROXY_REPLICAS"])
+
+          def patch_replicas(path: str, replicas: int) -> None:
+              p = Path(path)
+              data = p.read_text()
+              # Prefer patching an existing `replicas:` line (allowing comments).
+              new, n = re.subn(
+                  r"(?m)^(\s*)replicas:\s*\d+\s*(#.*)?$",
+                  rf"\1replicas: {replicas}\2",
+                  data,
+                  count=1,
+              )
+
+              if n == 0:
+                  # Fallback: insert `replicas:` under the first `spec:` stanza.
+                  new, n = re.subn(
+                      r"(?m)^(\s*)spec:\s*$",
+                      rf"\1spec:\n\1  replicas: {replicas}",
+                      data,
+                      count=1,
+                  )
+
+              if n != 1:
+                  raise SystemExit(f"{path}: expected to patch exactly 1 replicas field, patched {n}")
+
+              p.write_text(new)
+
+          patch_replicas("grok-servaar/media/cleanarr/webhook/cleanarr-webhook.yaml", webhook_replicas)
+          patch_replicas("grok-servaar/media/cleanarr/webhook/cleanarr-webhook-proxy.yaml", proxy_replicas)
+          PY
+
+      - name: Commit and push mode switch
+        env:
+          GITOPS_PAT: ${{ secrets.GITOPS_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GITOPS_PAT:-}" ]; then
+            echo "::error::GITOPS_PAT is required to push mode switch commits."
+            exit 1
+          fi
+
+          MODE="${{ inputs.mode }}"
+          BRANCH="automation/switch-cleanarr-webhook-mode/${MODE}/${GITHUB_RUN_ID}"
+
+          git config user.name "GitHub Actions"
+          git config user.email "github-actions@github.com"
+
+          git add \
+            grok-servaar/media/cleanarr/webhook/cleanarr-webhook.yaml \
+            grok-servaar/media/cleanarr/webhook/cleanarr-webhook-proxy.yaml
+
+          if git diff --cached --quiet; then
+            echo "::notice::No replica changes to commit."
+          else
+            git checkout -b "$BRANCH"
+            git commit -m "chore(cleanarr): switch webhook mode to ${MODE} [skip actions]"
+            git config --local --unset-all http.https://github.com/.extraheader || true
+            git remote set-url origin "https://x-access-token:${GITOPS_PAT}@github.com/Josh-Archer/home.git"
+            git push -u origin "$BRANCH"
+
+            # Create + auto-merge PR to comply with repo rules (no direct pushes to main).
+            TITLE="chore(cleanarr): switch webhook mode to ${MODE}"
+            BODY="Automated mode switch via switch-cleanarr-webhook-mode workflow run ${GITHUB_RUN_ID}."
+            PR_URL="$(gh pr create --base main --head "$BRANCH" --title "$TITLE" --body "$BODY")"
+            echo "::notice::Created PR: $PR_URL"
+            gh pr merge "$PR_URL" --merge --auto --delete-branch
+            echo "::notice::Enabled auto-merge for: $PR_URL"
+          fi
+
+      - name: Trigger Deploy from Main (build k3s cleanarr-webhook)
+        if: inputs.mode == 'k3s'
+        run: |
+          set -euo pipefail
+          echo "::notice::Dispatching deploy.yml with build_cleanarr_webhook=true"
+          gh workflow run deploy.yml --ref main -f build_cleanarr_webhook=true
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - uses: google-github-actions/setup-gcloud@v3
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - name: Toggle Cloud Run public invoker (OpenTofu)
+        working-directory: infrastructure/terraform/gcp-cleanarr
+        env:
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+          R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+          TOFU_BACKEND_STATE_KEY: gcp-cleanarr/terraform.tfstate
+          # Required TF vars
+          TF_VAR_plex_baseurl: "https://plex-api.archer.casa"
+          TF_VAR_plex_token: ${{ secrets.PLEX_TOKEN }}
+          TF_VAR_sonarr_baseurl: "https://sonarr-api.archer.casa/api/v3/"
+          TF_VAR_sonarr_apikey: ${{ secrets.SONARR_APIKEY }}
+          TF_VAR_radarr_baseurl: "https://radarr-api.archer.casa/api/v3/"
+          TF_VAR_radarr_apikey: ${{ secrets.RADARR_APIKEY }}
+          TF_VAR_cf_access_client_id: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_ID }}
+          TF_VAR_cf_access_client_secret: ${{ secrets.CLEANARR_WEBHOOK_CLIENT_SECRET }}
+          TF_VAR_webhook_secret: ${{ secrets.CLEANARR_WEBHOOK_SECRET }}
+          TF_VAR_webhook_secret_previous: ${{ secrets.CLEANARR_WEBHOOK_SECRET_PREVIOUS }}
+          TF_VAR_loki_url: ${{ vars.LOKI_URL }}
+        run: |
+          set -euo pipefail
+
+          MODE="${{ inputs.mode }}"
+          if [ "$MODE" = "k3s" ]; then
+            export TF_VAR_public_invoker_enabled="false"
+          else
+            export TF_VAR_public_invoker_enabled="true"
+          fi
+
+          PROJECT_ID="${CLOUDSDK_CORE_PROJECT:-}"
+          if [ -z "$PROJECT_ID" ]; then
+            PROJECT_ID="${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}"
+          fi
+          if [ -z "$PROJECT_ID" ]; then
+            echo "::error::Unable to determine GCP project id."
+            exit 1
+          fi
+          export TF_VAR_project_id="$PROJECT_ID"
+
+          # Pin docker_image to the currently deployed image so we don't accidentally redeploy.
+          CURRENT_IMAGE="$(gcloud run services describe cleanarr-webhook --project "$PROJECT_ID" --region us-central1 --format='value(spec.template.spec.containers[0].image)')"
+          if [ -z "$CURRENT_IMAGE" ]; then
+            echo "::error::Unable to determine current Cloud Run image."
+            exit 1
+          fi
+          export TF_VAR_docker_image="$CURRENT_IMAGE"
+
+          bash "$GITHUB_WORKSPACE/scripts/tofu-init-with-retry.sh" --reconfigure
+
+          # One-time state move when public_invoker became counted.
+          if [ "${TF_VAR_public_invoker_enabled}" = "true" ] && tofu state show -no-color google_cloud_run_v2_service_iam_member.public_invoker >/dev/null 2>&1; then
+            tofu state mv -no-color \
+              google_cloud_run_v2_service_iam_member.public_invoker \
+              'google_cloud_run_v2_service_iam_member.public_invoker[0]'
+          fi
+
+          tofu apply -auto-approve -lock-timeout=30s

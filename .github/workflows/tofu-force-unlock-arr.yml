@@ -1,0 +1,54 @@
+name: OpenTofu Force Unlock (ARR)
+
+on:
+  workflow_dispatch:
+    inputs:
+      lock_id:
+        description: 'OpenTofu lock ID to force-unlock'
+        required: true
+        type: string
+      state_key:
+        description: 'Remote state key'
+        required: true
+        default: 'arr-config/terraform.tfstate'
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  force-unlock:
+    name: Force unlock ARR state
+    runs-on: home-gh-runner
+    defaults:
+      run:
+        working-directory: terraform/arr-config
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - name: Init backend
+        env:
+          TOFU_BACKEND_STATE_KEY: ${{ inputs.state_key }}
+        run: |
+          bash ../../scripts/tofu-init-with-retry.sh --reconfigure
+
+      - name: Force unlock state
+        run: |
+          tofu force-unlock -force "${{ inputs.lock_id }}"

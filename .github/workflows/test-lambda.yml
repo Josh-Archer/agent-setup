@@ -1,0 +1,15 @@
+name: Verify Lambda
+
+on:
+  workflow_dispatch:
+
+jobs:
+  test-lambda:
+    runs-on: home-gh-runner
+    steps:
+      - run: echo "🚀 ARC Works"
+
+  test-codebuild:
+    runs-on: ["codebuild-home-pr-runner-${{ github.run_id }}-${{ github.run_attempt }}"]
+    steps:
+      - run: echo "🚀 Lambda Works"

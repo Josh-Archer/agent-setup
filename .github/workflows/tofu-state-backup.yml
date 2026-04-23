@@ -1,0 +1,77 @@
+name: Backup OpenTofu State Files
+
+on:
+  workflow_dispatch:
+    inputs:
+      state_key:
+        description: 'Optional single state key to back up (for example cloudflare-access/terraform.tfstate)'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: tofu-state-backup
+  cancel-in-progress: false
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  backup:
+    name: Backup OpenTofu states
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    env:
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - name: Install AWS CLI
+        run: |
+          set -euo pipefail
+          if command -v aws >/dev/null 2>&1; then
+            aws --version
+            exit 0
+          fi
+          curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip"
+          unzip -q awscliv2.zip
+          sudo ./aws/install --update
+          rm -rf aws awscliv2.zip
+          aws --version
+
+      - name: Capture state backups
+        id: backup
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR="$RUNNER_TEMP/tofu-state-backup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+
+          if [ -n "${{ github.event.inputs.state_key }}" ]; then
+            bash scripts/backup-opentofu-states.sh --output-dir "$OUTPUT_DIR" --state-key "${{ github.event.inputs.state_key }}"
+          else
+            bash scripts/backup-opentofu-states.sh --output-dir "$OUTPUT_DIR"
+          fi
+
+          echo "backup_dir=$OUTPUT_DIR" >> "$GITHUB_OUTPUT"
+
+      - name: Upload backup artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tofu-state-backup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.backup.outputs.backup_dir }}
+          if-no-files-found: error
+          retention-days: 30

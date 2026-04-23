@@ -1,0 +1,6 @@
+flake8
+requests
+plexapi
+transmission-rpc
+loguru
+PyYAML

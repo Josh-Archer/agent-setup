@@ -1,0 +1,296 @@
+name: Manage GCP (OpenTofu)
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: 'Target GCP state'
+        required: true
+        type: choice
+        options:
+          - spin-up
+          - spin-down
+          - force-cleanup
+        default: spin-down
+      confirm:
+        description: 'Type CONFIRM to proceed'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  actions: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  control:
+    runs-on: ${{ (vars.USE_SELF_HOSTED == 'true' || vars.USE_SELF_HOSTED == true) && 'home-gh-runner' || 'ubuntu-latest' }}
+    concurrency:
+      group: tofu-gcp-worker
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: terraform/gcp-worker
+    env:
+      GH_ADMIN_TOKEN: ${{ secrets.GH_ADMIN_TOKEN }}
+      TAILSCALE_API_KEY: ${{ secrets.TAILSCALE_API_KEY }}
+      GOOGLE_CREDENTIALS: ${{ secrets.GOOGLE_CREDENTIALS }}
+      GCP_CATALOG_API_KEY: ${{ secrets.GCP_CATALOG_API_KEY }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      TF_VAR_project_id: ${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}
+      TF_VAR_k3s_token: ${{ secrets.K3S_TOKEN }}
+      TF_VAR_k3s_url: ${{ secrets.K3S_URL }}
+      TF_VAR_enable_gcp_reconcile_scheduler: ${{ (vars.GCP_RECONCILE_SCHEDULER_ENABLED == 'true' || vars.GCP_RECONCILE_SCHEDULER_ENABLED == true) && 'true' || 'false' }}
+      TF_VAR_gcp_reconcile_scheduler_job_name: ${{ vars.GCP_RECONCILE_SCHEDULER_JOB_NAME != '' && vars.GCP_RECONCILE_SCHEDULER_JOB_NAME || 'github-gcp-reconcile-hourly' }}
+      TF_VAR_gcp_reconcile_scheduler_schedule: ${{ vars.GCP_RECONCILE_SCHEDULER_SCHEDULE != '' && vars.GCP_RECONCILE_SCHEDULER_SCHEDULE || '0 * * * *' }}
+      TF_VAR_gcp_reconcile_scheduler_time_zone: ${{ vars.GCP_RECONCILE_SCHEDULER_TIME_ZONE != '' && vars.GCP_RECONCILE_SCHEDULER_TIME_ZONE || 'Etc/UTC' }}
+      TF_VAR_gcp_reconcile_scheduler_paused: ${{ (vars.GCP_RECONCILE_SCHEDULER_PAUSED == 'true' || vars.GCP_RECONCILE_SCHEDULER_PAUSED == true) && 'true' || 'false' }}
+      TF_VAR_gcp_reconcile_scheduler_allow_deletions: ${{ (vars.GCP_RECONCILE_SCHEDULER_ALLOW_DELETIONS == 'true' || vars.GCP_RECONCILE_SCHEDULER_ALLOW_DELETIONS == true) && 'true' || 'false' }}
+      TF_VAR_github_actions_dispatch_secret_name: ${{ vars.GCP_RECONCILE_DISPATCH_SECRET_NAME != '' && vars.GCP_RECONCILE_DISPATCH_SECRET_NAME || 'github-scheduler-token' }}
+      TF_VAR_github_actions_dispatch_secret_version: ${{ vars.GCP_RECONCILE_DISPATCH_SECRET_VERSION != '' && vars.GCP_RECONCILE_DISPATCH_SECRET_VERSION || 'latest' }}
+      TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE: ${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}
+
+    steps:
+      - name: Confirm intent
+        working-directory: ${{ github.workspace }}
+        run: |
+          if [ "${{ inputs.confirm }}" != "CONFIRM" ]; then
+            echo "Confirmation failed. Type CONFIRM to continue."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v6
+      - name: Ensure unzip dependency for OpenTofu action
+        if: ${{ runner.os == 'Linux' && startsWith(runner.name, 'az-vm-gha') }}
+        run: |
+          bash ${{ github.workspace }}/scripts/ci/ensure-opentofu-runner-dependencies.sh
+
+      - uses: opentofu/setup-opentofu@v2
+        with:
+          tofu_version_file: .opentofu-version
+
+      - id: auth
+        uses: google-github-actions/auth@v3
+        with:
+          credentials_json: '${{ secrets.GOOGLE_CREDENTIALS }}'
+
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v3
+        with:
+          version: '>= 363.0.0'
+
+      - name: Create variables file
+        run: |
+          echo 'allowed_emails = ${{ secrets.TF_VAR_ALLOWED_EMAILS }}' >> secrets.auto.tfvars
+
+      - name: Fetch current GCP node flag
+        id: current_flag
+        env:
+          GCP_NODE_ENABLED_VAR: ${{ vars.GCP_NODE_ENABLED }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GCP_NODE_ENABLED_VAR:-}" ]; then
+            echo "::error::Repository variable GCP_NODE_ENABLED is not defined; cannot proceed."
+            exit 1
+          fi
+          CURRENT_LOWER=$(printf '%s' "$GCP_NODE_ENABLED_VAR" | tr -d '\r\n' | tr '[:upper:]' '[:lower:]')
+          echo "::notice::Current repository variable GCP_NODE_ENABLED=$CURRENT_LOWER"
+          echo "current_state=$CURRENT_LOWER" >> "$GITHUB_OUTPUT"
+
+      - name: Determine desired GCP node state
+        id: desired
+        run: |
+          set -euo pipefail
+          ACTION="${{ inputs.action }}"
+          
+          if [ "$ACTION" == "force-cleanup" ]; then
+            TARGET_VAL="false"
+            echo "force_cleanup=true" >> "$GITHUB_OUTPUT"
+            LABEL="force-cleaned"
+          elif [ "$ACTION" == "spin-up" ]; then
+            TARGET_VAL="true"
+            echo "force_cleanup=false" >> "$GITHUB_OUTPUT"
+            LABEL="enabled"
+          else # spin-down
+            TARGET_VAL="false"
+            echo "force_cleanup=false" >> "$GITHUB_OUTPUT"
+            LABEL="disabled"
+          fi
+          
+          echo "target_state=$TARGET_VAL" >> "$GITHUB_OUTPUT"
+          
+          CURRENT_STATE="${{ steps.current_flag.outputs.current_state }}"
+          echo "current_state=$CURRENT_STATE" >> "$GITHUB_OUTPUT"
+          echo "status_label=$LABEL" >> "$GITHUB_OUTPUT"
+          echo "target_action=$ACTION" >> "$GITHUB_OUTPUT"
+          echo "TF_VAR_gcp_node_enabled=$TARGET_VAL" >> "$GITHUB_ENV"
+
+      - name: Decide if apply is required
+        id: guard
+        run: |
+          set -euo pipefail
+          TARGET="${{ steps.desired.outputs.target_state }}"
+          CURRENT="${{ steps.current_flag.outputs.current_state }}"
+          FORCE="${{ steps.desired.outputs.force_cleanup }}"
+          
+          if [ "$FORCE" == "true" ] || [ "${{ steps.desired.outputs.target_action }}" == "spin-up" ]; then
+            echo "run_apply=true" >> "$GITHUB_OUTPUT"
+            echo "summary=force-run" >> "$GITHUB_OUTPUT"
+            echo "::notice::Spin-up or force-cleanup requested. Proceeding with apply."
+          elif [ "$TARGET" == "$CURRENT" ]; then
+            echo "run_apply=false" >> "$GITHUB_OUTPUT"
+            echo "summary=already-${{ steps.desired.outputs.status_label }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "run_apply=true" >> "$GITHUB_OUTPUT"
+            echo "summary=transitioning-to-${{ steps.desired.outputs.status_label }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Verify and Inject Encryption Secret
+        if: steps.guard.outputs.run_apply == 'true'
+        run: |
+          if [ -z "${{ secrets.TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE }}" ]; then
+            echo "ERROR: TF_ENCRYPTION_KEY_PROVIDER_PBKDF2_R2_PASSPHRASE secret is missing or empty."
+            exit 1
+          fi
+
+      - name: Find Best Zone for Spot Instance
+        id: zone_selection
+        if: steps.guard.outputs.run_apply == 'true' && steps.desired.outputs.target_state == 'true'
+        run: |
+          set -euo pipefail
+          echo "Finding best zone with Spot availability and pricing..."
+          MACHINE_TYPE="${{ vars.GCP_MACHINE_TYPE != '' && vars.GCP_MACHINE_TYPE || 'e2-small' }}"
+          
+          # Run the zone finder script
+          PROVISIONING_MODEL="${{ vars.GCP_PROVISIONING_MODEL != '' && vars.GCP_PROVISIONING_MODEL || 'STANDARD' }}"
+          EXTRA_ARGS=""
+          if [ "$PROVISIONING_MODEL" == "STANDARD" ]; then
+            EXTRA_ARGS="--standard"
+          fi
+          
+          ZONE_OUTPUT=$(bash "$GITHUB_WORKSPACE/scripts/find-best-gcp-zone.sh" \
+            --machine-type "$MACHINE_TYPE" \
+            --project-id "${{ steps.auth.outputs.project_id }}" \
+            --regions "${{ vars.GCP_SPOT_REGIONS }}" \
+            $EXTRA_ARGS)
+          
+          # Parse output
+          ZONE=$(echo "$ZONE_OUTPUT" | grep "^ZONE=" | cut -d= -f2)
+          REGION=$(echo "$ZONE_OUTPUT" | grep "^REGION=" | cut -d= -f2)
+          
+          if [ -z "$ZONE" ] || [ -z "$REGION" ]; then
+            echo "::error::Failed to find available zone for Spot instances"
+            exit 1
+          fi
+          
+          echo "Selected zone: $ZONE (region: $REGION)"
+          echo "zone=$ZONE" >> "$GITHUB_OUTPUT"
+          echo "region=$REGION" >> "$GITHUB_OUTPUT"
+          
+          # Set as environment variables for Terraform
+          echo "TF_VAR_project_id=${{ steps.auth.outputs.project_id }}" >> "$GITHUB_ENV"
+          echo "TF_VAR_zone=$ZONE" >> "$GITHUB_ENV"
+          echo "TF_VAR_region=$REGION" >> "$GITHUB_ENV"
+          echo "TF_VAR_machine_type=$MACHINE_TYPE" >> "$GITHUB_ENV"
+          echo "TF_VAR_gcp_provisioning_model=${{ vars.GCP_PROVISIONING_MODEL != '' && vars.GCP_PROVISIONING_MODEL || 'STANDARD' }}" >> "$GITHUB_ENV"
+          echo "TF_VAR_gcp_preemptible=${{ vars.GCP_PREEMPTIBLE != '' && vars.GCP_PREEMPTIBLE || 'false' }}" >> "$GITHUB_ENV"
+          echo "TF_VAR_gcp_automatic_restart=${{ vars.GCP_AUTOMATIC_RESTART != '' && vars.GCP_AUTOMATIC_RESTART || 'true' }}" >> "$GITHUB_ENV"
+
+      - name: OpenTofu Init
+        if: steps.guard.outputs.run_apply == 'true'
+        env:
+          TOFU_BACKEND_STATE_KEY: gcp-worker/terraform.tfstate
+        run: |
+          set -x
+          pwd
+          ls -la
+          tofu --version
+          bash "$GITHUB_WORKSPACE/scripts/tofu-init-with-retry.sh" --reconfigure
+
+      - name: Cleanup orphaned GCP resources
+        if: steps.guard.outputs.run_apply == 'true' && steps.desired.outputs.target_state == 'true'
+        run: |
+          bash "$GITHUB_WORKSPACE/scripts/cleanup-gcp-orphans.sh" \
+            --terraform-dir "$PWD" \
+            --project-id "${{ vars.GCP_PROJECT_ID != '' && vars.GCP_PROJECT_ID || secrets.GCP_PROJECT_ID }}" \
+            --region "${{ steps.zone_selection.outputs.region }}" \
+            --zone "${{ steps.zone_selection.outputs.zone }}"
+
+      - name: OpenTofu Apply
+        id: opentofu_apply
+        if: steps.guard.outputs.run_apply == 'true' && steps.desired.outputs.force_cleanup != 'true'
+        run: tofu apply -input=false -auto-approve
+
+      - name: OpenTofu Force Cleanup
+        id: opentofu_force_cleanup
+        if: steps.guard.outputs.run_apply == 'true' && steps.desired.outputs.force_cleanup == 'true'
+        run: |
+          set -euo pipefail
+          PROJECT_ID=$(gcloud config get-value project)
+          echo "Using Project ID: $PROJECT_ID"
+
+          echo "=== Removing GCP resources from OpenTofu state ==="
+          tofu state list || echo "(state empty or unavailable)"
+
+          # Remove all GCP resources from state so next spin-up can re-create them cleanly
+          RESOURCES=(
+            "google_compute_instance.k3s_worker[0]"
+            "google_compute_router_nat.nat[0]"
+            "google_compute_router.router[0]"
+            "google_compute_subnetwork.k3s_worker_subnet[0]"
+            "google_compute_firewall.allow_ssh_iap[0]"
+            "google_compute_firewall.allow_all_egress[0]"
+            "google_compute_network.k3s_worker_vpc[0]"
+            "tailscale_acl.k3s_cluster[0]"
+            "tailscale_tailnet_key.k3s_nodes[0]"
+            "tailscale_tailnet_key.k3s_single_use[0]"
+          )
+          for res in "${RESOURCES[@]}"; do
+            tofu state rm "$res" || true
+          done
+
+          echo "=== Discovering and deleting ALL live homelabgcp instances ==="
+          # Fetch instances and parse them directly into gcloud delete commands
+          while read -r name zone; do
+            [ -z "$name" ] && continue
+            echo "  Deleting $name in $zone..."
+            gcloud compute instances delete "$name" \
+              --zone="$zone" \
+              --project="$PROJECT_ID" \
+              --delete-disks=all \
+              --quiet || echo "  (warning: delete attempted but returned non-zero for $name)"
+          done < <(gcloud compute instances list \
+            --project="$PROJECT_ID" \
+            --filter="name=homelabgcp" \
+            --format="value(name,zone)" 2>/dev/null || true)
+
+          echo "=== Post-state cleanup ==="
+          tofu state list || echo "(state empty)"
+
+      - name: Persist target state
+        if: always() && steps.desired.outputs.target_state != '' && steps.guard.outputs.run_apply == 'true' && (steps.opentofu_apply.conclusion == 'success' || steps.opentofu_force_cleanup.conclusion == 'success')
+        uses: actions/github-script@v9
+        with:
+          github-token: ${{ secrets.GH_ADMIN_TOKEN }}
+          script: |
+            const targetState = "${{ steps.desired.outputs.target_state }}";
+            console.log(`Setting GCP_NODE_ENABLED to ${targetState}`);
+            await github.rest.actions.updateRepoVariable({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              name: 'GCP_NODE_ENABLED',
+              value: targetState
+            });
+
+      - name: ATP summary
+        run: |
+          if [ "${{ steps.guard.outputs.run_apply }}" = "true" ]; then
+            echo "GCP infrastructure is now ${{ steps.desired.outputs.status_label }} (action=${{ steps.desired.outputs.target_action }})."
+          else
+            echo "No action taken: GCP already ${{ steps.desired.outputs.status_label }}."
+          fi
