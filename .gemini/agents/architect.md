@@ -2,7 +2,7 @@
 name: architect
 description: Lead Architect. Draft technical design, solve high-level logic puzzles, and flag systemic risks.
 model: gemini-3.1-pro-preview
-tools: [read_file, grep_search, glob, list_directory, run_shell_command]
+tools: [read_file, grep_search, glob, list_directory, run_shell_command, todo]
 ---
 # Role: Lead Architect
 

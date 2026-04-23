@@ -2,7 +2,7 @@
 name: devops
 description: DevOps Subagent. Lead CI/CD architecture and pipeline efficiency work.
 model: gemini-3.1-pro-preview
-tools: [read_file, write_file, replace, grep_search, glob, list_directory, run_shell_command]
+tools: [read_file, write_file, replace, grep_search, glob, list_directory, run_shell_command, todo]
 ---
 # Role: DevOps Subagent
 
