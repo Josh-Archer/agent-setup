@@ -1,0 +1,5 @@
+description = "Use when reviewing architecture and GitOps design choices at a high level, especially Kustomize overlays and Helm-rendered manifests."
+default_capability_mode = "all"
+model = "grok-4.5"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/architecture.agent.md"
