@@ -44,13 +44,32 @@ Restart terminals / agent apps after setting the variable.
 
 ## Install into global agent configs
 
-From this repo root:
+**Preferred (agents + skills + shell + MCP):**
 
 ```powershell
-pwsh -File scripts/install-homelab-mcp.ps1
+# Windows
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_agents.ps1 -LoadKeyFromCluster
+```
+
+```bash
+# Linux / macOS / WSL
+./scripts/setup_agents.sh
+source ~/.zshrc
+```
+
+**MCP-only:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-homelab-mcp.ps1 -LoadKeyFromCluster
 ```
 
 Or manually apply the fragments under `mcp/fragments/`.
+
+**Validate (no secrets printed):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\validate-homelab-mcp.ps1
+```
 
 ## Fragments
 

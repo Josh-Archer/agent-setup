@@ -1,0 +1,12 @@
+# Local secrets / caches (never commit)
+.config/
+**/mcp-api-key
+**/*.bak-homelab-mcp-*
+**/*.bak-setup-agents-*
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+.idea/
+.vscode/
