@@ -1,0 +1,12 @@
+# Homelab MCP — Paperless + Immich (no secrets in-file)
+# Requires env HOMELAB_MCP_API_KEY for Paperless mcpo auth.
+# Install: codex mcp add ... or scripts/install-homelab-mcp.ps1
+
+[mcp_servers.paperless]
+url = "http://paperless-mcp.archer.casa"
+bearer_token_env_var = "HOMELAB_MCP_API_KEY"
+startup_timeout_sec = 30
+
+[mcp_servers.immich]
+url = "http://immich-mcp.archer.casa/mcp"
+startup_timeout_sec = 30
