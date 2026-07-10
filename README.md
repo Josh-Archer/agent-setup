@@ -14,12 +14,16 @@ Antigravity (`agy`), including dependency-aware multi-agent plans. See
 [`docs/grok-agy-delegation.md`](docs/grok-agy-delegation.md).
 
 ## Notes
-- This was created from the latest `origin/main` commit in `C:\Code\agent-setup-main`.
-- I scrubbed obvious hardcoded secrets I could identify in the copied files (for example inline test/example values).
+- This was created as a sanitized snapshot of agent-related configuration folders from a larger home repository.
+- Obvious hardcoded secrets were scrubbed where identified (for example inline test/example values).
 - References to platform secret providers (e.g. `${{ secrets.* }}` / `${{ vars.* }}` / `${{ inputs.* }}` / runtime env lookups) are intentionally retained because they are not in plaintext.
+- Multi-agent run artifacts land under `.agent-runs/` (gitignored).
 
-## Update source
-If you need a refreshed copy later, recreate it from the same source path (`C:\Code\agent-setup-main`) and re-run the same copy step.
+## Local validation for agent surfaces
+```bash
+python3 scripts/sync_agent_surfaces.py --check
+python3 -m unittest discover -s scripts/tests -v
+```
 
 ## Agent Delegation
 

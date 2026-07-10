@@ -1,0 +1,14 @@
+# Local multi-agent orchestration handoffs (orchestrate.py)
+.agent-runs/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS / editor noise
+.DS_Store
+*.swp
+*~

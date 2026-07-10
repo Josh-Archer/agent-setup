@@ -16,6 +16,8 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 DELEGATE = SCRIPT_DIR / "delegate.py"
+SUCCESS_STATUSES = frozenset({"completed", "dry-run"})
+BLOCKING_STATUSES = frozenset({"failed", "timed-out", "skipped"})
 
 
 def parse_args() -> argparse.Namespace:
@@ -44,10 +46,17 @@ def load_plan(path: Path) -> dict[str, Any]:
         for dependency in task.get("depends_on", []):
             if dependency not in known:
                 raise SystemExit(f"Task {task['id']} depends on unknown task {dependency}")
+    # Validate the dependency graph can be ordered (cycle detection).
+    batches(plan["tasks"])
     return plan
 
 
 def batches(tasks: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    """Topological batches for cycle detection and dry planning.
+
+    Runtime execution does not use this alone: dependents of failed or
+    timed-out tasks are skipped even when the DAG is otherwise valid.
+    """
     pending = {task["id"]: task for task in tasks}
     completed: set[str] = set()
     result: list[list[dict[str, Any]]] = []
@@ -77,6 +86,54 @@ Read completed dependency handoffs before starting:
 {prior}
 
 Stay within the requested scope. If you edit files, report the exact paths and validation. End with a concise handoff summary for the manager."""
+
+
+def skipped_task_result(
+    task: dict[str, Any],
+    run_dir: Path,
+    blocked_by: list[str],
+    results_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    task_dir = run_dir / "tasks" / task["id"]
+    task_dir.mkdir(parents=True, exist_ok=True)
+    output_file = task_dir / "output.txt"
+    error_file = task_dir / "stderr.txt"
+    reasons = []
+    for dep in blocked_by:
+        status = results_by_id[dep]["status"]
+        reasons.append(f"{dep} ({status})")
+    message = (
+        "SKIPPED: dependency did not succeed: "
+        + ", ".join(reasons)
+        + "\nDependents are not executed after failed, timed-out, or skipped prerequisites.\n"
+    )
+    output_file.write_text(message)
+    error_file.write_text(message)
+    return {
+        "id": task["id"],
+        "status": "skipped",
+        "blocked_by": blocked_by,
+        "output": str(output_file),
+        "stderr": str(error_file),
+        "started": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+
+
+def blocking_dependencies(task: dict[str, Any], results_by_id: dict[str, dict[str, Any]]) -> list[str]:
+    blocked: list[str] = []
+    for dep in task.get("depends_on", []):
+        result = results_by_id.get(dep)
+        if result is not None and result["status"] in BLOCKING_STATUSES:
+            blocked.append(dep)
+    return blocked
+
+
+def dependencies_ready(task: dict[str, Any], results_by_id: dict[str, dict[str, Any]]) -> bool:
+    for dep in task.get("depends_on", []):
+        result = results_by_id.get(dep)
+        if result is None or result["status"] not in SUCCESS_STATUSES:
+            return False
+    return True
 
 
 def run_task(plan: dict[str, Any], task: dict[str, Any], cwd: str, run_dir: Path, outputs: dict[str, Path], default_timeout: int) -> dict[str, Any]:
@@ -111,6 +168,54 @@ def run_task(plan: dict[str, Any], task: dict[str, Any], cwd: str, run_dir: Path
         return {"id": task["id"], "status": "timed-out", "output": str(output_file), "stderr": str(error_file), "started": started}
 
 
+def execute_plan(
+    plan: dict[str, Any],
+    cwd: str,
+    run_dir: Path,
+    max_parallel: int,
+    default_timeout: int,
+) -> list[dict[str, Any]]:
+    """Run tasks with dependency awareness; skip dependents of non-success tasks."""
+    pending = {task["id"]: task for task in plan["tasks"]}
+    results_by_id: dict[str, dict[str, Any]] = {}
+    outputs: dict[str, Path] = {}
+    results: list[dict[str, Any]] = []
+
+    while pending:
+        ready = [task for task in pending.values() if dependencies_ready(task, results_by_id)]
+        if ready:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_parallel) as pool:
+                futures = [
+                    pool.submit(run_task, plan, task, cwd, run_dir, outputs, default_timeout)
+                    for task in ready
+                ]
+                for future in futures:
+                    result = future.result()
+                    results.append(result)
+                    results_by_id[result["id"]] = result
+                    outputs[result["id"]] = Path(result["output"])
+                    pending.pop(result["id"])
+            continue
+
+        skipped_any = False
+        for task_id, task in list(pending.items()):
+            blocked_by = blocking_dependencies(task, results_by_id)
+            if not blocked_by:
+                continue
+            result = skipped_task_result(task, run_dir, blocked_by, results_by_id)
+            results.append(result)
+            results_by_id[result["id"]] = result
+            outputs[result["id"]] = Path(result["output"])
+            pending.pop(task_id)
+            skipped_any = True
+        if skipped_any:
+            continue
+
+        raise SystemExit("Task dependency cycle detected")
+
+    return results
+
+
 def main() -> int:
     args = parse_args()
     plan = load_plan(args.plan_file)
@@ -123,16 +228,8 @@ def main() -> int:
     run_dir = args.run_dir or (Path(cwd) / ".agent-runs" / (dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ") + "-" + uuid.uuid4().hex[:8]))
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / "plan.json").write_text(json.dumps(plan, indent=2) + "\n")
-    outputs: dict[str, Path] = {}
-    results: list[dict[str, Any]] = []
 
-    for batch in batches(plan["tasks"]):
-        with concurrent.futures.ThreadPoolExecutor(max_workers=args.max_parallel) as pool:
-            futures = [pool.submit(run_task, plan, task, cwd, run_dir, outputs, args.task_timeout_seconds) for task in batch]
-            for future in futures:
-                result = future.result()
-                results.append(result)
-                outputs[result["id"]] = Path(result["output"])
+    results = execute_plan(plan, cwd, run_dir, args.max_parallel, args.task_timeout_seconds)
 
     manager_provider = plan.get("manager_provider", plan.get("provider", "agy"))
     manager_dir = run_dir / "manager"
@@ -177,7 +274,7 @@ Do not redo completed work unless a handoff is missing or contradictory.""")
     manifest = {"run_dir": str(run_dir), "tasks": results, "manager": manager_result}
     (run_dir / "run.json").write_text(json.dumps(manifest, indent=2) + "\n")
     print(json.dumps(manifest, indent=2))
-    return 0 if all(item["status"] in ("completed", "dry-run") for item in results) and manager_result["status"] in ("completed", "dry-run") else 1
+    return 0 if all(item["status"] in SUCCESS_STATUSES for item in results) and manager_result["status"] in SUCCESS_STATUSES else 1
 
 
 if __name__ == "__main__":

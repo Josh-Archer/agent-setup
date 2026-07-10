@@ -3,7 +3,11 @@
 
 from __future__ import annotations
 
+import argparse
+import filecmp
 import re
+import shutil
+import tempfile
 from pathlib import Path
 
 
@@ -64,15 +68,22 @@ def agy_tools(tools: str) -> str:
     return "[" + ", ".join(mapped) + "]"
 
 
-def main() -> None:
-    GROK_DIR.mkdir(parents=True, exist_ok=True)
-    GROK_AGENT_DIR.mkdir(parents=True, exist_ok=True)
-    AGY_AGENT_DIR.mkdir(parents=True, exist_ok=True)
-    (AGY_PLUGIN_DIR / "rules").mkdir(parents=True, exist_ok=True)
+def write_surfaces(root: Path) -> int:
+    """Write generated Grok and Antigravity surfaces under root. Returns agent count."""
+    source_dir = root / ".codex" / "agents"
+    grok_dir = root / ".grok" / "roles"
+    grok_agent_dir = root / ".grok" / "agents"
+    agy_plugin_dir = root / ".agents" / "plugins" / "home-codex-agents"
+    agy_agent_dir = agy_plugin_dir / "agents"
 
-    agents = sorted(SOURCE_DIR.glob("*.agent.md"))
+    grok_dir.mkdir(parents=True, exist_ok=True)
+    grok_agent_dir.mkdir(parents=True, exist_ok=True)
+    agy_agent_dir.mkdir(parents=True, exist_ok=True)
+    (agy_plugin_dir / "rules").mkdir(parents=True, exist_ok=True)
+
+    agents = sorted(source_dir.glob("*.agent.md"))
     if not agents:
-        raise SystemExit(f"No Codex agents found in {SOURCE_DIR}")
+        raise SystemExit(f"No Codex agents found in {source_dir}")
 
     for source in agents:
         meta, body = frontmatter(source.read_text())
@@ -89,7 +100,7 @@ def main() -> None:
             f'reasoning_effort = "{("high" if reasoning == "extra high" else reasoning)}"\n'
             f'prompt_file = ".codex/agents/{source.name}"\n'
         )
-        (GROK_DIR / f"{name}.toml").write_text(grok)
+        (grok_dir / f"{name}.toml").write_text(grok)
 
         grok_agent = (
             "---\n"
@@ -102,7 +113,7 @@ def main() -> None:
             "---\n"
             + body
         )
-        (GROK_AGENT_DIR / f"{name}.md").write_text(grok_agent)
+        (grok_agent_dir / f"{name}.md").write_text(grok_agent)
 
         agy = (
             "---\n"
@@ -113,27 +124,119 @@ def main() -> None:
             "---\n"
             + body
         )
-        (AGY_AGENT_DIR / f"{name}.md").write_text(agy)
+        (agy_agent_dir / f"{name}.md").write_text(agy)
 
-    (AGY_PLUGIN_DIR / "plugin.json").write_text(
+    (agy_plugin_dir / "plugin.json").write_text(
         '{\n'
         '  "$schema": "https://antigravity.google/schemas/v1/plugin.json",\n'
         '  "name": "home-codex-agents",\n'
         '  "description": "Repository-specific agent roles synchronized from Codex."\n'
         '}\n'
     )
-    (AGY_PLUGIN_DIR / "rules" / "model-equivalence.md").write_text(
+    (agy_plugin_dir / "rules" / "model-equivalence.md").write_text(
         "# Home agent model equivalence\n\n"
         "These mappings preserve role intent across local agent surfaces:\n\n"
         "- High/extra-high Codex roles: Grok `grok-4.5`; Antigravity `Claude Opus 4.6 (Thinking)`.\n"
         "- Medium Codex roles: Grok `grok-composer-2.5-fast`; Antigravity `Gemini 3.5 Flash (Medium)`.\n"
         "- Spark/low-risk Codex roles: Grok `grok-composer-2.5-fast`; Antigravity `Gemini 3.5 Flash (Low)`.\n"
     )
+    (agy_plugin_dir / "rules" / "repo-agents.md").write_text(
+        "# Repository agent constitution (Antigravity)\n\n"
+        "Antigravity does not auto-load the repository root `AGENTS.md`. Use this rule "
+        "together with the role body when working in this repo.\n\n"
+        "## Source of truth\n\n"
+        "- Canonical roles: `.codex/agents/*.agent.md`\n"
+        "- Cross-provider contract: repository root `AGENTS.md`\n"
+        "- Operational guide: `docs/grok-agy-delegation.md`\n"
+        "- Regenerate Grok/agy surfaces: `python3 scripts/sync_agent_surfaces.py`\n"
+        "- Drift check: `python3 scripts/sync_agent_surfaces.py --check`\n\n"
+        "## Delegation handoffs\n\n"
+        "- Single-agent wrapper: `.codex/skills/grok-agy-delegate/scripts/delegate.py`\n"
+        "- Plan orchestrator: `.codex/skills/grok-agy-delegate/scripts/orchestrate.py`\n"
+        "- Multi-agent outputs: `.agent-runs/<run-id>/` (local, gitignored)\n"
+        "- Dependents are not run when a prerequisite fails, times out, or is skipped\n\n"
+        "## Safety\n\n"
+        "- Do not put secrets into prompts or plan JSON\n"
+        "- Prefer read-only roles for analysis-only work\n"
+        "- Inspect `git diff` before treating delegated edits as accepted\n"
+    )
+    return len(agents)
 
-    print(f"Generated {len(agents)} Grok roles in {GROK_DIR}")
-    print(f"Generated {len(agents)} Grok agents in {GROK_AGENT_DIR}")
-    print(f"Generated {len(agents)} Antigravity agents in {AGY_PLUGIN_DIR}")
+
+def _generated_trees(root: Path) -> list[Path]:
+    return [
+        root / ".grok" / "roles",
+        root / ".grok" / "agents",
+        root / ".agents" / "plugins" / "home-codex-agents",
+    ]
+
+
+def check_surfaces() -> int:
+    """Regenerate into a temp tree and compare to committed generated surfaces."""
+    with tempfile.TemporaryDirectory(prefix="agent-surface-check-") as tmp:
+        tmp_root = Path(tmp)
+        # Sync reads only .codex/agents; copy that tree into the temp root.
+        dest_source = tmp_root / ".codex" / "agents"
+        dest_source.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copytree(SOURCE_DIR, dest_source)
+        write_surfaces(tmp_root)
+
+        mismatches: list[str] = []
+        for rel_root in _generated_trees(ROOT):
+            tmp_tree = tmp_root / rel_root.relative_to(ROOT)
+            if not rel_root.exists():
+                mismatches.append(f"missing on disk: {rel_root.relative_to(ROOT)}")
+                continue
+            if not tmp_tree.exists():
+                mismatches.append(f"missing in regenerated output: {rel_root.relative_to(ROOT)}")
+                continue
+            cmp = filecmp.dircmp(rel_root, tmp_tree)
+            mismatches.extend(_collect_dircmp_diffs(cmp, rel_root.relative_to(ROOT)))
+
+        if mismatches:
+            print("Generated agent surfaces are out of sync with .codex/agents:")
+            for item in mismatches:
+                print(f"  - {item}")
+            print("Run: python3 scripts/sync_agent_surfaces.py")
+            return 1
+        print("Generated agent surfaces match .codex/agents")
+        return 0
+
+
+def _collect_dircmp_diffs(cmp: filecmp.dircmp, prefix: Path) -> list[str]:
+    found: list[str] = []
+    for name in sorted(cmp.left_only):
+        found.append(f"only on disk: {prefix / name}")
+    for name in sorted(cmp.right_only):
+        found.append(f"only in regenerated output: {prefix / name}")
+    for name in sorted(cmp.diff_files):
+        found.append(f"content differs: {prefix / name}")
+    for name, sub in sorted(cmp.subdirs.items()):
+        found.extend(_collect_dircmp_diffs(sub, prefix / name))
+    return found
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Exit non-zero if generated Grok/Antigravity surfaces drift from .codex/agents",
+    )
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    if args.check:
+        return check_surfaces()
+
+    count = write_surfaces(ROOT)
+    print(f"Generated {count} Grok roles in {GROK_DIR}")
+    print(f"Generated {count} Grok agents in {GROK_AGENT_DIR}")
+    print(f"Generated {count} Antigravity agents in {AGY_PLUGIN_DIR}")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

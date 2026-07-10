@@ -31,13 +31,16 @@ python3 .codex/skills/grok-agy-delegate/scripts/orchestrate.py \
   --plan-file /tmp/agent-plan.json --provider agy --cwd "$PWD"
 ```
 
-The orchestrator validates dependencies, runs ready tasks in parallel, writes
-each prompt/result to `.agent-runs/<run-id>/tasks/<task-id>/`, and then asks the
-configured `manager` role to read those handoffs and reconcile the outcome.
-Tasks can choose a different provider or model in the plan. See
+The orchestrator validates dependencies (including cycle detection), runs ready
+tasks in parallel, writes each prompt/result to
+`.agent-runs/<run-id>/tasks/<task-id>/`, skips dependents of failed, timed-out,
+or skipped prerequisites, and then asks the configured `manager` role to read
+those handoffs and reconcile the outcome. Tasks can choose a different provider
+or model in the plan. Plans without `provider` default to `agy`. See
 [references/plan-format.md](references/plan-format.md) for the JSON schema.
 Workers and the manager default to a 10-minute timeout; use
-`--task-timeout-seconds` or a task-level `timeout_seconds` override when needed.
+`--task-timeout-seconds`, a task-level `timeout_seconds`, or plan-level
+`manager_timeout_seconds` when needed.
 
 ## Safety and scope
 
