@@ -36,6 +36,9 @@ symlinks the surfaces into `~/.codex/skills/`, `~/.grok/`, and
 python3 scripts/setup_global_delegation.py
 ```
 
+The startup marker reruns the skill-only sync on every new zsh session, so new
+directories added under `.codex/skills/` are linked automatically.
+
 Restart the shell or open a new ChatGPT/Codex session afterward.
 
 ## Agent Delegation

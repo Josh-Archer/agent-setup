@@ -17,6 +17,8 @@ def shell_block(repo_root: Path) -> str:
     return f'''{MARKER}
 # Keep the global Codex delegation skill tied to this checkout.
 export CODEX_DELEGATION_REPO={repo_root}
+# Link any new repository skills when a new zsh starts.
+python3 "$CODEX_DELEGATION_REPO/scripts/setup_global_delegation.py" --sync-skills --quiet 2>/dev/null || true
 {END_MARKER}'''
 
 
@@ -52,6 +54,17 @@ def install_link(source: Path, destination: Path, label: str) -> Path:
         )
     destination.symlink_to(source, target_is_directory=source.is_dir())
     return destination
+
+
+def sync_skills(repo_root: Path, codex_home: Path) -> list[Path]:
+    source_root = repo_root / ".codex" / "skills"
+    destination_root = codex_home / "skills"
+    destination_root.mkdir(parents=True, exist_ok=True)
+    installed: list[Path] = []
+    for source in sorted(source_root.iterdir()):
+        if source.is_dir() and not source.name.startswith("."):
+            installed.append(install_link(source, destination_root / source.name, "Codex skill"))
+    return installed
 
 
 def install_harness_surfaces(repo_root: Path, home: Path) -> list[Path]:
@@ -90,9 +103,14 @@ def main() -> int:
     parser.add_argument("--repo-root", type=Path, default=Path(__file__).resolve().parents[1])
     parser.add_argument("--codex-home", type=Path, default=Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser())
     parser.add_argument("--shell-file", type=Path, default=Path("~/.zshrc").expanduser())
+    parser.add_argument("--sync-skills", action="store_true", help="Link all repository skills and exit")
+    parser.add_argument("--quiet", action="store_true")
     args = parser.parse_args()
 
     repo_root = args.repo_root.resolve()
+    if args.sync_skills:
+        sync_skills(repo_root, args.codex_home.expanduser())
+        return 0
     destination = install_skill(repo_root, args.codex_home.expanduser())
     harness_links = install_harness_surfaces(repo_root, Path.home())
     install_shell_hook(args.shell_file.expanduser(), repo_root)
