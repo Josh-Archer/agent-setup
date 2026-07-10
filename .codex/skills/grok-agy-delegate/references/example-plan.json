@@ -1,0 +1,18 @@
+{
+  "goal": "Investigate and validate a deployment failure.",
+  "provider": "agy",
+  "manager_role": "manager",
+  "tasks": [
+    {
+      "id": "diagnose",
+      "role": "debugger",
+      "prompt": "Find the root cause. Do not edit files."
+    },
+    {
+      "id": "validate",
+      "role": "testing",
+      "depends_on": ["diagnose"],
+      "prompt": "Read the diagnosis handoff and run the narrowest confirming test."
+    }
+  ]
+}

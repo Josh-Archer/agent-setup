@@ -14,6 +14,8 @@ Global agents should stay generic and reusable across repositories.
 ## Canonical Role Map
 - `architecture`: high-level structure and GitOps design
 - `development`: implementation, maintenance, and local tooling
+- `devops`: CI/CD, deployment, and operational reliability
+- `devops-subagent`: focused CI/CD and deployment support
 - `documentation`: runbooks, guides, and operational notes
 - `docs-scribe`: lightweight README and usage-doc maintenance
 - `debugger`: bug isolation, discrepancy analysis, and root-cause identification
@@ -36,6 +38,14 @@ Global agents should stay generic and reusable across repositories.
 ## Role: Documentation
 - **Model:** gpt-5.4
 - **Goal:** Maintain runbooks, guides, and operational notes.
+
+## Role: DevOps
+- **Model:** gpt-5.4
+- **Goal:** Define and operate deployment, release, and infrastructure reliability workflows.
+
+## Role: DevOps Subagent
+- **Model:** gpt-5.4
+- **Goal:** Execute focused infrastructure-support tasks for deployment and operational stability.
 
 ## Role: Docs Scribe
 - **Model:** gpt-5-mini
@@ -72,3 +82,19 @@ Global agents should stay generic and reusable across repositories.
 ## Role: Junior
 - **Model:** gpt-5.3-codex-spark
 - **Goal:** Documentation, unit test boilerplate, and repetitive low-risk support work.
+
+## External delegation
+
+The repository also provides the `grok-agy-delegate` Codex skill at
+`.codex/skills/grok-agy-delegate/`. It can run one named agent through Grok
+Build or Antigravity (`agy`), or coordinate a Codex-generated plan through
+multiple workers and a final `manager` pass.
+
+- Single-agent entry point: `scripts/delegate.py`.
+- Plan orchestration entry point: `scripts/orchestrate.py`.
+- Provider agents and roles: `.grok/agents/`, `.grok/roles/`, and
+  `.agents/plugins/home-codex-agents/agents/`.
+- Cross-agent communication uses handoff files under `.agent-runs/<run-id>/`.
+- A named agent uses its configured equivalent model. Pass `--model` only for
+  an intentional override.
+- Use `docs/grok-agy-delegation.md` for invocation examples and plan schema.

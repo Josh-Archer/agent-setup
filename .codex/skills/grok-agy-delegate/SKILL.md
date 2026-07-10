@@ -5,7 +5,7 @@ description: Delegate repository work from Codex to the installed Grok Build or 
 
 # Grok and Antigravity delegation
 
-Use the bundled `scripts/delegate.py` wrapper to run a named repository agent through `grok` or `agy`. Keep the provider choice explicit when the user names one. If the user asks for a second opinion without choosing a provider, prefer Grok for a code review or architecture pass and agy for a fast implementation or validation pass.
+Use the bundled `scripts/delegate.py` wrapper to run a named repository agent through `grok` or `agy`, or use `scripts/orchestrate.py` to run a dependency-aware plan with worker handoffs and a manager reconciliation pass. Keep the provider choice explicit when the user names one. If the user asks for a second opinion without choosing a provider, prefer Grok for a code review or architecture pass and agy for a fast implementation or validation pass.
 
 ## Workflow
 
@@ -22,11 +22,28 @@ Use the bundled `scripts/delegate.py` wrapper to run a named repository agent th
 4. Use `--dry-run` first when constructing a new invocation or when the prompt contains shell-sensitive text.
 5. Return the provider, selected role/model, exit status, and the complete delegated result. Clearly distinguish provider output from Codex's own conclusions.
 
+## Coordinated plans
+
+When Codex has already made a plan or task list, save it as JSON and run:
+
+```bash
+python3 .codex/skills/grok-agy-delegate/scripts/orchestrate.py \
+  --plan-file /tmp/agent-plan.json --provider agy --cwd "$PWD"
+```
+
+The orchestrator validates dependencies, runs ready tasks in parallel, writes
+each prompt/result to `.agent-runs/<run-id>/tasks/<task-id>/`, and then asks the
+configured `manager` role to read those handoffs and reconcile the outcome.
+Tasks can choose a different provider or model in the plan. See
+[references/plan-format.md](references/plan-format.md) for the JSON schema.
+Workers and the manager default to a 10-minute timeout; use
+`--task-timeout-seconds` or a task-level `timeout_seconds` override when needed.
+
 ## Safety and scope
 
 - The wrapper runs the provider CLI locally with the current user's credentials and filesystem permissions.
 - Do not pass API keys, browser tokens, passwords, or unrelated private files unless the user explicitly asks for that exact data to be sent to the selected provider.
-- Read-only tasks should use `--no-write` where the provider supports it, or a read-only role such as `gitops-architect` or `security-auditor`.
+- Read-only tasks should use a read-only role such as `gitops-architect` or `security-auditor`; the wrapper does not silently enable write or auto-approval flags.
 - Do not use auto-approval or dangerous permission flags unless the user explicitly requests that execution mode.
 - A delegated agent's edits are local workspace changes. Inspect `git diff` before reporting them as accepted.
 
@@ -43,4 +60,4 @@ Use the bundled `scripts/delegate.py` wrapper to run a named repository agent th
 - `debugger`: isolate a failure without changing files.
 - `security-auditor`: review a diff for concrete security issues.
 - `testing` or `validation-runner`: run focused checks and report evidence.
-- `manager`: coordinate a multi-step task when the provider supports subagents.
+- `manager`: coordinate a multi-step task and reconcile worker handoffs.
