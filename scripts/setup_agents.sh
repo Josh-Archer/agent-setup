@@ -186,19 +186,20 @@ if not isinstance(servers, dict):
 servers.update(frag)
 settings["mcpServers"] = servers
 settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-agy = home / ".gemini" / "antigravity" / "mcp_config.json"
-agy.parent.mkdir(parents=True, exist_ok=True)
-agy_doc = {"mcpServers": dict(frag)}
-if agy.exists():
-    try:
-        existing = json.loads(agy.read_text(encoding="utf-8") or "{}")
-        base = existing.get("mcpServers") if isinstance(existing.get("mcpServers"), dict) else {}
-        base.update(frag)
-        existing["mcpServers"] = base
-        agy_doc = existing
-    except Exception:
-        pass
-agy.write_text(json.dumps(agy_doc, indent=2) + "\n", encoding="utf-8")
+for sub_path in ["antigravity/mcp_config.json", "antigravity-cli/mcp_config.json"]:
+    agy = home / ".gemini" / sub_path
+    agy.parent.mkdir(parents=True, exist_ok=True)
+    agy_doc = {"mcpServers": dict(frag)}
+    if agy.exists():
+        try:
+            existing = json.loads(agy.read_text(encoding="utf-8") or "{}")
+            base = existing.get("mcpServers") if isinstance(existing.get("mcpServers"), dict) else {}
+            base.update(frag)
+            existing["mcpServers"] = base
+            agy_doc = existing
+        except Exception:
+            pass
+    agy.write_text(json.dumps(agy_doc, indent=2) + "\n", encoding="utf-8")
 print("[setup_agents] synced Gemini/Antigravity mcpServers")
 PY
 }
