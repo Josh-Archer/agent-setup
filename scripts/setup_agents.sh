@@ -3,6 +3,12 @@
 # Safe for public repos: no secret values written into git-tracked files.
 set -euo pipefail
 
+if [ "$EUID" -eq 0 ]; then
+  printf '[setup_agents] Error: Please do not run this script as root or with sudo.\n'
+  printf '[setup_agents] The script will prompt for sudo internally when updating /etc/hosts.\n'
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/homelab"
 SHELL_SNIPPET_SRC="$REPO_ROOT/shell/homelab-mcp.env.sh"
@@ -186,21 +192,95 @@ if not isinstance(servers, dict):
 servers.update(frag)
 settings["mcpServers"] = servers
 settings_path.write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-agy = home / ".gemini" / "antigravity" / "mcp_config.json"
-agy.parent.mkdir(parents=True, exist_ok=True)
-agy_doc = {"mcpServers": dict(frag)}
-if agy.exists():
-    try:
-        existing = json.loads(agy.read_text(encoding="utf-8") or "{}")
-        base = existing.get("mcpServers") if isinstance(existing.get("mcpServers"), dict) else {}
-        base.update(frag)
-        existing["mcpServers"] = base
-        agy_doc = existing
-    except Exception:
-        pass
-agy.write_text(json.dumps(agy_doc, indent=2) + "\n", encoding="utf-8")
+for sub_path in ["antigravity/mcp_config.json", "antigravity-cli/mcp_config.json"]:
+    agy = home / ".gemini" / sub_path
+    agy.parent.mkdir(parents=True, exist_ok=True)
+    agy_doc = {"mcpServers": dict(frag)}
+    if agy.exists():
+        try:
+            existing = json.loads(agy.read_text(encoding="utf-8") or "{}")
+            base = existing.get("mcpServers") if isinstance(existing.get("mcpServers"), dict) else {}
+            base.update(frag)
+            existing["mcpServers"] = base
+            agy_doc = existing
+        except Exception:
+            pass
+    agy.write_text(json.dumps(agy_doc, indent=2) + "\n", encoding="utf-8")
 print("[setup_agents] synced Gemini/Antigravity mcpServers")
 PY
+}
+
+update_hosts_entry() {
+  # Check if OS is macOS or Linux
+  if [[ "$OSTYPE" != "darwin"* && "$OSTYPE" != "linux-gnu"* && "$OSTYPE" != "linux"* ]]; then
+    log "OS is not macOS/Linux; skipping hosts file check"
+    return 0
+  fi
+
+  if ! command -v kubectl >/dev/null 2>&1; then
+    log "kubectl not found; skip hosts file check"
+    return 0
+  fi
+
+  local ts_ip
+  ts_ip="$(kubectl get svc -n kube-system traefik -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || true)"
+  if [ -z "$ts_ip" ]; then
+    log "could not find Traefik Tailscale IP; skip hosts file check"
+    return 0
+  fi
+
+  log "found Traefik Tailscale IP: $ts_ip"
+  local domains=("paperless-mcp.archer.casa" "immich-mcp.archer.casa")
+  local needs_update=0
+
+  for domain in "${domains[@]}"; do
+    if ! grep -qE "[[:space:]]${domain}([[:space:]]|$)" /etc/hosts; then
+      needs_update=1
+      break
+    fi
+    local current_ip
+    current_ip="$(grep -E "[[:space:]]${domain}([[:space:]]|$)" /etc/hosts | awk '{print $1}' | head -n1)"
+    if [ "$current_ip" != "$ts_ip" ]; then
+      needs_update=1
+      break
+    fi
+  done
+
+  if [ "$needs_update" -eq 1 ]; then
+    local block
+    block=$(cat <<EOF
+
+# >>> homelab-mcp-hosts (agent-setup-showcase) >>>
+$ts_ip paperless-mcp.archer.casa
+$ts_ip immich-mcp.archer.casa
+# <<< homelab-mcp-hosts (agent-setup-showcase) <<<
+EOF
+)
+    # Check if we can run sudo without password, or if terminal is interactive
+    if sudo -n true 2>/dev/null || [ -t 0 ]; then
+      log "updating /etc/hosts with Tailscale MCP routes..."
+      if grep -qF "# >>> homelab-mcp-hosts" /etc/hosts 2>/dev/null; then
+        local tmp
+        tmp="$(mktemp)"
+        awk '
+          /# >>> homelab-mcp-hosts/ {skip=1; next}
+          /# <<< homelab-mcp-hosts/ {skip=0; next}
+          !skip {print}
+        ' /etc/hosts >"$tmp"
+        printf '%s\n' "$block" >>"$tmp"
+        sudo mv "$tmp" /etc/hosts
+      else
+        printf '%s\n' "$block" | sudo tee -a /etc/hosts >/dev/null
+      fi
+      log "successfully updated /etc/hosts"
+    else
+      log "warning: /etc/hosts needs update but sudo requires a password and terminal is non-interactive."
+      log "Please run the following command manually to update your hosts file:"
+      log "  sudo sh -c 'printf \"\\\n# Tailscale MCP routes\\\n$ts_ip paperless-mcp.archer.casa\\\n$ts_ip immich-mcp.archer.casa\\\n\" >> /etc/hosts'"
+    fi
+  else
+    log "/etc/hosts already up-to-date for MCP domains"
+  fi
 }
 
 main() {
@@ -210,6 +290,7 @@ main() {
   install_shell_snippet
   refresh_key_cache
   install_mcp_clients
+  update_hosts_entry
   log "done. Open a new shell (or: source ~/.zshrc) and restart Codex/Grok/Antigravity."
 }
 
