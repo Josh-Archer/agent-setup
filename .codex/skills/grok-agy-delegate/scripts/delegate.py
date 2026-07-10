@@ -36,7 +36,11 @@ def build_command(args: argparse.Namespace, prompt: str) -> list[str]:
     if not executable:
         raise SystemExit(f"{args.provider} CLI not found on PATH")
 
-    model = args.model or DEFAULT_MODELS[args.provider]
+    # A named agent owns its equivalent model in the provider-specific
+    # definition. Only apply a wrapper default when no role was selected.
+    model = args.model
+    if model is None and not args.role:
+        model = DEFAULT_MODELS[args.provider]
     if args.provider == "grok":
         command = [executable, "-p", prompt, "--cwd", args.cwd, "--output-format", args.output_format]
         if args.role:
