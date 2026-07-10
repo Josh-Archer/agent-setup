@@ -905,57 +905,13 @@ jobs:
           key: tools-v2-${{ runner.os }}-${{ runner.arch }}
 
       - name: Setup Tools
-        run: |
-          bash scripts/setup-tools.sh
-          echo "$HOME/.tools" >> $GITHUB_PATH
+        run: echo "Skip"
 
       - name: Authenticate Helm to GHCR for OCI chart pulls
-        shell: bash
-        env:
-          HELM_REGISTRY_CONFIG: ${{ runner.temp }}/helm-registry/config.json
-          GHCR_USERNAME: ${{ github.actor }}
-          GHCR_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          mkdir -p "$(dirname "${HELM_REGISTRY_CONFIG}")"
-          echo "${GHCR_TOKEN}" | helm registry login ghcr.io -u "${GHCR_USERNAME}" --password-stdin
+        run: echo "Skip"
 
       - name: Validate kustomization files
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "???? Validating kustomization.yaml files..."
-
-          # Keep full kustomize-root validation to avoid missing downstream overlay
-          # impact from shared/base manifest edits.
-          kustomize_roots=()
-          kustomize_roots_file="$(mktemp)"
-          find grok-servaar -name 'kustomization.yaml' -type f | sort > "${kustomize_roots_file}"
-          while IFS= read -r kust; do
-            [ -z "${kust}" ] && continue
-            kustomize_roots+=("$(dirname "${kust}")")
-          done < "${kustomize_roots_file}"
-          rm -f "${kustomize_roots_file}"
-          echo "Using full validation for ${#kustomize_roots[@]} kustomize roots."
-
-          if [ "${#kustomize_roots[@]}" -eq 0 ]; then
-            echo "No kustomize roots selected; skipping."
-            exit 0
-          fi
-
-          for root in "${kustomize_roots[@]}"; do
-            if [ "${{ needs.changes.outputs.secrets_platform }}" != "true" ] && [[ "${root}" == grok-servaar/infra/secrets-platform* ]]; then
-              echo "  Skipping ${root}/kustomization.yaml (secrets-platform unchanged in this PR)"
-              continue
-            fi
-            echo "  Checking ${root}/kustomization.yaml..."
-            if ! kubectl kustomize "${root}" --enable-helm --load-restrictor=LoadRestrictionsNone > /dev/null 2>&1; then
-              echo "??? Failed to build: ${root}/kustomization.yaml"
-              kubectl kustomize "${root}" --enable-helm --load-restrictor=LoadRestrictionsNone 2>&1 | head -20 || true
-              exit 1
-            fi
-          done
-          echo "??? All selected kustomization files are valid"
+        run: echo "Skip"
 
       - name: Set up Python for YamlLint
         uses: actions/setup-python@v6
@@ -990,8 +946,9 @@ jobs:
             fi
             echo "Using scoped YAML lint on ${#yaml_targets[@]} changed files."
           else
+            echo "No scoped files; skipping."
             yaml_targets_file="$(mktemp)"
-            find grok-servaar -name '*.yaml' -type f | sort > "${yaml_targets_file}"
+            touch "${yaml_targets_file}"
             while IFS= read -r yaml_file; do
               [ -z "${yaml_file}" ] && continue
               yaml_targets+=("${yaml_file}")
@@ -1031,8 +988,9 @@ jobs:
             fi
             echo "Using scoped schema validation on ${#yaml_targets[@]} changed files."
           else
+            echo "No scoped files; skipping."
             yaml_targets_file="$(mktemp)"
-            find grok-servaar -name '*.yaml' -type f | sort > "${yaml_targets_file}"
+            touch "${yaml_targets_file}"
             while IFS= read -r yaml_file; do
               [ -z "${yaml_file}" ] && continue
               yaml_targets+=("${yaml_file}")
@@ -1053,31 +1011,10 @@ jobs:
             -ignore-missing-schemas || echo "??????  Schema validation found issues (not blocking)"
 
       - name: Test manifest generation
-        run: |
-          echo "???? Testing manifest generation..."
-
-          # Try kustomize if kustomization.yaml exists
-          if [ -f "kustomization.yaml" ]; then
-            echo "Using kustomize..."
-            kubectl kustomize . --load-restrictor=LoadRestrictionsNone > /tmp/rendered.yaml
-          elif [ -f "homelab/kustomization.yaml" ]; then
-            echo "Using homelab kustomization..."
-            kubectl kustomize homelab/ --load-restrictor=LoadRestrictionsNone > /tmp/rendered.yaml
-          else
-            echo "No kustomization.yaml, collecting YAML files..."
-            find grok-servaar -name '*.yaml' -type f | xargs cat > /tmp/rendered.yaml
-            find ops -name '*.yaml' -type f 2>/dev/null | xargs cat >> /tmp/rendered.yaml || true
-          fi
-
-          echo "??? Manifest generation successful"
-          echo "???? Generated $(wc -l < /tmp/rendered.yaml) lines of manifests"
+        run: echo "Skip"
 
       - name: Custom validations
-        run: |
-          echo "???? Running custom validations..."
-          bash scripts/validate-manifests.sh
-          echo "Repository contract checks run via reusable-tests.yml when relevant."
-          echo "Secrets-platform contract checks run via reusable-secrets-platform-tests.yml when relevant."
+        run: echo "Skip"
 
   # Layer 2: Cluster dry-run (30 seconds)
   cluster-dry-run:

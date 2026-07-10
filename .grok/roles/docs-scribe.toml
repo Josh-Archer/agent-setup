@@ -1,0 +1,5 @@
+description = "Use when maintaining README and usage documentation for scripts, manifests, and GitOps workflows."
+default_capability_mode = "all"
+model = "grok-composer-2.5-fast"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/docs-scribe.agent.md"

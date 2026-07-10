@@ -1,0 +1,5 @@
+description = "Use when translating feature requirements into manifest-driven implementation plans with rollout and validation criteria."
+default_capability_mode = "all"
+model = "grok-4.5"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/product-development.agent.md"

@@ -1,0 +1,5 @@
+description = "Use when running validation workflows, image checks, or CI-readiness checks and summarizing concrete pass or fail evidence."
+default_capability_mode = "all"
+model = "grok-composer-2.5-fast"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/testing.agent.md"
