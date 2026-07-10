@@ -1,6 +1,7 @@
 # Local secrets / caches (never commit)
 .config/
 **/mcp-api-key
+**/paperless-api-key
 **/*.bak-homelab-mcp-*
 **/*.bak-setup-agents-*
 
