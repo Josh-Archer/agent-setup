@@ -1,0 +1,5 @@
+description = "Use when running Codex validation, environment setup, kustomize checks, or other focused repo validation workflows that benefit from a fast execution-oriented worker."
+default_capability_mode = "all"
+model = "grok-composer-2.5-fast"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/validation-runner.agent.md"

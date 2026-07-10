@@ -1,0 +1,5 @@
+description = "Use when owning CI/CD pipeline design, build optimization, and deployment reliability."
+default_capability_mode = "all"
+model = "grok-4.5"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/devops.agent.md"

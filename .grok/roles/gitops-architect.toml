@@ -1,0 +1,5 @@
+description = "Use when planning manifest-driven changes, Kustomize updates, and ArgoCD-safe rollout structure for this homelab repo."
+default_capability_mode = "read-only"
+model = "grok-4.5"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/gitops-architect.agent.md"

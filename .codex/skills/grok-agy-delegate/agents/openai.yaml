@@ -1,0 +1,4 @@
+interface:
+  display_name: "Delegate to Grok or agy"
+  short_description: "Run a named repo agent through Grok or Antigravity"
+  default_prompt: "Use the Grok or agy CLI to delegate this task to the best matching repo agent, then return the provider output and validation status."

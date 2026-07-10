@@ -1,0 +1,5 @@
+description = "Use when reviewing diffs for security issues, unsafe scripts, or configuration drift."
+default_capability_mode = "read-only"
+model = "grok-4.5"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/security-auditor.agent.md"

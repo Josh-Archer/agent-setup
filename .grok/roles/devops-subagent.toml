@@ -1,0 +1,5 @@
+description = "Use when optimizing CI/CD pipelines, builds, and deployment workflows for speed, reliability, and operational safety."
+default_capability_mode = "all"
+model = "grok-4.5"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/devops-subagent.agent.md"
