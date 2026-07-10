@@ -27,9 +27,10 @@ python3 -m unittest discover -s scripts/tests -v
 
 ## Install delegation globally
 
-Run this once to make the delegation skill available to Codex sessions across
-projects. It symlinks the skill into `~/.codex/skills/` and adds an idempotent
-startup marker to `~/.zshrc`:
+Run this once to make the delegation skill and generated role surfaces
+available to Codex, Grok CLI, and Antigravity sessions across projects. It
+symlinks the surfaces into `~/.codex/skills/`, `~/.grok/`, and
+`~/.agents/plugins/`, then adds an idempotent startup marker to `~/.zshrc`:
 
 ```bash
 python3 scripts/setup_global_delegation.py

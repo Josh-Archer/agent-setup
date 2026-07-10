@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Install this repository's delegation skill for all local Codex sessions."""
+"""Install this repository's delegation surfaces for local agent harnesses."""
 
 from __future__ import annotations
 
@@ -39,6 +39,35 @@ def install_skill(repo_root: Path, codex_home: Path) -> Path:
     return destination
 
 
+def install_link(source: Path, destination: Path, label: str) -> Path:
+    if not source.exists():
+        raise SystemExit(f"{label} source not found: {source}")
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if destination.is_symlink() or destination.exists():
+        if destination.is_symlink() and destination.resolve() == source.resolve():
+            return destination
+        raise SystemExit(
+            f"Refusing to replace existing global {label}: {destination}. "
+            "Move it aside and rerun."
+        )
+    destination.symlink_to(source, target_is_directory=source.is_dir())
+    return destination
+
+
+def install_harness_surfaces(repo_root: Path, home: Path) -> list[Path]:
+    """Expose generated role/plugin surfaces to Grok CLI and Antigravity."""
+    links = [
+        (repo_root / ".grok" / "agents", home / ".grok" / "agents", "Grok agents"),
+        (repo_root / ".grok" / "roles", home / ".grok" / "roles", "Grok roles"),
+        (
+            repo_root / ".agents" / "plugins" / "home-codex-agents",
+            home / ".agents" / "plugins" / "home-codex-agents",
+            "Antigravity plugin",
+        ),
+    ]
+    return [install_link(source, destination, label) for source, destination, label in links]
+
+
 def install_shell_hook(shell_file: Path, repo_root: Path) -> None:
     existing = shell_file.read_text() if shell_file.exists() else ""
     block = shell_block(repo_root)
@@ -65,8 +94,11 @@ def main() -> int:
 
     repo_root = args.repo_root.resolve()
     destination = install_skill(repo_root, args.codex_home.expanduser())
+    harness_links = install_harness_surfaces(repo_root, Path.home())
     install_shell_hook(args.shell_file.expanduser(), repo_root)
     print(f"Installed global Codex skill: {destination} -> {repo_root / '.codex/skills' / SKILL_NAME}")
+    for link in harness_links:
+        print(f"Installed global harness surface: {link} -> {link.resolve()}")
     print(f"Updated shell startup: {args.shell_file.expanduser()}")
     print("Restart the shell or open a new Codex/ChatGPT session to load it.")
     return 0
