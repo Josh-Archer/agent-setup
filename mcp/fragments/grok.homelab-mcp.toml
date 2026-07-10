@@ -1,11 +1,23 @@
-# Homelab MCP — Paperless + Immich (secrets via env expansion)
-# Requires env HOMELAB_MCP_API_KEY for Paperless mcpo auth.
+# Homelab MCP — Paperless + Immich for Grok
+#
+# Paperless: native stdio MCP (npx). Cluster mcpo is OpenAPI-only and cannot
+# complete Grok's streamable-HTTP MCP handshake.
+# Requires User/process env PAPERLESS_API_KEY (Paperless-NGX token) and optional
+# PAPERLESS_URL (defaults below).
+#
+# Immich: native HTTP MCP. Prefer hostname when AdGuard rewrites resolve;
+# install script falls back to Traefik Tailscale IP + Host header when DNS fails.
 
 [mcp_servers.paperless]
-url = "http://paperless-mcp.archer.casa"
+command = "npx"
+args = ["-y", "@baruchiro/paperless-mcp@latest"]
 enabled = true
-startup_timeout_sec = 30
-headers = { "Authorization" = "Bearer ${HOMELAB_MCP_API_KEY}" }
+startup_timeout_sec = 60
+
+[mcp_servers.paperless.env]
+PAPERLESS_URL = "https://paperless.archer.casa"
+PAPERLESS_API_KEY = "${PAPERLESS_API_KEY}"
+PAPERLESS_PUBLIC_URL = "https://paperless.archer.casa"
 
 [mcp_servers.immich]
 url = "http://immich-mcp.archer.casa/mcp"

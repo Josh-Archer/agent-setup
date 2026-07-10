@@ -5,11 +5,12 @@
 
 .DESCRIPTION
   - Never writes secret values into config files or this repo.
-  - Expects HOMELAB_MCP_API_KEY in the environment (User or Process).
-  - Optionally loads the key from the cluster secret paperless-mcp-secret (API_KEY) into User env.
+  - HOMELAB_MCP_API_KEY: mcpo Bearer for HTTP clients that speak OpenAPI-through-mcpo (not Grok native MCP).
+  - PAPERLESS_API_KEY: Paperless-NGX token for Grok/Codex stdio paperless MCP (@baruchiro/paperless-mcp).
+  - Immich: native HTTP MCP (allowlist only). Install uses hostname when DNS works, else Traefik Tailscale IP + Host.
 
 .PARAMETER LoadKeyFromCluster
-  If set, read mcp/paperless-mcp-secret API_KEY via kubectl and store as User env HOMELAB_MCP_API_KEY.
+  Read paperless-mcp-secret API_KEY → HOMELAB_MCP_API_KEY and PAPERLESS_API_TOKEN → PAPERLESS_API_KEY.
 
 .PARAMETER SkipCodex
 .PARAMETER SkipGrok
@@ -41,7 +42,7 @@ function Test-EnvKey {
 }
 
 function Import-KeyFromCluster {
-  Write-Host 'Loading HOMELAB_MCP_API_KEY from cluster secret mcp/paperless-mcp-secret ...'
+  Write-Host 'Loading keys from cluster secret mcp/paperless-mcp-secret ...'
   $b64 = kubectl -n mcp get secret paperless-mcp-secret -o jsonpath='{.data.API_KEY}'
   if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace($b64)) {
     throw 'Failed to read paperless-mcp-secret.API_KEY (is kubectl context set and secret present?)'
@@ -50,7 +51,47 @@ function Import-KeyFromCluster {
   if ($key.Length -lt 8) { throw 'API_KEY from cluster looks empty/short' }
   [Environment]::SetEnvironmentVariable('HOMELAB_MCP_API_KEY', $key, 'User')
   $env:HOMELAB_MCP_API_KEY = $key
-  Write-Host "Set User env HOMELAB_MCP_API_KEY (length=$($key.Length)). Restart agent apps to pick it up."
+  Write-Host "Set User env HOMELAB_MCP_API_KEY (length=$($key.Length))."
+
+  $tokB64 = kubectl -n mcp get secret paperless-mcp-secret -o jsonpath='{.data.PAPERLESS_API_TOKEN}'
+  if (-not [string]::IsNullOrWhiteSpace([string]$tokB64)) {
+    $tok = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String([string]$tokB64))
+    if ($tok.Length -ge 8) {
+      [Environment]::SetEnvironmentVariable('PAPERLESS_API_KEY', $tok, 'User')
+      $env:PAPERLESS_API_KEY = $tok
+      [Environment]::SetEnvironmentVariable('PAPERLESS_URL', 'https://paperless.archer.casa', 'User')
+      $env:PAPERLESS_URL = 'https://paperless.archer.casa'
+      Write-Host "Set User env PAPERLESS_API_KEY (length=$($tok.Length)) + PAPERLESS_URL."
+    }
+  } else {
+    Write-Warning 'PAPERLESS_API_TOKEN missing from secret; Grok stdio paperless MCP will fail until set.'
+  }
+  Write-Host 'Restart agent apps so they pick up User env.'
+}
+
+function Test-PaperlessEnvKey {
+  $k = [Environment]::GetEnvironmentVariable('PAPERLESS_API_KEY', 'Process')
+  if ([string]::IsNullOrWhiteSpace($k)) {
+    $k = [Environment]::GetEnvironmentVariable('PAPERLESS_API_KEY', 'User')
+  }
+  if ([string]::IsNullOrWhiteSpace($k)) { return $false }
+  $env:PAPERLESS_API_KEY = $k
+  return $true
+}
+
+function Resolve-ImmichMcpUrl {
+  # Prefer DNS hostname; fall back to Traefik Tailscale VIP + Host header.
+  $hostName = 'immich-mcp.archer.casa'
+  try {
+    $null = [System.Net.Dns]::GetHostAddresses($hostName)
+    return @{ Url = "http://$hostName/mcp"; UseHostHeader = $false; HostHeader = $hostName }
+  } catch {
+    # NXDOMAIN / no resolution
+  }
+  $tsVip = $env:HOMELAB_TRAEFIK_TS_IP
+  if ([string]::IsNullOrWhiteSpace($tsVip)) { $tsVip = '100.68.151.94' }
+  Write-Warning "DNS for $hostName failed; using Tailscale Traefik $tsVip with Host header."
+  return @{ Url = "http://$tsVip/mcp"; UseHostHeader = $true; HostHeader = $hostName }
 }
 
 function Merge-TomlFragment {
@@ -163,18 +204,41 @@ if (-not $SkipCodex) {
 }
 
 if (-not $SkipGrok) {
+  if (-not (Test-PaperlessEnvKey)) {
+    Write-Warning 'PAPERLESS_API_KEY not set; Grok paperless stdio MCP will fail auth until set (re-run -LoadKeyFromCluster).'
+  }
+  $immich = Resolve-ImmichMcpUrl
   if (Get-Command grok -ErrorAction SilentlyContinue) {
     Write-Host 'Installing Grok MCP servers via CLI...'
     try { & grok mcp remove paperless 2>&1 | Out-Null } catch {}
     try { & grok mcp remove immich 2>&1 | Out-Null } catch {}
-    & grok mcp add --transport http paperless 'http://paperless-mcp.archer.casa' --header 'Authorization: Bearer ${HOMELAB_MCP_API_KEY}'
+    # Paperless: native stdio MCP (cluster mcpo is OpenAPI, not streamable HTTP MCP)
+    if ($env:PAPERLESS_URL) {
+      & grok mcp add paperless -e "PAPERLESS_URL=$env:PAPERLESS_URL" -e 'PAPERLESS_API_KEY=${PAPERLESS_API_KEY}' -e "PAPERLESS_PUBLIC_URL=$env:PAPERLESS_URL" -- npx -y @baruchiro/paperless-mcp@latest
+    } else {
+      & grok mcp add paperless -e 'PAPERLESS_URL=https://paperless.archer.casa' -e 'PAPERLESS_API_KEY=${PAPERLESS_API_KEY}' -e 'PAPERLESS_PUBLIC_URL=https://paperless.archer.casa' -- npx -y @baruchiro/paperless-mcp@latest
+    }
     if ($LASTEXITCODE -ne 0) { throw "grok mcp add paperless failed ($LASTEXITCODE)" }
-    & grok mcp add --transport http immich 'http://immich-mcp.archer.casa/mcp'
+    if ($immich.UseHostHeader) {
+      & grok mcp add --transport http immich $immich.Url --header "Host: $($immich.HostHeader)"
+    } else {
+      & grok mcp add --transport http immich $immich.Url
+    }
     if ($LASTEXITCODE -ne 0) { throw "grok mcp add immich failed ($LASTEXITCODE)" }
-    Write-Host 'Grok MCP servers registered.'
+    Write-Host 'Grok MCP servers registered (paperless=stdio, immich=http).'
   } else {
     Merge-TomlFragment -TargetPath (Join-Path $env:USERPROFILE '.grok\config.toml') `
       -FragmentPath (Join-Path $FragDir 'grok.homelab-mcp.toml') -ServerNames $names
+    if ($immich.UseHostHeader) {
+      # Patch immich URL/header when DNS is broken
+      $cfg = Join-Path $env:USERPROFILE '.grok\config.toml'
+      $raw = Get-Content -Raw $cfg
+      $raw = $raw -replace 'url = "http://immich-mcp\.archer\.casa/mcp"', ("url = `"{0}`"" -f $immich.Url)
+      if ($raw -notmatch '\[mcp_servers\.immich\.headers\]') {
+        $raw = $raw.TrimEnd() + "`n`n[mcp_servers.immich.headers]`nHost = `"$($immich.HostHeader)`"`n"
+      }
+      [System.IO.File]::WriteAllText($cfg, $raw)
+    }
   }
 }
 

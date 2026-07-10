@@ -1,58 +1,92 @@
 # Agent Setup Showcase
 
-This repository is a sanitized snapshot of my agent-related configuration folders, copied from `origin/main`:
+Sanitized snapshot of agent-related configuration folders (from `origin/main` of the homelab workspace):
 
-- `.codex`
-- `.gemini`
-- `.github`
-- `.claude`
-
-## Delegation
-
-The repository includes a Codex skill for delegating work to Grok Build and
-Antigravity (`agy`), including dependency-aware multi-agent plans. See
-[`docs/grok-agy-delegation.md`](docs/grok-agy-delegation.md).
+- `.codex` — Codex agents + skills
+- `.gemini` — Gemini / Antigravity agents + skills
+- `.github` — GitHub agent definitions + workflows
+- `.claude` — Claude Code agents
+- `.grok` — Grok agents + roles
+- `mcp/` — Homelab MCP client fragments (Paperless + Immich)
+- `shell/` — Shell profile snippets (zsh/bash + PowerShell)
+- `scripts/` — Bootstrap + validate + agent surface sync
 
 ## Notes
-- This was created as a sanitized snapshot of agent-related configuration folders from a larger home repository.
-- Obvious hardcoded secrets were scrubbed where identified (for example inline test/example values).
-- References to platform secret providers (e.g. `${{ secrets.* }}` / `${{ vars.* }}` / `${{ inputs.* }}` / runtime env lookups) are intentionally retained because they are not in plaintext.
+
+- Obvious hardcoded secrets were scrubbed from the snapshot.
+- Platform secret references (`${{ secrets.* }}`, env lookups, `${HOMELAB_MCP_API_KEY}`, `${PAPERLESS_API_KEY}`) are intentional and not plaintext credentials.
 - Multi-agent run artifacts land under `.agent-runs/` (gitignored).
 
-## Local validation for agent surfaces
-```bash
-python3 scripts/sync_agent_surfaces.py --check
-python3 -m unittest discover -s scripts/tests -v
+## One-command bootstrap (agents + skills + MCP)
+
+Same idea as installing agent/skill definitions: run once per machine.
+
+### Windows
+
+```powershell
+cd path\to\agent-setup-showcase
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_agents.ps1 -LoadKeyFromCluster
+powershell -ExecutionPolicy Bypass -File .\scripts\validate-homelab-mcp.ps1
 ```
 
-## Install delegation globally
+This:
 
-Run this once to make the delegation skill and generated role surfaces
-available to Codex, Grok CLI, and Antigravity sessions across projects. It
-symlinks the surfaces into `~/.codex/skills/`, `~/.grok/`, and
-`~/.agents/plugins/`, then adds an idempotent startup marker to `~/.zshrc`:
+1. Syncs agent/skill trees into `~/.codex`, `~/.claude`, `~/.gemini`
+2. Installs PowerShell profile hooks that load `HOMELAB_MCP_API_KEY` and `PAPERLESS_API_KEY` (from User env, cache file, or kubectl)
+3. Registers Paperless + Immich MCP for **Codex**, **Grok**, and **Antigravity (agy) / Gemini**
+
+### Linux / macOS / WSL
+
+```bash
+cd path/to/agent-setup-showcase
+chmod +x scripts/setup_agents.sh
+./scripts/setup_agents.sh
+# new shell or:
+source ~/.zshrc   # or ~/.bashrc
+```
+
+Hooks are idempotent blocks in `~/.zshrc` and `~/.bashrc` marked:
+
+```text
+# >>> homelab-mcp (agent-setup-showcase) >>>
+...
+# <<< homelab-mcp (agent-setup-showcase) <<<
+```
+
+## Homelab MCP (no secrets in git)
+
+| Server | Transport | Auth |
+|--------|-----------|------|
+| Paperless (Grok / native MCP) | stdio `npx @baruchiro/paperless-mcp` | `${PAPERLESS_API_KEY}` |
+| Paperless (mcpo OpenAPI) | `http://paperless-mcp.archer.casa` | Bearer `${HOMELAB_MCP_API_KEY}` |
+| Immich | `http://immich-mcp.archer.casa/mcp` | LAN/Tailscale allowlist only |
+
+Fragments live under `mcp/fragments/`. See [mcp/README.md](mcp/README.md).
+
+**Never commit** `~/.config/homelab/mcp-api-key`, `paperless-api-key`, or real token values.
+
+## Delegation (Grok Build + Antigravity)
+
+The repository includes a Codex skill for delegating work to Grok Build and Antigravity (`agy`), including dependency-aware multi-agent plans.
+
+- [Agent Architecture map](AGENTS.md) — canonical roles and model equivalences
+- [Grok & Antigravity Delegation Guide](docs/grok-agy-delegation.md) — setup, CLI examples, plan schema
+
+### Install delegation globally
 
 ```bash
 python3 scripts/setup_global_delegation.py
 ```
 
-The startup marker reruns the skill-only sync on every new zsh session, so new
-directories added under `.codex/skills/` are linked automatically.
+This symlinks surfaces into `~/.codex/skills/`, `~/.grok/`, and `~/.agents/plugins/`, and adds an idempotent startup marker to `~/.zshrc`.
 
-Restart the shell or open a new ChatGPT/Codex session afterward.
+### Local validation for agent surfaces
 
-## Agent Delegation
-
-This repository includes a delegation capability allowing Codex to offload execution workloads to **Grok Build** and **Antigravity**.
-- See the [Agent Architecture map](AGENTS.md) for canonical roles and model equivalences.
-- See the [Grok & Antigravity Delegation Guide](docs/grok-agy-delegation.md) for setup, CLI invocation examples, JSON plan schemas, and safety boundaries.
-
-## Homelab MCP (Paperless + Immich)
-
-Global MCP client fragments for **Codex**, **Grok**, and **Antigravity (agy) / Gemini** live under [`mcp/`](mcp/README.md).
-
-- **No secrets in git** — only URLs + `${HOMELAB_MCP_API_KEY}` / `bearer_token_env_var`.
-- Install on a workstation: `pwsh -File scripts/install-homelab-mcp.ps1 -LoadKeyFromCluster`
+```bash
+python3 scripts/sync_agent_surfaces.py --check
+python3 -m unittest discover -s scripts/tests -v
+```
 
 ## Update source
-If you need a refreshed copy later, recreate it from the same source path (`C:\Code\agent-setup-main`) and re-run the same copy step.
+
+Refresh agent snapshots from `C:\Code\agent-setup-main` (or the homelab `home` repo agent trees) and re-run setup.

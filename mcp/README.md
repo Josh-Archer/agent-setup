@@ -12,10 +12,13 @@ Immich MCP has **no edge API key** (LAN/Tailscale allowlist only). Prefer a **re
 
 ## Endpoints (LAN / Tailscale)
 
-| Server | URL | Client auth |
+| Server | URL / transport | Client auth |
 | ------ | --- | ----------- |
-| Paperless | `http://paperless-mcp.archer.casa` | Bearer `${HOMELAB_MCP_API_KEY}` |
-| Immich | `http://immich-mcp.archer.casa/mcp` | none (allowlist) |
+| Paperless (mcpo OpenAPI) | `http://paperless-mcp.archer.casa` | Bearer `${HOMELAB_MCP_API_KEY}` (OpenAPI clients) |
+| Paperless (native MCP) | **stdio** `npx @baruchiro/paperless-mcp` | `${PAPERLESS_API_KEY}` (Grok / real MCP clients) |
+| Immich | `http://immich-mcp.archer.casa/mcp` | none (LAN/Tailscale allowlist) |
+
+> **Grok note:** Cluster `paperless-mcp` is **mcpo** (MCP→OpenAPI). Grok speaks streamable HTTP MCP, so Paperless is installed as **stdio** `npx`. Immich is native HTTP MCP. If `immich-mcp.archer.casa` does not resolve, install falls back to Traefik’s Tailscale IP + `Host` header.
 
 See also `home` repo `docs/mcp-catalog.md`.
 
@@ -44,13 +47,32 @@ Restart terminals / agent apps after setting the variable.
 
 ## Install into global agent configs
 
-From this repo root:
+**Preferred (agents + skills + shell + MCP):**
 
 ```powershell
-pwsh -File scripts/install-homelab-mcp.ps1
+# Windows
+powershell -ExecutionPolicy Bypass -File .\scripts\setup_agents.ps1 -LoadKeyFromCluster
+```
+
+```bash
+# Linux / macOS / WSL
+./scripts/setup_agents.sh
+source ~/.zshrc
+```
+
+**MCP-only:**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\install-homelab-mcp.ps1 -LoadKeyFromCluster
 ```
 
 Or manually apply the fragments under `mcp/fragments/`.
+
+**Validate (no secrets printed):**
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\validate-homelab-mcp.ps1
+```
 
 ## Fragments
 

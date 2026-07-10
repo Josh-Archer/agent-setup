@@ -1,3 +1,10 @@
+# Local secrets / caches (never commit)
+.config/
+**/mcp-api-key
+**/paperless-api-key
+**/*.bak-homelab-mcp-*
+**/*.bak-setup-agents-*
+
 # Local multi-agent orchestration handoffs (orchestrate.py)
 .agent-runs/
 
@@ -8,7 +15,10 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 
-# OS / editor noise
+# OS / editor
 .DS_Store
+Thumbs.db
 *.swp
 *~
+.idea/
+.vscode/
