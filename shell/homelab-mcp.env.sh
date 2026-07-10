@@ -12,7 +12,8 @@ _homelab_mcp_load_one() {
   local name="$1"
   local cache="$2"
   local jsonpath="$3"
-  local cur="${!name:-}"
+  local cur
+  cur="$(eval "echo \"\${$name:-}\"")"
 
   if [ -n "$cur" ]; then
     return 0
@@ -21,8 +22,7 @@ _homelab_mcp_load_one() {
   if [ -f "$cache" ] && [ -r "$cache" ]; then
     cur="$(tr -d '\r\n' <"$cache" 2>/dev/null || true)"
     if [ -n "$cur" ]; then
-      printf -v "$name" '%s' "$cur"
-      export "$name"
+      eval "export $name=\"\$cur\""
       return 0
     fi
   fi
@@ -35,8 +35,7 @@ _homelab_mcp_load_one() {
         cur="$(printf '%s' "$b64" | base64 --decode 2>/dev/null || printf '%s' "$b64" | base64 -d 2>/dev/null || true)"
       fi
       if [ -n "$cur" ]; then
-        printf -v "$name" '%s' "$cur"
-        export "$name"
+        eval "export $name=\"\$cur\""
         mkdir -p "$(dirname "$cache")" 2>/dev/null || true
         if [ -d "$(dirname "$cache")" ]; then
           umask 077
