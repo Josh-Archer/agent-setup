@@ -3,6 +3,12 @@
 # Safe for public repos: no secret values written into git-tracked files.
 set -euo pipefail
 
+if [ "$EUID" -eq 0 ]; then
+  printf '[setup_agents] Error: Please do not run this script as root or with sudo.\n'
+  printf '[setup_agents] The script will prompt for sudo internally when updating /etc/hosts.\n'
+  exit 1
+fi
+
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/homelab"
 SHELL_SNIPPET_SRC="$REPO_ROOT/shell/homelab-mcp.env.sh"
