@@ -146,7 +146,8 @@ install_mcp_clients() {
   if command -v codex >/dev/null 2>&1; then
     codex mcp remove paperless >/dev/null 2>&1 || true
     codex mcp remove immich >/dev/null 2>&1 || true
-    codex mcp add paperless --url 'http://paperless-mcp.archer.casa' --bearer-token-env-var HOMELAB_MCP_API_KEY
+    # Note: Antigravity-CLI natively handles http URLs by connecting to their SSE endpoint or directly as SSE URL
+    codex mcp add paperless --url 'http://paperless-mcp.archer.casa/sse' --bearer-token-env-var HOMELAB_MCP_API_KEY
     codex mcp add immich --url 'http://immich-mcp.archer.casa/mcp'
     log "Codex MCP: paperless + immich"
   else
@@ -156,7 +157,7 @@ install_mcp_clients() {
   if command -v grok >/dev/null 2>&1; then
     grok mcp remove paperless >/dev/null 2>&1 || true
     grok mcp remove immich >/dev/null 2>&1 || true
-    grok mcp add --transport http paperless 'http://paperless-mcp.archer.casa' \
+    grok mcp add --transport http paperless 'http://paperless-mcp.archer.casa/sse' \
       --header 'Authorization: Bearer ${HOMELAB_MCP_API_KEY}'
     grok mcp add --transport http immich 'http://immich-mcp.archer.casa/mcp'
     log "Grok MCP: paperless + immich"
