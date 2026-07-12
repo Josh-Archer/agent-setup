@@ -1,7 +1,7 @@
 ---
 name: documentation
 description: Use when updating runbooks, guides, and operational notes that should stay accurate to current repo behavior.
-model: grok-4.5
+model: grok-composer-2.5-fast
 prompt_mode: full
 permission_mode: default
 agents_md: true

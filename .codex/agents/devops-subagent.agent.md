@@ -1,6 +1,6 @@
 ---
 description: "Use when optimizing CI/CD pipelines, builds, and deployment workflows for speed, reliability, and operational safety."
-model: "gpt-5.4"
+model: "gpt-5.6-sol"
 tools: [read, search, edit, execute, todo]
 user-invocable: true
 ---

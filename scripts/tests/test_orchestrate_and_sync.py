@@ -155,9 +155,13 @@ class SyncSurfaceTests(unittest.TestCase):
         self.assertEqual(self.sync.grok_model("gpt-5.4"), "grok-4.5")
         self.assertEqual(self.sync.grok_model("gpt-5.4-mini"), "grok-composer-2.5-fast")
         self.assertEqual(self.sync.grok_model("gpt-5.3-codex-spark"), "grok-composer-2.5-fast")
+        self.assertEqual(self.sync.grok_model("gpt-5.6-terra-high"), "grok-composer-2.5-fast")
+        self.assertEqual(self.sync.grok_model("gpt-5.6-luna"), "grok-composer-2.5-fast")
         self.assertEqual(self.sync.agy_model("gpt-5.4"), "Claude Opus 4.6 (Thinking)")
         self.assertEqual(self.sync.agy_model("gpt-5.4-mini"), "Gemini 3.5 Flash (Medium)")
         self.assertEqual(self.sync.agy_model("gpt-5.3-codex-spark"), "Gemini 3.5 Flash (Low)")
+        self.assertEqual(self.sync.agy_model("gpt-5.6-terra"), "Gemini 3.5 Flash (Medium)")
+        self.assertEqual(self.sync.agy_model("gpt-5.6-luna"), "Gemini 3.5 Flash (Low)")
 
     def test_check_surfaces_clean_on_repo(self) -> None:
         # Requires generated trees to already match; run sync in the suite setup path if needed.

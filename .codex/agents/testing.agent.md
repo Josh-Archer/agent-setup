@@ -1,6 +1,6 @@
 ---
 description: "Use when running validation workflows, image checks, or CI-readiness checks and summarizing concrete pass or fail evidence."
-model: "gpt-5.4-mini"
+model: "gpt-5.6-terra"
 tools: [read, search, execute]
 user-invocable: true
 ---

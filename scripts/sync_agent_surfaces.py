@@ -36,15 +36,15 @@ def value(meta: dict[str, str], key: str, default: str = "") -> str:
 
 
 def grok_model(codex_model: str) -> str:
-    if "5.3-codex-spark" in codex_model or "mini" in codex_model:
+    if any(token in codex_model for token in ("5.3-codex-spark", "mini", "terra", "luna")):
         return "grok-composer-2.5-fast"
     return "grok-4.5"
 
 
 def agy_model(codex_model: str) -> str:
-    if "5.3-codex-spark" in codex_model:
+    if "5.3-codex-spark" in codex_model or codex_model == "gpt-5.6-luna":
         return "Gemini 3.5 Flash (Low)"
-    if "mini" in codex_model:
+    if any(token in codex_model for token in ("mini", "terra", "luna-high")):
         return "Gemini 3.5 Flash (Medium)"
     return "Claude Opus 4.6 (Thinking)"
 
@@ -89,7 +89,7 @@ def write_surfaces(root: Path) -> int:
         meta, body = frontmatter(source.read_text())
         name = source.name.removesuffix(".agent.md")
         description = value(meta, "description", name).replace('"', '\\"')
-        model = value(meta, "model", "gpt-5.5")
+        model = value(meta, "model", "gpt-5.6-sol")
         reasoning = value(meta, "reasoning_effort", "medium")
         tools = value(meta, "tools", "")
 

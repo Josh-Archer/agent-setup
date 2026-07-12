@@ -1,6 +1,6 @@
 ---
 description: "Use when translating feature requirements into manifest-driven implementation plans with rollout and validation criteria."
-model: "gpt-5.4"
+model: "gpt-5.6-sol"
 tools: [read, search, edit]
 user-invocable: true
 ---

@@ -1,6 +1,6 @@
 ---
 description: "Use when updating runbooks, guides, and operational notes that should stay accurate to current repo behavior."
-model: "gpt-5.4"
+model: "gpt-5.6-terra"
 tools: [read, search, edit]
 user-invocable: true
 ---

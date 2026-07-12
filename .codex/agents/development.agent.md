@@ -1,6 +1,6 @@
 ---
 description: "Use when working on local tooling, maintenance, and implementation workflows that should prefer existing scripts and manifest-driven changes."
-model: "gpt-5.4-mini"
+model: "gpt-5.6-terra-high"
 tools: [read, search, edit, execute]
 user-invocable: true
 ---

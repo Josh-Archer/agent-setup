@@ -1,6 +1,6 @@
 ---
 description: "Use when orchestrating complex requests across agents and skills, keeping plans aligned and preventing drift."
-model: "gpt-5.4"
+model: "gpt-5.6-sol"
 tools: [read, search, todo, agent]
 user-invocable: true
 ---

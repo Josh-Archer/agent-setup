@@ -1,6 +1,6 @@
 ---
 description: "Use when reviewing diffs for security issues, unsafe scripts, or configuration drift."
-model: "o2-preview"
+model: "gpt-5.6-sol"
 tools: [read, search]
 user-invocable: true
 ---
