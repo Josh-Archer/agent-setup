@@ -1,6 +1,6 @@
 ---
 description: "Use when investigating bugs, discrepancies between implementation and docs, or unclear failures to determine the concrete root cause."
-model: "gpt-5.4"
+model: "gpt-5.6-sol-medium"
 tools: [read, search, edit, execute]
 user-invocable: true
 ---

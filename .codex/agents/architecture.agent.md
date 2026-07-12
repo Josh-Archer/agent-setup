@@ -1,6 +1,6 @@
 ---
 description: "Use when reviewing architecture and GitOps design choices at a high level, especially Kustomize overlays and Helm-rendered manifests."
-model: "gpt-5.4"
+model: "gpt-5.6-sol-xhigh"
 tools: [read, search, edit]
 user-invocable: true
 ---

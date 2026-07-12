@@ -58,20 +58,21 @@ Project agents are mapped across different provider surfaces. The canonical role
 
 | Role | Responsibility | Primary Model |
 | :--- | :--- | :--- |
-| **architecture** | High-level structure and GitOps system design | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **development** | Implementation, maintenance, and local tool execution | `gpt-5.4-mini` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
-| **devops** | CI/CD, deployment, and operational reliability | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **devops-subagent** | Focused CI/CD and deployment support | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **documentation** | Runbooks, guides, and deep technical reference docs | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **docs-scribe** | Lightweight README and usage-doc maintenance | `gpt-5-mini` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
-| **debugger** | Bug isolation, root-cause analysis, and reproduction | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **manager** | Orchestration, planning, and task handoff reconciliation | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **product-development** | Requirement translation and release planning | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **testing** | Focused test execution and CI-readiness validation | `gpt-5.4-mini` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
-| **gitops-architect** | ArgoCD manifest planning and infrastructure alignment | `gpt-5.4` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **security-auditor** | Diff risk audits and configuration drift review | `o2-preview` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
-| **validation-runner** | Codex validation and environment verification | `gpt-5.3-codex-spark` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Low)` |
-| **junior** | Boilerplate generation, docs, and low-risk support | `gpt-5.3-codex-spark` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Low)` |
+| **architecture** | High-level structure and GitOps system design | `gpt-5.6-sol-xhigh` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **development** | Implementation, maintenance, and local tool execution | `gpt-5.6-terra-high` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
+| **devops** | CI/CD, deployment, and operational reliability | `gpt-5.6-sol` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **devops-subagent** | Focused CI/CD and deployment support | `gpt-5.6-sol` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **documentation** | Runbooks, guides, and deep technical reference docs | `gpt-5.6-terra` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
+| **docs-scribe** | Lightweight README and usage-doc maintenance | `gpt-5.6-luna-high` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
+| **debugger** | Bug isolation, root-cause analysis, and reproduction | `gpt-5.6-sol-medium` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **manager** | Orchestration, planning, and task handoff reconciliation | `gpt-5.6-sol` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **product-development** | Requirement translation and release planning | `gpt-5.6-sol` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **testing** | Focused test execution and CI-readiness validation | `gpt-5.6-terra` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
+| **gitops-architect** | ArgoCD manifest planning and infrastructure alignment | `gpt-5.6-sol-high` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **security-auditor** | Diff risk audits and configuration drift review | `gpt-5.6-sol` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
+| **validation-runner** | Codex validation and environment verification | `gpt-5.6-luna` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Low)` |
+| **junior** | Boilerplate generation, docs, and low-risk support | `gpt-5.6-luna-high` / `grok-composer-2.5-fast` / `Gemini 3.5 Flash (Medium)` |
+| **qa** | End-to-end validation, requirement checks, and logical consistency | `gpt-5.6-sol-medium` / `grok-4.5` / `Claude Opus 4.6 (Thinking)` |
 
 ---
 

@@ -48,7 +48,7 @@ Names match `*.agent.md` basenames and the root role map:
 
 `architecture`, `development`, `devops`, `devops-subagent`, `documentation`,
 `docs-scribe`, `debugger`, `manager`, `product-development`, `testing`,
-`gitops-architect`, `security-auditor`, `validation-runner`, `junior`.
+`gitops-architect`, `security-auditor`, `validation-runner`, `junior`, `qa`.
 
 ## External delegation
 

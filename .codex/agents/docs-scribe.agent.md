@@ -1,6 +1,6 @@
 ---
 description: "Use when maintaining README and usage documentation for scripts, manifests, and GitOps workflows."
-model: "gpt-5-mini"
+model: "gpt-5.6-luna-high"
 tools: [read, search, edit]
 user-invocable: true
 ---

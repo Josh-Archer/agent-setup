@@ -1,6 +1,6 @@
 ---
 description: "Use when planning manifest-driven changes, Kustomize updates, and ArgoCD-safe rollout structure for this homelab repo."
-model: "gpt-5.4"
+model: "gpt-5.6-sol-high"
 tools: [read, search]
 user-invocable: true
 ---

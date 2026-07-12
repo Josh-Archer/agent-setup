@@ -151,9 +151,9 @@ Model selection is determined dynamically by the complexity of the requested age
 
 | Role Complexity Tier | Codex Model Class | Grok Equivalent | Antigravity Equivalent |
 | :--- | :--- | :--- | :--- |
-| **High / Reasoning** | `gpt-5.4`, `gpt-5.4-extended`, `o2-preview` | `grok-4.5` | `Claude Opus 4.6 (Thinking)` |
-| **Medium / Fast** | `gpt-5.4-mini` | `grok-composer-2.5-fast` | `Gemini 3.5 Flash (Medium)` |
-| **Low / Spark** | `gpt-5.3-codex-spark` | `grok-composer-2.5-fast` | `Gemini 3.5 Flash (Low)` |
+| **High / Reasoning** | `gpt-5.6-sol`, `gpt-5.6-sol-high`, `gpt-5.6-sol-xhigh`, `gpt-5.6-sol-medium` | `grok-4.5` | `Claude Opus 4.6 (Thinking)` |
+| **Medium / Fast** | `gpt-5.6-terra`, `gpt-5.6-terra-high`, `gpt-5.6-luna-high` | `grok-composer-2.5-fast` | `Gemini 3.5 Flash (Medium)` |
+| **Low / Spark** | `gpt-5.6-luna` | `grok-composer-2.5-fast` | `Gemini 3.5 Flash (Low)` |
 
 ### How to Override Models
 1. **At the CLI Level**: Pass the `--model` parameter to `.codex/skills/grok-agy-delegate/scripts/delegate.py`.

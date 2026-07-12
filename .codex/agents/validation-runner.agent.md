@@ -1,6 +1,6 @@
 ---
 description: "Use when running Codex validation, environment setup, kustomize checks, or other focused repo validation workflows that benefit from a fast execution-oriented worker."
-model: "gpt-5.3-codex-spark"
+model: "gpt-5.6-luna"
 tools: [read, search, execute]
 user-invocable: true
 ---

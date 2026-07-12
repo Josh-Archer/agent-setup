@@ -1,0 +1,5 @@
+description = "Use when you need end-to-end validation, requirement checks, and logical consistency reviews."
+default_capability_mode = "all"
+model = "grok-4.5"
+reasoning_effort = "medium"
+prompt_file = ".codex/agents/qa.agent.md"

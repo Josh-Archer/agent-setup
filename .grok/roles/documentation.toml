@@ -1,5 +1,5 @@
 description = "Use when updating runbooks, guides, and operational notes that should stay accurate to current repo behavior."
 default_capability_mode = "all"
-model = "grok-4.5"
+model = "grok-composer-2.5-fast"
 reasoning_effort = "medium"
 prompt_file = ".codex/agents/documentation.agent.md"
