@@ -1,6 +1,6 @@
 {
   "paperless": {
-    "url": "http://paperless-mcp.archer.casa",
+    "url": "http://paperless-mcp.archer.casa/sse",
     "headers": {
       "Authorization": "Bearer ${HOMELAB_MCP_API_KEY}"
     },
