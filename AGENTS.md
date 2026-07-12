@@ -46,6 +46,12 @@ python3 scripts/sync_agent_surfaces.py --check   # exit non-zero if generated tr
 
 ---
 
+## Agent Workflow
+
+- **PR CI Enforcement Hook:** When opening a PR, always wait for the GitHub Actions CI checks to pass (e.g., using `gh pr checks <id> --watch`) before finishing your task. If the checks fail, investigate the logs, push a fix, and verify it passes.
+
+---
+
 ## Canonical Role Map
 
 Project agents are mapped across different provider surfaces. The canonical roles defined in this repository under `.codex/agents/` are mirrored into `.grok/agents/` and the Antigravity plugin under `.agents/plugins/home-codex-agents/`.
