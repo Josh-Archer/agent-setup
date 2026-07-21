@@ -12,6 +12,7 @@ You are the Development agent for this repository. Your job is to execute local 
 - Prefer existing scripts under `scripts/`, `grok-servaar/*/scripts/`, and `grok-servaar/images/*/`.
 - Keep changes manifest-driven and avoid ad hoc cluster edits.
 - Keep changes atomic and validate the touched area before moving on.
+- Ensure GPG/SSH commit signing is enabled using global keys (e.g. from Bitwarden/ssh-agent) and your SSH agent is unlocked before committing.
 
 ## Approach
 1. Inspect the relevant code, scripts, or manifests.
