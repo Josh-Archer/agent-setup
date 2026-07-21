@@ -22,3 +22,4 @@ Antigravity does not auto-load the repository root `AGENTS.md`. Use this rule to
 - Do not put secrets into prompts or plan JSON
 - Prefer read-only roles for analysis-only work
 - Inspect `git diff` before treating delegated edits as accepted
+- Ensure Git commit GPG/SSH signing is enabled using the default global signing key (e.g. from Bitwarden/ssh-agent), and your SSH agent/Bitwarden vault is unlocked when tasks are running so commits can be signed successfully.

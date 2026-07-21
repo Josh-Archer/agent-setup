@@ -10,7 +10,7 @@ This skill automates the lifecycle of a Pull Request, from review to production 
 
 1.  **List PRs**: Use `gh pr list` to identify open PRs requiring review.
 2.  **Review & Checkout**: Use `gh pr checkout <number>` to switch to the PR branch. Analyze the diff and codebase.
-3.  **Remediate**: If issues (lint, build, logic) are found, apply surgical fixes. Commit changes directly to the PR branch if authorized.
+3.  **Remediate**: If issues (lint, build, logic) are found, apply surgical fixes. Commit changes directly to the PR branch if authorized. (Note: Ensure GPG/SSH commit signing is enabled and your SSH agent/Bitwarden vault is unlocked so the commit does not block.)
 4.  **Group Sign-off**: Call the following sub-agents to validate the PR. Merge is ONLY permitted if all three provide a positive sign-off.
     -   **security-auditor**: `/agents call security-auditor "Review the security impact of this PR: <diff>"`
     -   **gitops-architect**: `/agents call gitops-architect "Validate ArgoCD and manifest alignment for this PR."`

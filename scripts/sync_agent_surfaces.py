@@ -159,6 +159,7 @@ def write_surfaces(root: Path) -> int:
         "- Do not put secrets into prompts or plan JSON\n"
         "- Prefer read-only roles for analysis-only work\n"
         "- Inspect `git diff` before treating delegated edits as accepted\n"
+        "- Ensure Git commit GPG/SSH signing is enabled using the default global signing key (e.g. from Bitwarden/ssh-agent), and your SSH agent/Bitwarden vault is unlocked when tasks are running so commits can be signed successfully.\n"
     )
     return len(agents)
 

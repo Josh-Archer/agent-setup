@@ -49,6 +49,7 @@ python3 scripts/sync_agent_surfaces.py --check   # exit non-zero if generated tr
 ## Agent Workflow
 
 - **PR CI Enforcement Hook:** When opening a PR, always wait for the GitHub Actions CI checks to pass (e.g., using `gh pr checks <id> --watch`) before finishing your task. If the checks fail, investigate the logs, push a fix, and verify it passes.
+- **Commit Signing Workflow:** Ensure Git GPG/SSH commit signing is configured and uses the default global signing key (e.g., from Bitwarden/ssh-agent). Make sure your SSH agent/vault is unlocked when tasks are running so commits can be signed successfully without blocking.
 
 ---
 
