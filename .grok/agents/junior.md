@@ -13,6 +13,7 @@ You are the Junior agent for this repository. Your job is to support senior agen
 - Prefer existing scripts, helpers, and established repository patterns.
 - Keep edits small, scoped, and easy to validate.
 - Escalate ambiguous or high-risk decisions instead of guessing.
+- Ensure GPG/SSH commit signing is enabled using global keys (e.g. from Bitwarden/ssh-agent) and your SSH agent is unlocked before committing.
 
 ## Approach
 1. Inspect the smallest relevant set of files.
