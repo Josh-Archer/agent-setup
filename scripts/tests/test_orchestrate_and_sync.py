@@ -182,6 +182,28 @@ class SyncSurfaceTests(unittest.TestCase):
         self.assertEqual(meta["model"], "gpt-5.4")
         self.assertTrue(body.startswith("Hello"))
 
+    def test_omp_tools_omits_bash_without_execute(self) -> None:
+        self.assertEqual(
+            self.sync.omp_tools("[read, search]"),
+            ["read", "grep", "glob", "lsp", "web_search"],
+        )
+
+    def test_omp_tools_includes_bash_with_execute(self) -> None:
+        self.assertEqual(
+            self.sync.omp_tools("[read, search, execute]"),
+            ["read", "grep", "glob", "bash", "lsp", "web_search"],
+        )
+
+    def test_agy_tools_omits_shell_without_execute(self) -> None:
+        self.assertEqual(
+            self.sync.agy_tools("[read, search]"),
+            "[read_file, grep_search, glob, list_directory]",
+        )
+
+    def test_capability_read_only_without_execute(self) -> None:
+        self.assertEqual(self.sync.capability("[read, search]"), "read-only")
+        self.assertEqual(self.sync.capability("[read, search, execute]"), "all")
+
     def _seed_agent(self, root: Path, name: str, body: str = "Role body.\n") -> None:
         agents = root / ".codex" / "agents"
         agents.mkdir(parents=True, exist_ok=True)

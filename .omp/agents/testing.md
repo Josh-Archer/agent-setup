@@ -2,7 +2,7 @@
 name: testing
 description: Compatibility alias for validation-runner; prefer validation-runner for new tasks.
 model:
-  - "gemini-3.8-flash:high"
+  - "openai-codex/gpt-6-astra:low"
 tools:
   - read
   - grep

@@ -2,7 +2,7 @@
 description: "Compatibility alias for reviewer; prefer reviewer for new tasks."
 model: "gpt-6-astra"
 reasoning_effort: "high"
-tools: [read, search, execute]
+tools: [read, search]
 user-invocable: false
 ---
 This legacy name maps to `reviewer`. It is not a separate capability tier or required handoff.

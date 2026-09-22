@@ -2,8 +2,7 @@
 name: investigator
 description: Trace bugs, logs, code, and documentation to evidence-backed root causes.
 model:
-  - "grok-4.7:high"
-  - "claude-opus-4-6"
+  - "openai-codex/gpt-6-astra:medium"
 tools:
   - read
   - grep
