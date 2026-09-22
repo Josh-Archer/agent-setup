@@ -2,7 +2,7 @@
 name: reviewer
 description: Independently review correctness, security, operational risks, and test gaps.
 model:
-  - "openai-codex/gpt-6-astra:high"
+  - "gemini-3.8-flash:high"
 tools:
   - read
   - grep

@@ -2,7 +2,7 @@
 name: security-auditor
 description: Compatibility alias for reviewer; prefer reviewer for new tasks.
 model:
-  - "openai-codex/gpt-6-astra:high"
+  - "gemini-3.8-flash:high"
 tools:
   - read
   - grep

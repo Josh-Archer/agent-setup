@@ -2,7 +2,7 @@
 name: documentation
 description: Compatibility alias for lead; prefer lead for new tasks.
 model:
-  - "openai-codex/gpt-6-astra:medium"
+  - "gemini-3.8-flash:high"
 tools:
   - read
   - grep

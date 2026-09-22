@@ -2,7 +2,8 @@
 name: architect
 description: Compatibility alias for lead; prefer lead for new tasks.
 model:
-  - "openai-codex/gpt-6-astra:medium"
+  - "x-ai/grok-4.7:xhigh"
+  - "claude-opus-4-6"
 tools:
   - read
   - grep

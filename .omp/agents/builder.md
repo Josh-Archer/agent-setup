@@ -2,7 +2,8 @@
 name: builder
 description: Compatibility alias for lead; prefer lead for new tasks.
 model:
-  - "openai-codex/gpt-6-astra:medium"
+  - "grok-4.7:high"
+  - "claude-opus-4-6"
 tools:
   - read
   - grep
