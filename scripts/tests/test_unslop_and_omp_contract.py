@@ -69,6 +69,60 @@ class OmpHarnessContractTests(unittest.TestCase):
             self.assertEqual(len(model_entries), 1, "Provider alternatives require explicit selection")
             self.assertRegex(model_entries[0], r"^openai-codex/gpt-6-astra:(low|medium|high)$")
 
+    def test_security_auditor_omp_tools_exclude_shell(self) -> None:
+        path = ROOT / ".omp" / "agents" / "security-auditor.md"
+        content = path.read_text(encoding="utf-8")
+        self.assertTrue(content.startswith("---\n"), f"{path} must have YAML frontmatter")
+        lines = content.splitlines()
+        tools_indices = [i for i, line in enumerate(lines) if line.strip() == "tools:"]
+        self.assertTrue(tools_indices, f"{path} missing tools: block")
+        tools: list[str] = []
+        for line in lines[tools_indices[0] + 1 :]:
+            if line.startswith("  - "):
+                tools.append(line.strip()[2:].strip())
+            else:
+                break
+        self.assertIn("read", tools)
+        self.assertIn("grep", tools)
+        self.assertIn("glob", tools)
+        self.assertIn("lsp", tools)
+        self.assertNotIn("bash", tools)
+        self.assertNotIn("edit", tools)
+        self.assertNotIn("write", tools)
+
+
+class SecurityAuditorToolPolicyTests(unittest.TestCase):
+    def test_codex_security_auditor_is_read_search_only(self) -> None:
+        content = (ROOT / ".codex" / "agents" / "security-auditor.agent.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(content, r"(?m)^tools: \[read, search\]$")
+
+    def test_agy_security_auditor_has_no_shell(self) -> None:
+        content = (
+            ROOT / ".agents" / "plugins" / "home-codex-agents" / "agents" / "security-auditor.md"
+        ).read_text(encoding="utf-8")
+        self.assertRegex(content, r"(?m)^tools: \[read_file, grep_search, glob, list_directory\]$")
+        self.assertNotIn("run_shell_command", content.split("---", 2)[1])
+
+    def test_grok_security_auditor_is_read_only(self) -> None:
+        content = (ROOT / ".grok" / "roles" / "security-auditor.toml").read_text(encoding="utf-8")
+        self.assertIn('default_capability_mode = "read-only"', content)
+
+    def test_claude_security_auditor_has_no_shell(self) -> None:
+        content = (ROOT / ".claude" / "agents" / "security-auditor.md").read_text(encoding="utf-8")
+        self.assertRegex(content, r"(?m)^tools: \[Read, Grep, Glob\]$")
+
+    def test_github_security_auditor_is_read_search_only(self) -> None:
+        content = (ROOT / ".github" / "agents" / "security-auditor.agent.md").read_text(
+            encoding="utf-8"
+        )
+        self.assertRegex(content, r"(?m)^tools: \[read, search\]$")
+
+    def test_gemini_security_auditor_has_no_shell(self) -> None:
+        content = (ROOT / ".gemini" / "agents" / "security-auditor.md").read_text(encoding="utf-8")
+        self.assertRegex(content, r"(?m)^tools: \[read_file, grep_search\]$")
+
 
 if __name__ == "__main__":
     unittest.main()

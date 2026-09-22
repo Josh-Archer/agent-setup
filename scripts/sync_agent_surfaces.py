@@ -231,7 +231,10 @@ def agy_tools(tools: str) -> str:
 
 
 def omp_tools(tools: str) -> list[str]:
-    mapped: list[str] = ["read", "grep", "glob", "bash", "lsp", "web_search"]
+    mapped: list[str] = ["read", "grep", "glob"]
+    if "execute" in tools:
+        mapped.append("bash")
+    mapped += ["lsp", "web_search"]
     if "edit" in tools:
         mapped += ["edit", "write"]
     if "todo" in tools:

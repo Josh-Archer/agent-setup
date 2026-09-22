@@ -2,7 +2,7 @@
 name: docs-scribe
 description: Compatibility alias for lead; prefer lead for new tasks.
 model:
-  - "gemini-3.8-flash:high"
+  - "openai-codex/gpt-6-astra:medium"
 tools:
   - read
   - grep

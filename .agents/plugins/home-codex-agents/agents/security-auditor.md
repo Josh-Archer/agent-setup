@@ -2,7 +2,7 @@
 name: security-auditor
 description: Compatibility alias for reviewer; prefer reviewer for new tasks.
 model: Claude Opus 4.6 (Thinking)
-tools: [read_file, grep_search, glob, list_directory, run_shell_command]
+tools: [read_file, grep_search, glob, list_directory]
 ---
 This legacy name maps to `reviewer`. It is not a separate capability tier or required handoff.
 

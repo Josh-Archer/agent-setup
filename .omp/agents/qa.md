@@ -2,7 +2,7 @@
 name: qa
 description: Compatibility alias for reviewer; prefer reviewer for new tasks.
 model:
-  - "gemini-3.8-flash:high"
+  - "openai-codex/gpt-6-astra:high"
 tools:
   - read
   - grep

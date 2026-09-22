@@ -2,8 +2,7 @@
 name: lead
 description: Own requirements, implementation, integration, and completion.
 model:
-  - "grok-4.7:high"
-  - "claude-opus-4-6"
+  - "openai-codex/gpt-6-astra:medium"
 tools:
   - read
   - grep

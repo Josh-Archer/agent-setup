@@ -2,7 +2,7 @@
 name: security-auditor
 model: claude-opus-4-6
 thinking: true
-tools: [Read, Grep, Glob, Bash]
+tools: [Read, Grep, Glob]
 ---
 # Role: Security Auditor
 
