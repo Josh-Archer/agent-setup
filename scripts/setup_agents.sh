@@ -445,6 +445,6 @@ main() {
   log "done. Open a new shell (or: source ~/.zshrc) and restart Codex/Claude/Gemini/Grok/Antigravity/OMP."
 }
 
-if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+if [ "${BASH_SOURCE[0]:-}" = "$0" ]; then
   main "$@"
 fi

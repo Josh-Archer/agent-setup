@@ -122,8 +122,7 @@ exit 0
                 export HOME="{td}"
                 export CODEX_HOME="{td}"
                 export REPO_ROOT="{ROOT}"
-                export BASH_SOURCE=("{SCRIPTS / 'setup_agents.sh'}")
-                eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
+                . "{SCRIPTS / 'setup_agents.sh'}"
                 getent() {{ return {dns_ret}; }}
                 host() {{ return {dns_ret}; }}
                 nslookup() {{ return {dns_ret}; }}
@@ -184,8 +183,7 @@ exit 0
                 export HOME="{td}"
                 export CODEX_HOME="{td}"
                 export REPO_ROOT="{ROOT}"
-                export BASH_SOURCE=("{SCRIPTS / 'setup_agents.sh'}")
-                eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
+                . "{SCRIPTS / 'setup_agents.sh'}"
                 getent() {{ return {dns_ret}; }}
                 host() {{ return {dns_ret}; }}
                 nslookup() {{ return {dns_ret}; }}
