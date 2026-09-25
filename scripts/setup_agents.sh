@@ -43,49 +43,49 @@ install_agent_trees() {
   if [ -d "$REPO_ROOT/.codex/agents" ]; then
     mkdir -p "$HOME/.codex"
     # Copy agent defs (not full config.toml — user keeps local settings)
-    rsync -a --delete "$REPO_ROOT/.codex/agents/" "$HOME/.codex/agents/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.codex/agents/" "$HOME/.codex/agents/" 2>/dev/null \
       || { mkdir -p "$HOME/.codex/agents"; cp -R "$REPO_ROOT/.codex/agents/." "$HOME/.codex/agents/"; }
     log "synced Codex agents -> ~/.codex/agents"
   fi
   if [ -d "$REPO_ROOT/.codex/skills" ]; then
     mkdir -p "$HOME/.codex/skills"
-    rsync -a --delete "$REPO_ROOT/.codex/skills/" "$HOME/.codex/skills/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.codex/skills/" "$HOME/.codex/skills/" 2>/dev/null \
       || { mkdir -p "$HOME/.codex/skills"; cp -R "$REPO_ROOT/.codex/skills/." "$HOME/.codex/skills/"; }
     log "synced Codex skills -> ~/.codex/skills"
   fi
   if [ -d "$REPO_ROOT/.claude/agents" ]; then
     mkdir -p "$HOME/.claude"
-    rsync -a --delete "$REPO_ROOT/.claude/agents/" "$HOME/.claude/agents/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.claude/agents/" "$HOME/.claude/agents/" 2>/dev/null \
       || { mkdir -p "$HOME/.claude/agents"; cp -R "$REPO_ROOT/.claude/agents/." "$HOME/.claude/agents/"; }
     log "synced Claude agents -> ~/.claude/agents"
   fi
   if [ -d "$REPO_ROOT/.claude/skills" ]; then
     mkdir -p "$HOME/.claude/skills"
-    rsync -a --delete "$REPO_ROOT/.claude/skills/" "$HOME/.claude/skills/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.claude/skills/" "$HOME/.claude/skills/" 2>/dev/null \
       || { mkdir -p "$HOME/.claude/skills"; cp -R "$REPO_ROOT/.claude/skills/." "$HOME/.claude/skills/"; }
     log "synced Claude skills -> ~/.claude/skills"
   fi
   if [ -d "$REPO_ROOT/.gemini/agents" ]; then
     mkdir -p "$HOME/.gemini"
-    rsync -a --delete "$REPO_ROOT/.gemini/agents/" "$HOME/.gemini/agents/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.gemini/agents/" "$HOME/.gemini/agents/" 2>/dev/null \
       || { mkdir -p "$HOME/.gemini/agents"; cp -R "$REPO_ROOT/.gemini/agents/." "$HOME/.gemini/agents/"; }
     log "synced Gemini agents -> ~/.gemini/agents"
   fi
   if [ -d "$REPO_ROOT/.gemini/skills" ]; then
     mkdir -p "$HOME/.gemini/skills"
-    rsync -a --delete "$REPO_ROOT/.gemini/skills/" "$HOME/.gemini/skills/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.gemini/skills/" "$HOME/.gemini/skills/" 2>/dev/null \
       || { mkdir -p "$HOME/.gemini/skills"; cp -R "$REPO_ROOT/.gemini/skills/." "$HOME/.gemini/skills/"; }
     log "synced Gemini skills -> ~/.gemini/skills"
   fi
   if [ -d "$REPO_ROOT/.omp/agents" ]; then
     mkdir -p "$HOME/.omp/agent/agents"
-    rsync -a --delete "$REPO_ROOT/.omp/agents/" "$HOME/.omp/agent/agents/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.omp/agents/" "$HOME/.omp/agent/agents/" 2>/dev/null \
       || { mkdir -p "$HOME/.omp/agent/agents"; cp -R "$REPO_ROOT/.omp/agents/." "$HOME/.omp/agent/agents/"; }
     log "synced OMP agents -> ~/.omp/agent/agents"
   fi
   if [ -d "$REPO_ROOT/.omp/skills" ]; then
     mkdir -p "$HOME/.omp/agent/skills"
-    rsync -a --delete "$REPO_ROOT/.omp/skills/" "$HOME/.omp/agent/skills/" 2>/dev/null \
+    rsync -a "$REPO_ROOT/.omp/skills/" "$HOME/.omp/agent/skills/" 2>/dev/null \
       || { mkdir -p "$HOME/.omp/agent/skills"; cp -R "$REPO_ROOT/.omp/skills/." "$HOME/.omp/agent/skills/"; }
     log "synced OMP skills -> ~/.omp/agent/skills"
   fi
@@ -375,6 +375,10 @@ EOF
 main() {
   export REPO_ROOT
   log "repo=$REPO_ROOT"
+  if [ "${1:-}" = "--trees-only" ] || [ "${1:-}" = "install_agent_trees" ]; then
+    install_agent_trees
+    return 0
+  fi
   install_agent_trees
   install_shell_snippet
   refresh_key_cache
@@ -383,4 +387,6 @@ main() {
   log "done. Open a new shell (or: source ~/.zshrc) and restart Codex/Claude/Gemini/Grok/Antigravity/OMP."
 }
 
-main "$@"
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+  main "$@"
+fi

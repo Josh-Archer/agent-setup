@@ -42,8 +42,8 @@ function Sync-Tree {
   param([string]$Src, [string]$Dst)
   if (-not (Test-Path $Src)) { return }
   if (-not (Test-Path $Dst)) { New-Item -ItemType Directory -Path $Dst -Force | Out-Null }
-  # Robocopy mirror agent defs (exclude secrets if any)
-  & robocopy $Src $Dst /MIR /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
+  # Robocopy agent defs (exclude secrets if any)
+  & robocopy $Src $Dst /E /NFL /NDL /NJH /NJS /nc /ns /np | Out-Null
   $code = $LASTEXITCODE
   if ($code -ge 8) { throw "robocopy failed $Src -> $Dst (exit $code)" }
   Write-Log "synced $Src -> $Dst"
