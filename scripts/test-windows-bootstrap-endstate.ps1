@@ -168,7 +168,7 @@ foreach ($t in $agentTrees) {
   }
   if ($dstCount -lt $srcCount) {
     Fail $t.Step "partial agent sync: installed $dstCount / repo $srcCount under $($t.Dst)" `
-      "Re-run: powershell -ExecutionPolicy Bypass -File .\scripts\setup_agents.ps1 (robocopy mirror)"
+      "Re-run: powershell -ExecutionPolicy Bypass -File .\scripts\setup_agents.ps1 (robocopy)"
   } else {
     Ok "$($t.Step) installed ($dstCount files)"
   }
