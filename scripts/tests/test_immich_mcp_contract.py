@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -60,6 +63,7 @@ class ImmichBootstrapContractTests(unittest.TestCase):
         # DNS / Tailscale fallback path
         self.assertIn("HOMELAB_TRAEFIK_TS_IP", text)
         self.assertIn("UseHostHeader", text)
+        self.assertIn('codex mcp add immich --url $immich.Url --header "Host: $($immich.HostHeader)"', text)
 
     def test_setup_agents_sh_registers_immich(self) -> None:
         text = (SCRIPTS / "setup_agents.sh").read_text(encoding="utf-8")
@@ -67,6 +71,79 @@ class ImmichBootstrapContractTests(unittest.TestCase):
         self.assertIn("grok mcp add --transport http immich", text)
         self.assertIn("immich-mcp.archer.casa", text)
         self.assertIn("HOMELAB_TRAEFIK_TS_IP", text)
+        self.assertIn('codex mcp add immich --url "$immich_url" --header "Host: ${immich_host}"', text)
+
+    def test_setup_agents_sh_codex_host_header_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mock_bin = os.path.join(td, "codex")
+            log_file = os.path.join(td, "codex.log")
+            with open(mock_bin, "w", encoding="utf-8") as f:
+                f.write(f"""#!/bin/sh
+echo "$@" >> "{log_file}"
+exit 0
+""")
+            os.chmod(mock_bin, 0o755)
+
+            script = f"""
+            export PATH="{td}:$PATH"
+            export HOME="{td}"
+            export REPO_ROOT="{ROOT}"
+            eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
+            getent() {{ return 1; }}
+            host() {{ return 1; }}
+            nslookup() {{ return 1; }}
+            log() {{ :; }}
+            install_mcp_clients
+            """
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}")
+            with open(log_file, encoding="utf-8") as f:
+                calls = f.read()
+            self.assertIn(
+                "mcp add immich --url http://100.68.151.94/mcp --header Host: immich-mcp.archer.casa",
+                calls,
+            )
+
+    def test_setup_agents_sh_codex_host_header_fallback_on_unsupported_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            mock_bin = os.path.join(td, "codex")
+            log_file = os.path.join(td, "codex.log")
+            with open(mock_bin, "w", encoding="utf-8") as f:
+                f.write(f"""#!/bin/sh
+echo "$@" >> "{log_file}"
+for arg in "$@"; do
+    if [ "$arg" = "--header" ]; then
+        echo "error: unexpected argument '--header' found" >&2
+        exit 2
+    fi
+done
+exit 0
+""")
+            os.chmod(mock_bin, 0o755)
+
+            script = f"""
+            export PATH="{td}:$PATH"
+            export HOME="{td}"
+            export REPO_ROOT="{ROOT}"
+            eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
+            getent() {{ return 1; }}
+            host() {{ return 1; }}
+            nslookup() {{ return 1; }}
+            log() {{ :; }}
+            install_mcp_clients
+            """
+            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}")
+            with open(log_file, encoding="utf-8") as f:
+                calls = f.read().splitlines()
+            self.assertIn(
+                "mcp add immich --url http://100.68.151.94/mcp --header Host: immich-mcp.archer.casa",
+                calls,
+            )
+            self.assertIn(
+                "mcp add immich --url http://100.68.151.94/mcp",
+                calls,
+            )
 
 
 class ImmichValidateContractTests(unittest.TestCase):

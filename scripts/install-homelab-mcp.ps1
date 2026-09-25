@@ -200,7 +200,7 @@ if (-not $SkipCodex) {
     # Immich is first-class alongside Paperless (native HTTP MCP, allowlist only).
     if ($immich.UseHostHeader) {
       # Some Codex builds accept --header; if not, fall back to plain URL and document Host need.
-      & codex mcp add immich --url $immich.Url 2>$null
+      & codex mcp add immich --url $immich.Url --header "Host: $($immich.HostHeader)" 2>$null
       if ($LASTEXITCODE -ne 0) {
         & codex mcp add immich --url $immich.Url
       }

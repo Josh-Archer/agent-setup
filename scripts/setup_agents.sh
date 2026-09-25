@@ -192,7 +192,15 @@ install_mcp_clients() {
     codex mcp remove paperless >/dev/null 2>&1 || true
     codex mcp remove immich >/dev/null 2>&1 || true
     codex mcp add paperless --url 'http://paperless-mcp.archer.casa' --bearer-token-env-var HOMELAB_MCP_API_KEY
-    codex mcp add immich --url "$immich_url"
+    if [ "$immich_use_host_header" -eq 1 ]; then
+      # Some Codex builds accept --header; if not, fall back to plain URL.
+      if ! codex mcp add immich --url "$immich_url" --header "Host: ${immich_host}" 2>/dev/null; then
+        codex mcp add immich --url "$immich_url"
+        log "warning: Codex Immich uses $immich_url; ensure Host: $immich_host is sent if the client supports headers"
+      fi
+    else
+      codex mcp add immich --url "$immich_url"
+    fi
     log "Codex MCP: paperless + immich ($immich_url)"
   else
     log "codex CLI not found; skip Codex MCP CLI registration"
