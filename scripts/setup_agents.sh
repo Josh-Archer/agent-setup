@@ -9,7 +9,7 @@ if [ "$EUID" -eq 0 ]; then
   exit 1
 fi
 
-REPO_ROOT="${REPO_ROOT:-$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)}"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")/.." && pwd)"
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/homelab"
 SHELL_SNIPPET_SRC="$REPO_ROOT/shell/homelab-mcp.env.sh"
 SHELL_SNIPPET_DST="$CONFIG_DIR/homelab-mcp.env.sh"

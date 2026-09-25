@@ -40,6 +40,15 @@ class SetupAgentsSourceContractTests(unittest.TestCase):
         )
         self.assertIn("/E", text, "setup_agents.ps1 Sync-Tree should use /E to copy subtrees")
 
+    def test_setup_agents_sh_does_not_expand_inherited_repo_root(self) -> None:
+        text = SETUP_AGENTS_SH.read_text(encoding="utf-8")
+        self.assertNotIn(
+            'REPO_ROOT="${REPO_ROOT:-',
+            text,
+            "setup_agents.sh must not allow REPO_ROOT to be overridden from environment",
+        )
+
+
 
 class SetupAgentsBootstrapExecutionTests(unittest.TestCase):
     def test_install_agent_trees_preserves_machine_only_skills(self) -> None:
@@ -201,6 +210,50 @@ class SetupAgentsBootstrapExecutionTests(unittest.TestCase):
                 "Repo skill 'unslop' should be copied via fallback path",
             )
 
+    def test_setup_agents_sh_derives_repo_root_and_ignores_inherited_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_home_str:
+            tmp_home = Path(tmp_home_str)
+            env = dict(
+                os.environ,
+                HOME=str(tmp_home),
+                REPO_ROOT="/tmp/untrusted-spoofed-repo-root",
+            )
+
+            # Sourced in bash
+            cmd_sourced = [
+                "bash",
+                "-c",
+                f'. "{SETUP_AGENTS_SH}" && printf "%s" "$REPO_ROOT"',
+            ]
+            result_sourced = subprocess.run(
+                cmd_sourced,
+                capture_output=True,
+                text=True,
+                check=False,
+                env=env,
+            )
+            self.assertEqual(result_sourced.returncode, 0)
+            self.assertEqual(result_sourced.stdout, str(ROOT))
+
+            # Executed directly (check log output repo=...)
+            cmd_exec = [
+                "bash",
+                str(SETUP_AGENTS_SH),
+                "--trees-only",
+            ]
+            result_exec = subprocess.run(
+                cmd_exec,
+                cwd=str(ROOT),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result_exec.returncode, 0)
+            self.assertIn(f"[setup_agents] repo={ROOT}", result_exec.stdout)
+            self.assertNotIn("/tmp/untrusted-spoofed-repo-root", result_exec.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()
+
