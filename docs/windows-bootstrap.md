@@ -50,7 +50,7 @@ powershell -ExecutionPolicy Bypass -File .\scripts\test-windows-bootstrap-endsta
 
 | Step | Re-run behavior |
 | ---- | --------------- |
-| Agent trees | `robocopy /MIR` from repo → user home (no manual cleanup) |
+| Agent trees | `robocopy /E` from repo → user home (no manual cleanup) |
 | Profile hooks | Marker block is replaced in place (start/end markers) |
 | MCP TOML/JSON | Prior `paperless` / `immich` blocks are stripped then re-merged; backups `*.bak-homelab-mcp-*` |
 | Keys | User env + cache file refreshed when `-LoadKeyFromCluster` or env already set |
