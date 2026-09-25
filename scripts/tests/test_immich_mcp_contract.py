@@ -6,6 +6,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -63,7 +64,9 @@ class ImmichBootstrapContractTests(unittest.TestCase):
         # DNS / Tailscale fallback path
         self.assertIn("HOMELAB_TRAEFIK_TS_IP", text)
         self.assertIn("UseHostHeader", text)
-        self.assertIn('codex mcp add immich --url $immich.Url --header "Host: $($immich.HostHeader)"', text)
+        self.assertIn("codex mcp add immich --url $immich.Url", text)
+        self.assertNotIn("codex mcp add immich --url $immich.Url --header", text)
+        self.assertIn("Set-CodexImmichHostHeader", text)
 
     def test_setup_agents_sh_registers_immich(self) -> None:
         text = (SCRIPTS / "setup_agents.sh").read_text(encoding="utf-8")
@@ -71,79 +74,183 @@ class ImmichBootstrapContractTests(unittest.TestCase):
         self.assertIn("grok mcp add --transport http immich", text)
         self.assertIn("immich-mcp.archer.casa", text)
         self.assertIn("HOMELAB_TRAEFIK_TS_IP", text)
-        self.assertIn('codex mcp add immich --url "$immich_url" --header "Host: ${immich_host}"', text)
+        self.assertIn('codex mcp add immich --url "$immich_url"', text)
+        self.assertNotIn('codex mcp add immich --url "$immich_url" --header', text)
+        self.assertIn("set_codex_immich_host_header", text)
 
-    def test_setup_agents_sh_codex_host_header_fallback(self) -> None:
+    def test_setup_agents_sh_codex_host_header_fallback_mock(self) -> None:
         with tempfile.TemporaryDirectory() as td:
-            mock_bin = os.path.join(td, "codex")
+            mock_codex = os.path.join(td, "codex")
             log_file = os.path.join(td, "codex.log")
-            with open(mock_bin, "w", encoding="utf-8") as f:
+            with open(mock_codex, "w", encoding="utf-8") as f:
                 f.write(f"""#!/bin/sh
 echo "$@" >> "{log_file}"
+if [ "$1" = "mcp" ] && [ "$2" = "add" ]; then
+    cfg="${{CODEX_HOME:-$HOME/.codex}}/config.toml"
+    mkdir -p "$(dirname "$cfg")"
+    name="$3"
+    url="$5"
+    printf '[mcp_servers.%s]\\nurl = "%s"\\n' "$name" "$url" >> "$cfg"
+elif [ "$1" = "mcp" ] && [ "$2" = "remove" ]; then
+    cfg="${{CODEX_HOME:-$HOME/.codex}}/config.toml"
+    if [ -f "$cfg" ]; then
+        name="$3"
+        python3 -c "
+import sys, re
+c_path, n = sys.argv[1], sys.argv[2]
+with open(c_path, 'r', encoding='utf-8') as fh: c = fh.read()
+p = r'(?ms)^\\[mcp_servers\\.' + re.escape(n) + r'\\]\\r?\\n.*?(?=(?:^\\[|\\Z))'
+with open(c_path, 'w', encoding='utf-8') as fh: fh.write(re.sub(p, '', c))
+" "$cfg" "$name" 2>/dev/null || true
+    fi
+fi
 exit 0
 """)
-            os.chmod(mock_bin, 0o755)
+            os.chmod(mock_codex, 0o755)
 
-            script = f"""
-            export PATH="{td}:$PATH"
-            export HOME="{td}"
-            export REPO_ROOT="{ROOT}"
-            eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
-            getent() {{ return 1; }}
-            host() {{ return 1; }}
-            nslookup() {{ return 1; }}
-            log() {{ :; }}
-            install_mcp_clients
-            """
-            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            # Stub out other CLIs so they don't run for real
+            for stub in ["grok", "claude", "powershell.exe", "pwsh"]:
+                stub_path = os.path.join(td, stub)
+                with open(stub_path, "w", encoding="utf-8") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(stub_path, 0o755)
+
+            def run_install(dns_ok: bool) -> subprocess.CompletedProcess[str]:
+                dns_ret = "0" if dns_ok else "1"
+                script = f"""
+                export PATH="{td}:$PATH"
+                export HOME="{td}"
+                export CODEX_HOME="{td}"
+                export REPO_ROOT="{ROOT}"
+                eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
+                getent() {{ return {dns_ret}; }}
+                host() {{ return {dns_ret}; }}
+                nslookup() {{ return {dns_ret}; }}
+                log() {{ :; }}
+                install_mcp_clients
+                """
+                return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+            # 1. DNS fallback run
+            proc = run_install(dns_ok=False)
             self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}")
             with open(log_file, encoding="utf-8") as f:
                 calls = f.read()
-            self.assertIn(
-                "mcp add immich --url http://100.68.151.94/mcp --header Host: immich-mcp.archer.casa",
-                calls,
-            )
+            self.assertIn("mcp add immich --url http://100.68.151.94/mcp", calls)
+            self.assertNotIn("--header", calls)
 
-    def test_setup_agents_sh_codex_host_header_fallback_on_unsupported_cli(self) -> None:
+            cfg_file = os.path.join(td, "config.toml")
+            self.assertTrue(os.path.isfile(cfg_file))
+            with open(cfg_file, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("[mcp_servers.immich]", content)
+            self.assertIn('http_headers = { Host = "immich-mcp.archer.casa" }', content)
+
+            # 2. Re-run: verify idempotency (no duplicate http_headers)
+            proc_rerun = run_install(dns_ok=False)
+            self.assertEqual(proc_rerun.returncode, 0, f"Re-run failed: {proc_rerun.stderr}")
+            with open(cfg_file, encoding="utf-8") as f:
+                content_rerun = f.read()
+            self.assertEqual(content_rerun.count("http_headers"), 1)
+            self.assertEqual(content_rerun.count("[mcp_servers.immich]"), 1)
+
+            # 3. DNS-ok path: verify no header added
+            proc_dns_ok = run_install(dns_ok=True)
+            self.assertEqual(proc_dns_ok.returncode, 0, f"DNS ok run failed: {proc_dns_ok.stderr}")
+            with open(cfg_file, encoding="utf-8") as f:
+                content_dns_ok = f.read()
+            self.assertIn('url = "http://immich-mcp.archer.casa/mcp"', content_dns_ok)
+            self.assertNotIn("http_headers", content_dns_ok)
+
+    def test_setup_agents_sh_codex_host_header_fallback_real_cli(self) -> None:
+        codex_bin = shutil.which("codex")
+        if not codex_bin:
+            self.skipTest("codex CLI not available in environment")
+
         with tempfile.TemporaryDirectory() as td:
-            mock_bin = os.path.join(td, "codex")
-            log_file = os.path.join(td, "codex.log")
-            with open(mock_bin, "w", encoding="utf-8") as f:
-                f.write(f"""#!/bin/sh
-echo "$@" >> "{log_file}"
-for arg in "$@"; do
-    if [ "$arg" = "--header" ]; then
-        echo "error: unexpected argument '--header' found" >&2
-        exit 2
-    fi
-done
-exit 0
-""")
-            os.chmod(mock_bin, 0o755)
+            stubs_dir = os.path.join(td, "stubs")
+            os.makedirs(stubs_dir, exist_ok=True)
+            for stub in ["grok", "claude", "powershell.exe", "pwsh"]:
+                stub_path = os.path.join(stubs_dir, stub)
+                with open(stub_path, "w", encoding="utf-8") as f:
+                    f.write("#!/bin/sh\nexit 0\n")
+                os.chmod(stub_path, 0o755)
 
-            script = f"""
-            export PATH="{td}:$PATH"
-            export HOME="{td}"
-            export REPO_ROOT="{ROOT}"
-            eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
-            getent() {{ return 1; }}
-            host() {{ return 1; }}
-            nslookup() {{ return 1; }}
-            log() {{ :; }}
-            install_mcp_clients
-            """
-            proc = subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+            def run_install(dns_ok: bool) -> subprocess.CompletedProcess[str]:
+                dns_ret = "0" if dns_ok else "1"
+                script = f"""
+                export PATH="{stubs_dir}:$PATH"
+                export HOME="{td}"
+                export CODEX_HOME="{td}"
+                export REPO_ROOT="{ROOT}"
+                eval "$(sed '/^main /d' "{SCRIPTS / 'setup_agents.sh'}")"
+                getent() {{ return {dns_ret}; }}
+                host() {{ return {dns_ret}; }}
+                nslookup() {{ return {dns_ret}; }}
+                log() {{ :; }}
+                install_mcp_clients
+                """
+                return subprocess.run(["bash", "-c", script], capture_output=True, text=True)
+
+            # 1. DNS fallback path
+            proc = run_install(dns_ok=False)
             self.assertEqual(proc.returncode, 0, f"Script failed: {proc.stderr}")
-            with open(log_file, encoding="utf-8") as f:
-                calls = f.read().splitlines()
-            self.assertIn(
-                "mcp add immich --url http://100.68.151.94/mcp --header Host: immich-mcp.archer.casa",
-                calls,
+
+            cfg_file = os.path.join(td, "config.toml")
+            self.assertTrue(os.path.isfile(cfg_file))
+            with open(cfg_file, encoding="utf-8") as f:
+                content = f.read()
+            self.assertIn("[mcp_servers.immich]", content)
+            self.assertIn('http_headers = { Host = "immich-mcp.archer.casa" }', content)
+
+            env = os.environ.copy()
+            env["CODEX_HOME"] = td
+            env["HOME"] = td
+            get_res = subprocess.run(
+                ["codex", "mcp", "get", "immich", "--json"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
             )
-            self.assertIn(
-                "mcp add immich --url http://100.68.151.94/mcp",
-                calls,
+            data = json.loads(get_res.stdout)
+            self.assertIsNotNone(data.get("transport", {}).get("http_headers"))
+            self.assertEqual(data["transport"]["http_headers"].get("Host"), "immich-mcp.archer.casa")
+
+            # 2. Re-run: ensure idempotent and no duplicate keys
+            proc_rerun = run_install(dns_ok=False)
+            self.assertEqual(proc_rerun.returncode, 0, f"Re-run failed: {proc_rerun.stderr}")
+            with open(cfg_file, encoding="utf-8") as f:
+                content_rerun = f.read()
+            self.assertEqual(content_rerun.count("http_headers"), 1)
+
+            get_res2 = subprocess.run(
+                ["codex", "mcp", "get", "immich", "--json"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
             )
+            data2 = json.loads(get_res2.stdout)
+            self.assertEqual(data2["transport"]["http_headers"].get("Host"), "immich-mcp.archer.casa")
+
+            # 3. DNS-ok path: no header
+            proc_dns_ok = run_install(dns_ok=True)
+            self.assertEqual(proc_dns_ok.returncode, 0, f"DNS-ok run failed: {proc_dns_ok.stderr}")
+            with open(cfg_file, encoding="utf-8") as f:
+                content_dns_ok = f.read()
+            self.assertIn('url = "http://immich-mcp.archer.casa/mcp"', content_dns_ok)
+            self.assertNotIn("http_headers", content_dns_ok)
+
+            get_res3 = subprocess.run(
+                ["codex", "mcp", "get", "immich", "--json"],
+                env=env,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            data3 = json.loads(get_res3.stdout)
+            self.assertIsNone(data3["transport"].get("http_headers"))
 
 
 class ImmichValidateContractTests(unittest.TestCase):

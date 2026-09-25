@@ -162,6 +162,61 @@ refresh_key_cache() {
   log "warning: HOMELAB_MCP_API_KEY not available (Paperless MCP auth may fail until set)"
 }
 
+set_codex_immich_host_header() {
+  local cfg="$1"
+  local host="$2"
+  mkdir -p "$(dirname "$cfg")"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 - "$cfg" "$host" <<'PY'
+import os, re, sys
+
+cfg_path, host = sys.argv[1], sys.argv[2]
+try:
+    with open(cfg_path, "r", encoding="utf-8") as f:
+        content = f.read()
+except FileNotFoundError:
+    content = ""
+
+header_line = f'http_headers = {{ Host = "{host}" }}'
+pattern = r"(?ms)(^\[mcp_servers\.immich\]\r?\n)(.*?)(?=(?:^\[|\Z))"
+match = re.search(pattern, content)
+if match:
+    header = match.group(1)
+    body = match.group(2)
+    # Remove any existing http_headers or subtable
+    body = re.sub(r"(?m)^http_headers\s*=.*?\r?\n", "", body)
+    body = re.sub(r"(?ms)^\[mcp_servers\.immich\.http_headers\].*?(?=(?:^\[|\Z))", "", body)
+    body = body.rstrip()
+    if body:
+        new_table = f"{header}{body}\n{header_line}\n"
+    else:
+        new_table = f"{header}{header_line}\n"
+    tail = content[match.end():]
+    if tail.startswith("\n"):
+        tail = tail.lstrip("\n")
+        if tail:
+            new_table += "\n"
+    elif tail:
+        new_table += "\n"
+    new_content = content[:match.start()] + new_table + tail
+else:
+    sep = "\n\n" if content.strip() else ""
+    new_content = content.rstrip() + f"{sep}[mcp_servers.immich]\n{header_line}\n"
+
+with open(cfg_path, "w", encoding="utf-8") as f:
+    f.write(new_content)
+PY
+  else
+    if [ -f "$cfg" ] && grep -q '^\[mcp_servers\.immich\]' "$cfg"; then
+      if ! grep -q 'http_headers = { Host =' "$cfg"; then
+        sed -i.bak-homelab-mcp "/^\[mcp_servers\.immich\]/a http_headers = { Host = \"${host}\" }" "$cfg" 2>/dev/null || true
+      fi
+    else
+      printf '\n[mcp_servers.immich]\nhttp_headers = { Host = "%s" }\n' "$host" >>"$cfg"
+    fi
+  fi
+}
+
 install_mcp_clients() {
   # Prefer PowerShell installer when available for Codex/Grok CLIs; else pure shell fragment merge.
   if command -v powershell.exe >/dev/null 2>&1 || command -v pwsh >/dev/null 2>&1; then
@@ -192,14 +247,9 @@ install_mcp_clients() {
     codex mcp remove paperless >/dev/null 2>&1 || true
     codex mcp remove immich >/dev/null 2>&1 || true
     codex mcp add paperless --url 'http://paperless-mcp.archer.casa' --bearer-token-env-var HOMELAB_MCP_API_KEY
+    codex mcp add immich --url "$immich_url"
     if [ "$immich_use_host_header" -eq 1 ]; then
-      # Some Codex builds accept --header; if not, fall back to plain URL.
-      if ! codex mcp add immich --url "$immich_url" --header "Host: ${immich_host}" 2>/dev/null; then
-        codex mcp add immich --url "$immich_url"
-        log "warning: Codex Immich uses $immich_url; ensure Host: $immich_host is sent if the client supports headers"
-      fi
-    else
-      codex mcp add immich --url "$immich_url"
+      set_codex_immich_host_header "${CODEX_HOME:-$HOME/.codex}/config.toml" "$immich_host"
     fi
     log "Codex MCP: paperless + immich ($immich_url)"
   else

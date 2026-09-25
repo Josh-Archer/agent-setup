@@ -95,6 +95,39 @@ function Resolve-ImmichMcpUrl {
   return @{ Url = "http://$tsVip/mcp"; UseHostHeader = $true; HostHeader = $hostName }
 }
 
+function Set-CodexImmichHostHeader {
+  param(
+    [string]$ConfigPath,
+    [string]$HostHeader
+  )
+  $headerLine = "http_headers = { Host = `"$HostHeader`" }"
+  $content = if (Test-Path $ConfigPath) { Get-Content -Raw -Path $ConfigPath } else { '' }
+  $pattern = '(?ms)(^\[mcp_servers\.immich\]\r?\n)(.*?)(?=(?:^\[|\Z))'
+  $m = [regex]::Match($content, $pattern)
+  if ($m.Success) {
+    $header = $m.Groups[1].Value
+    $body = $m.Groups[2].Value
+    $body = [regex]::Replace($body, '(?m)^http_headers\s*=.*?\r?\n', '')
+    $body = [regex]::Replace($body, '(?ms)^\[mcp_servers\.immich\.http_headers\].*?(?=(?:^\[|\Z))', '')
+    $body = $body.TrimEnd()
+    $newTable = if ($body) { "$header$body`n$headerLine`n" } else { "$header$headerLine`n" }
+    $tail = $content.Substring($m.Index + $m.Length)
+    if ($tail.StartsWith("`n")) {
+      $tail = $tail.TrimStart("`r`n")
+      if ($tail) { $newTable += "`n" }
+    } elseif ($tail) {
+      $newTable += "`n"
+    }
+    $newContent = $content.Substring(0, $m.Index) + $newTable + $tail
+  } else {
+    $sep = if ($content.Trim()) { "`n`n" } else { '' }
+    $newContent = $content.TrimEnd() + "$sep[mcp_servers.immich]`n$headerLine`n"
+  }
+  $dir = Split-Path -Parent $ConfigPath
+  if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Path $dir | Out-Null }
+  [System.IO.File]::WriteAllText($ConfigPath, $newContent)
+}
+
 function Merge-TomlFragment {
   param(
     [string]$TargetPath,
@@ -190,6 +223,15 @@ $names = @('paperless', 'immich')
 $immich = Resolve-ImmichMcpUrl
 
 if (-not $SkipCodex) {
+  $codexHome = if ($env:CODEX_HOME) {
+    $env:CODEX_HOME
+  } elseif ($env:USERPROFILE) {
+    Join-Path $env:USERPROFILE '.codex'
+  } else {
+    Join-Path $HOME '.codex'
+  }
+  $codexConfig = Join-Path $codexHome 'config.toml'
+
   # Prefer CLI when available (writes bearer_token_env_var cleanly)
   if (Get-Command codex -ErrorAction SilentlyContinue) {
     Write-Host 'Installing Codex MCP servers via CLI...'
@@ -198,30 +240,22 @@ if (-not $SkipCodex) {
     & codex mcp add paperless --url 'http://paperless-mcp.archer.casa' --bearer-token-env-var HOMELAB_MCP_API_KEY
     if ($LASTEXITCODE -ne 0) { throw "codex mcp add paperless failed ($LASTEXITCODE)" }
     # Immich is first-class alongside Paperless (native HTTP MCP, allowlist only).
-    if ($immich.UseHostHeader) {
-      # Some Codex builds accept --header; if not, fall back to plain URL and document Host need.
-      & codex mcp add immich --url $immich.Url --header "Host: $($immich.HostHeader)" 2>$null
-      if ($LASTEXITCODE -ne 0) {
-        & codex mcp add immich --url $immich.Url
-      }
-      Write-Warning "Codex Immich uses $($immich.Url); ensure Host: $($immich.HostHeader) is sent if the client supports headers."
-    } else {
-      & codex mcp add immich --url $immich.Url
-    }
+    & codex mcp add immich --url $immich.Url
     if ($LASTEXITCODE -ne 0) { throw "codex mcp add immich failed ($LASTEXITCODE)" }
+    if ($immich.UseHostHeader) {
+      Set-CodexImmichHostHeader -ConfigPath $codexConfig -HostHeader $immich.HostHeader
+      Write-Host "Set Codex Immich Host header in $codexConfig ($($immich.HostHeader))."
+    }
     Write-Host 'Codex MCP servers registered (paperless+immich).'
   } else {
-    Merge-TomlFragment -TargetPath (Join-Path $env:USERPROFILE '.codex\config.toml') `
+    Merge-TomlFragment -TargetPath $codexConfig `
       -FragmentPath (Join-Path $FragDir 'codex.homelab-mcp.toml') -ServerNames $names
     if ($immich.UseHostHeader) {
-      # Patch Immich URL when DNS is broken (mirror Grok fallback).
-      $cfg = Join-Path $env:USERPROFILE '.codex\config.toml'
-      $raw = Get-Content -Raw $cfg
+      # Patch Immich URL and Host header when DNS is broken (mirror Grok fallback).
+      $raw = Get-Content -Raw $codexConfig
       $raw = $raw -replace 'url = "http://immich-mcp\.archer\.casa/mcp"', ("url = `"{0}`"" -f $immich.Url)
-      if ($raw -notmatch '\[mcp_servers\.immich\.http_headers\]' -and $raw -notmatch '\[mcp_servers\.immich\.headers\]') {
-        $raw = $raw.TrimEnd() + "`n`n[mcp_servers.immich.http_headers]`nHost = `"$($immich.HostHeader)`"`n"
-      }
-      [System.IO.File]::WriteAllText($cfg, $raw)
+      [System.IO.File]::WriteAllText($codexConfig, $raw)
+      Set-CodexImmichHostHeader -ConfigPath $codexConfig -HostHeader $immich.HostHeader
     }
   }
 }
